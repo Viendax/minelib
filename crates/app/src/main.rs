@@ -322,6 +322,14 @@ struct Game {
     /// message (invitation envoyée, erreur) et depuis quand il est affiché.
     friends_ui: friends::FriendsUi,
     friends_note: Option<(String, f32)>,
+    /// (v271) Ami qu'on vient de demander d'ajouter (panneau, `/ami`, lobby FPS), et quand :
+    /// la réponse du relais (refus : pseudo inconnu ; ou la demande envoyée) est dite dans le
+    /// panneau. Avant, un refus n'était dit nulle part hors d'un monde en ligne : rien ne se
+    /// passait.
+    friend_adding: Option<(String, f32)>,
+    /// (v271) Pseudo proposé par le relais pour un ami inconnu (celui qui lui ressemble :
+    /// « lside » pour « 1side ») : bouton « Ajouter » du panneau, tant que le message y est.
+    friends_suggest: Option<String>,
     /// (v231) Partie (salle du relais) où l'on est : un ami qui y est déjà n'a ni « Rejoindre »
     /// ni « Inviter ».
     current_room: Option<u64>,
@@ -499,6 +507,8 @@ impl Game {
             settings_return: Screen::Title,
             friends_ui: friends::FriendsUi::default(),
             friends_note: None,
+            friend_adding: None,
+            friends_suggest: None,
             current_room: None,
             slider_drag: None,
             graphics_scroll: 0,
@@ -786,7 +796,7 @@ impl Game {
         st: &mut friends::FriendsUi,
         accounts: &account::Accounts,
         in_world: Option<u64>,
-        note: Option<&str>,
+        note: Option<(&str, Option<&str>)>,
         rect: (f32, f32, f32, f32),
         time: f32,
     ) -> friends::FriendsAction {
@@ -798,25 +808,28 @@ impl Game {
             requests: &accounts.friend_requests,
             invisible: accounts.invisible,
             in_world,
-            note,
+            note: note.map(|n| n.0),
+            suggest: note.and_then(|n| n.1),
         };
         let (x, y, w, h) = rect;
         friends::panel(c, input, st, &view, x, y, w, h, time)
     }
 
     /// (v233) Monde de construction en ligne où l'on est (on peut y inviter), et le message
-    /// du panneau des amis s'il est récent.
-    fn friends_context(&self) -> (Option<u64>, Option<String>) {
+    /// du panneau des amis s'il est récent. (v271) Avec le pseudo proposé pour un ami inconnu
+    /// (bouton « Ajouter ») : le message reste alors 30 s, le temps de le lire.
+    fn friends_context(&self) -> (Option<u64>, Option<(String, Option<String>)>) {
         let in_world = self
             .session
             .as_ref()
             .filter(|s| s.build.is_some())
             .and(self.current_room);
+        let keep = if self.friends_suggest.is_some() { 30.0 } else { 6.0 };
         let note = self
             .friends_note
             .as_ref()
-            .filter(|(_, t)| self.time - t < 6.0)
-            .map(|(n, _)| n.clone());
+            .filter(|(_, t)| self.time - t < keep)
+            .map(|(n, _)| (n.clone(), self.friends_suggest.clone()));
         (in_world, note)
     }
 
@@ -836,6 +849,9 @@ impl Game {
                 self.accounts
                     .friend_requests
                     .retain(|r| !r.eq_ignore_ascii_case(&p));
+                // (v271) Sa réponse sera dite dans le panneau (voir `friend_adding`).
+                self.friend_adding = Some((p.clone(), self.time));
+                self.friends_suggest = None;
                 self.accounts.room(Cmd::Friend { pseudo: p, add: true });
             }
             friends::FriendsAction::Decline(p) => {
@@ -1006,7 +1022,7 @@ impl Game {
             &mut self.friends_ui,
             &self.accounts,
             in_world,
-            note.as_deref(),
+            note.as_ref().map(|(n, p)| (n.as_str(), p.as_deref())),
             rect,
             time,
         );
@@ -1533,6 +1549,41 @@ impl Game {
                     }
                 }
                 Event::Friends(list) => {
+                    // (v271) L'ami demandé est dans la liste : la demande est partie (il la
+                    // verra même s'il n'est pas connecté), ou vous êtes amis.
+                    if self
+                        .friend_adding
+                        .as_ref()
+                        .is_some_and(|(_, t)| self.time - t >= 10.0)
+                    {
+                        self.friend_adding = None;
+                    }
+                    let asked = self.friend_adding.as_ref().and_then(|(p, _)| {
+                        list.iter()
+                            .position(|(f, _)| f.eq_ignore_ascii_case(p))
+                    });
+                    if let Some(i) = asked {
+                        self.friend_adding = None;
+                        let name = &list[i].0;
+                        let pending = self
+                            .accounts
+                            .friend_places
+                            .get(i)
+                            .is_none_or(|w| w.kind == minelib_net::proto::FRIEND_PENDING);
+                        let t = if pending {
+                            format!(
+                                "Demande d'ami envoyée à {name} : il la verra dans ses \
+                                 demandes, même s'il n'est pas connecté."
+                            )
+                        } else {
+                            format!("{name} et toi êtes amis.")
+                        };
+                        self.friends_note = Some((t.clone(), self.time));
+                        self.friends_suggest = None;
+                        if let Some(s) = &mut self.session {
+                            s.chat.say(t, chat::YELLOW);
+                        }
+                    }
                     // (v231) Dans le tchat seulement pour `/amis` (l'écran des amis redemande
                     // la liste toutes les quelques secondes).
                     if let Some(s) = self.session.as_mut().filter(|s| s.friends_said) {
@@ -1667,11 +1718,23 @@ impl Game {
                     if self.searching.take().is_some() || self.screen == Screen::FpsHome {
                         self.fps_status = Some(m.clone());
                     }
+                    // (v271) Réponse à un ami demandé (« Joueur « 1side » inconnu. Voulais-tu
+                    // dire « lside »… ») : dans le panneau des amis, avec un bouton pour le
+                    // pseudo proposé, et dans le tchat même hors d'un monde en ligne.
+                    let adding = self
+                        .friend_adding
+                        .take()
+                        .is_some_and(|(_, t)| self.time - t < 10.0);
+                    if adding {
+                        self.friends_note = Some((m.clone(), self.time));
+                        self.friends_suggest =
+                            minelib_net::proto::suggested_player(&m).map(str::to_string);
+                    }
                     if let Some(s) = &mut self.session {
                         // Refus de la liste des OP demandée pour l'éditeur de lumières : son
                         // propre message à la place.
                         let editor = m.contains("Réservé aux OP") && s.light_op_answer(false);
-                        if !editor && (s.net.is_some() || s.build.is_some()) {
+                        if !editor && (adding || s.net.is_some() || s.build.is_some()) {
                             s.chat.say(m.clone(), chat::RED);
                         }
                     }
@@ -1696,6 +1759,13 @@ impl Game {
                     .room(Cmd::MatchResult(minelib_net::game::encode(&summary)));
             }
             for cmd in std::mem::take(&mut s.relay_cmds) {
+                // (v271) `/ami <pseudo>` : sa réponse aussi est dite (tchat et panneau).
+                if let Cmd::Friend { pseudo, add: true } = &cmd {
+                    if !pseudo.is_empty() {
+                        self.friend_adding = Some((pseudo.clone(), self.time));
+                        self.friends_suggest = None;
+                    }
+                }
                 self.accounts.room(cmd);
             }
             if std::mem::take(&mut s.voice_dirty) {
@@ -2917,7 +2987,7 @@ impl Game {
             &mut self.friends_ui,
             &self.accounts,
             in_world,
-            note.as_deref(),
+            note.as_ref().map(|(n, p)| (n.as_str(), p.as_deref())),
             rect,
             time,
         );
@@ -3686,6 +3756,9 @@ impl Game {
         // l'inventaire créatif » : les réglages se rangent sur une colonne s'ils tiennent entre
         // le titre et les notes du bas, sinon sur deux ; s'ils ne tiennent toujours pas, ils
         // défilent (molette, barre à droite).
+        // (v271) « 2 par colonne les boutons des paramètres graphiques » : toujours deux par
+        // ligne. Dans une fenêtre trop étroite pour deux réglages de 300, ils rétrécissent
+        // (leur texte aussi) ; une seule colonne seulement sous 150 chacun.
         let several = gpu_report::several_cards();
         let n = 7 + usize::from(several) + usize::from(low_latency.is_some());
         let notes = 1 + usize::from(self.options.point_torches) + usize::from(self.optimus.is_some());
@@ -3693,11 +3766,13 @@ impl Game {
         let bottom = c.h * 0.78 - 14.0 * s - notes as f32 * ds * 10.0 - 4.0 * s;
         let avail = (bottom - top).max(step);
         let fit = ((avail / step).floor() as usize).max(1);
-        let cols = if n > fit && c.w >= 640.0 * s { 2 } else { 1 };
+        let half = ((c.w / s - 24.0) / 2.0 - 10.0).min(300.0).floor();
+        let cols = if half >= 150.0 { 2 } else { 1 };
+        let bw = if cols == 2 { half } else { 300.0 };
         let rows = n.div_ceil(cols);
         let vis = fit.min(rows);
-        let col_w = if cols == 2 { 310.0 * s } else { 0.0 };
-        let area_w = if cols == 2 { 620.0 * s } else { 310.0 * s };
+        let col_w = if cols == 2 { (bw + 10.0) * s } else { 0.0 };
+        let area_w = (bw + 10.0) * s * cols as f32;
         let over = c.hovered(cx - area_w / 2.0, top, area_w, vis as f32 * step);
         Ctx::wheel(input, over, rows, vis, &mut self.graphics_scroll);
         if rows > vis {
@@ -3742,7 +3817,7 @@ impl Game {
         };
         if let Some((x, y)) = next() {
             let frac = ((cfg.view_distance - 2) as f32 / (max - 2) as f32).sqrt();
-            if let Some(f) = c.slider(1, &mut self.slider_drag, &label, frac, x, y, 300.0) {
+            if let Some(f) = c.slider(1, &mut self.slider_drag, &label, frac, x, y, bw) {
                 cfg.view_distance = 2 + (f * f * (max - 2) as f32).round() as i32;
             }
         }
@@ -3756,7 +3831,7 @@ impl Game {
                 (scale - 0.5) / 0.5,
                 x,
                 y,
-                300.0,
+                bw,
             ) {
                 scale = ((0.5 + f * 0.5) * 20.0).round() / 20.0;
             }
@@ -3775,7 +3850,7 @@ impl Game {
             } else {
                 (cur.clamp(30, 500) - 30) as f32 / 470.0 * 0.985
             };
-            if let Some(f) = c.slider(6, &mut self.slider_drag, &label, frac, x, y, 300.0) {
+            if let Some(f) = c.slider(6, &mut self.slider_drag, &label, frac, x, y, bw) {
                 self.options.fps_max = if f > 0.985 {
                     0
                 } else {
@@ -3790,7 +3865,7 @@ impl Game {
             } else {
                 "Raytracing (reflets) : désactivé"
             };
-            if c.button(rt_label, x, y, 300.0, true) {
+            if c.button(rt_label, x, y, bw, true) {
                 raytracing = !raytracing;
             }
         }
@@ -3802,7 +3877,7 @@ impl Game {
             } else {
                 "Torches ponctuelles : désactivé"
             };
-            if c.button(pt_label, x, y, 300.0, true) {
+            if c.button(pt_label, x, y, bw, true) {
                 self.options.point_torches = !self.options.point_torches;
             }
         }
@@ -3812,7 +3887,7 @@ impl Game {
             } else {
                 "Plein écran : non (F11)"
             };
-            if c.button(fs_label, x, y, 300.0, true) {
+            if c.button(fs_label, x, y, bw, true) {
                 self.options.fullscreen = !self.options.fullscreen;
             }
         }
@@ -3829,7 +3904,7 @@ impl Game {
                 if self.options.igpu != self.igpu_at_start {
                     gpu_label.push_str(" (au prochain lancement)");
                 }
-                if c.button(&gpu_label, x, y, 300.0, true) {
+                if c.button(&gpu_label, x, y, bw, true) {
                     self.options.igpu = !self.options.igpu;
                 }
             }
@@ -3841,7 +3916,7 @@ impl Game {
             } else {
                 "Processeur : coeurs réservés"
             };
-            if c.button(cpu_label, x, y, 300.0, true) {
+            if c.button(cpu_label, x, y, bw, true) {
                 self.options.cpu_uniform = !self.options.cpu_uniform;
                 jobs::set_uniform_sharing(self.options.cpu_uniform);
             }
@@ -3854,7 +3929,7 @@ impl Game {
                     kind.label(),
                     if *on { "activé" } else { "désactivé" }
                 );
-                if c.button(&label, x, y, 300.0, true) {
+                if c.button(&label, x, y, bw, true) {
                     *on = !*on;
                 }
             }

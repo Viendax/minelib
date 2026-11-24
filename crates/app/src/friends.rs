@@ -53,6 +53,9 @@ pub struct FriendsView<'a> {
     pub in_world: Option<u64>,
     /// Message à montrer sous la recherche (invitation envoyée, erreur…).
     pub note: Option<&'a str>,
+    /// (v271) Pseudo proposé par le relais pour un ami inconnu (« lside » pour « 1side ») :
+    /// un bouton l'ajoute.
+    pub suggest: Option<&'a str>,
 }
 
 /// Ce que le joueur a demandé.
@@ -193,11 +196,19 @@ pub fn panel(
     }
     let mut y = sy + 23.0 * s;
     if let Some(n) = v.note {
-        for line in wrap(n, inner, ds).into_iter().take(2) {
+        // (v271) Jusqu'à cinq lignes : un refus dit pourquoi, et le pseudo proposé.
+        for line in wrap(n, inner, ds).into_iter().take(5) {
             c.ui.text(lx, y, ds, GOLD, line);
             y += 6.0 * ds + 2.0 * s;
         }
         y += 2.0 * s;
+        if let Some(p) = v.suggest {
+            // (Le bouton réduit ou coupe lui-même un texte trop long.)
+            if c.button(&format!("Ajouter {p}"), x + w / 2.0, y, inner / s, true) {
+                out = FriendsAction::Add(p.to_string());
+            }
+            y += 23.0 * s;
+        }
     }
     // Un grand bouton et un « x » (refuser, ignorer), toujours lisibles.
     let bw = inner / s - 26.0;
@@ -452,6 +463,7 @@ mod tests {
             invisible: false,
             in_world,
             note: None,
+            suggest: None,
         };
         // Au menu : on rejoint Bob, on n'invite personne.
         assert_eq!(actions(&view(None), 0), (Some(7), false));

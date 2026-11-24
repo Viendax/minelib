@@ -325,6 +325,20 @@ fn font_code(ch: char) -> u32 {
     }
 }
 
+/// (v271) Le l minuscule de la police : droit, avec un pied vers la droite (celui de
+/// font8x8 se confondait avec le chiffre 1).
+const L_GLYPH_CODE: u32 = b'l' as u32;
+const L_GLYPH: [u8; 8] = [
+    0b0000_1100,
+    0b0000_1100,
+    0b0000_1100,
+    0b0000_1100,
+    0b0000_1100,
+    0b0000_1100,
+    0b0011_1000,
+    0,
+];
+
 /// Police 8×8 en niveaux de gris, 128 × 128 (16 × 16 cases).
 pub(crate) fn font_bitmap() -> Vec<u8> {
     use font8x8::legacy::{BASIC_LEGACY, LATIN_LEGACY};
@@ -344,6 +358,10 @@ pub(crate) fn font_bitmap() -> Vec<u8> {
                 0,
                 0,
             ],
+            // (v271) « Je n'arrive pas à ajouter mon pote 1side » : il s'appelle « lside ».
+            // Le l de font8x8 (empattement en haut à gauche, pied large) se lisait comme un
+            // 1 : il est droit, avec un pied tourné vers la droite.
+            L_GLYPH_CODE => L_GLYPH,
             0..=127 => BASIC_LEGACY[code as usize],
             160..=255 => LATIN_LEGACY[(code - 160) as usize],
             _ => [0; 8],
@@ -868,6 +886,31 @@ impl OverlayRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v271) Le l minuscule ne ressemble plus au chiffre 1 ni au I majuscule (pseudo
+    /// « lside » lu « 1side ») : au moins quatre pixels de différence avec chacun, et le pied
+    /// part vers la droite (le 1 et le I l'ont des deux côtés).
+    #[test]
+    fn lowercase_l_is_not_read_as_one() {
+        let px = font_bitmap();
+        let cell = |code: u8| -> Vec<bool> {
+            let code = code as u32;
+            let (cx, cy) = ((code % 16) * CELL, (code / 16) * CELL);
+            (0..CELL)
+                .flat_map(|y| (0..CELL).map(move |x| (x, y)))
+                .map(|(x, y)| px[((cy + y) * 128 + cx + x) as usize] > 0)
+                .collect()
+        };
+        let l = cell(b'l');
+        for other in [b'1', b'I', b'i', b'|'] {
+            let o = cell(other);
+            let diff = l.iter().zip(&o).filter(|(a, b)| a != b).count();
+            assert!(diff >= 4, "l et {} : {diff} pixels de différence", other as char);
+        }
+        // Pied : rien à gauche de la tige (colonnes 0 et 1) sur la dernière ligne pleine.
+        let row6 = &l[6 * CELL as usize..7 * CELL as usize];
+        assert!(!row6[0] && !row6[1] && row6[4], "{row6:?}");
+    }
 
     #[test]
     fn font_has_glyphs_and_solid_cell() {

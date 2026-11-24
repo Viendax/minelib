@@ -203,9 +203,16 @@ impl<'a> Ctx<'a> {
             "gui/button"
         };
         self.ui.nine_slice(sprite, kx, y, knob, h, 3.0, s);
-        let tw = Ui::text_width(label, s);
+        // (v271) Comme les boutons : jamais de texte qui dépasse (plus petit, puis coupé),
+        // pour les curseurs rétrécis des paramètres graphiques sur deux colonnes.
+        let mut ts = s;
+        while ts > 1.0 && Ui::text_width(label, ts) > w - 6.0 * s {
+            ts -= 1.0;
+        }
+        let label = &fit(label, w - 4.0 * s, ts);
+        let tw = Ui::text_width(label, ts);
         self.ui
-            .text(x + (w - tw) / 2.0, y + (h - 8.0 * s) / 2.0, s, WHITE, label);
+            .text(x + (w - tw) / 2.0, y + (h - 8.0 * ts) / 2.0, ts, WHITE, label);
         changed
     }
 

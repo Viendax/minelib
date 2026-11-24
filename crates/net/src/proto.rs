@@ -156,6 +156,74 @@ pub fn valid_pseudo(p: &str) -> bool {
         && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// (v271) Caractères qui se ressemblent dans un pseudo (« je n'arrive pas à ajouter mon pote
+/// 1side » : son pseudo est « lside », un L minuscule que la police du jeu dessinait comme
+/// un 1) : 1, l et i ; 0 et o ; 5 et s ; 2 et z ; 8 et b. En minuscules : les pseudos se
+/// comparent sans la casse.
+const LOOKALIKE: [&str; 5] = ["1li", "0o", "5s", "2z", "8b"];
+
+/// (v271) Variantes d'un pseudo par ces ressemblances (en minuscules, lui compris en
+/// premier), `max` au plus.
+pub fn lookalikes(pseudo: &str, max: usize) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for c in pseudo.to_ascii_lowercase().chars() {
+        let class = LOOKALIKE.iter().find(|k| k.contains(c));
+        let options: Vec<char> = match class {
+            // Le caractère tapé d'abord : la première variante est le pseudo lui-même.
+            Some(k) => std::iter::once(c)
+                .chain(k.chars().filter(|&o| o != c))
+                .collect(),
+            None => vec![c],
+        };
+        let mut next = Vec::with_capacity(out.len() * options.len());
+        'all: for v in &out {
+            for &o in &options {
+                if next.len() >= max.max(1) {
+                    break 'all;
+                }
+                let mut s = v.clone();
+                s.push(o);
+                next.push(s);
+            }
+        }
+        out = next;
+    }
+    out
+}
+
+/// (v271) Ce que le relais répond pour un pseudo inconnu, avec celui qui lui ressemble s'il
+/// y en a un (voir `suggested_player`) : la lettre qui change est nommée, la police pouvant
+/// montrer pareil un l et un 1.
+pub fn unknown_player(who: &str, alike: Option<&str>) -> String {
+    let Some(a) = alike else {
+        return format!("Joueur « {who} » inconnu.");
+    };
+    let name = |c: char| {
+        if c.is_ascii_digit() {
+            format!("le chiffre {c}")
+        } else if c.is_ascii_uppercase() {
+            format!("un {c} majuscule")
+        } else {
+            format!("un {} minuscule", c.to_ascii_uppercase())
+        }
+    };
+    let hint = who
+        .chars()
+        .zip(a.chars())
+        .find(|(w, s)| !w.eq_ignore_ascii_case(s))
+        .map(|(w, s)| format!(" ({}, pas {})", name(s), name(w)))
+        .unwrap_or_default();
+    format!("Joueur « {who} » inconnu. Voulais-tu dire « {a} »{hint} ?")
+}
+
+/// (v271) Pseudo proposé par un message de `unknown_player` (bouton « Ajouter » du panneau
+/// des amis).
+pub fn suggested_player(msg: &str) -> Option<&str> {
+    let rest = msg.split_once("Voulais-tu dire « ")?.1;
+    let p = rest.split_once(" »")?.0;
+    valid_pseudo(p).then_some(p)
+}
+
 /// Mot de passe : au moins 8 caractères, au plus 128.
 pub fn valid_password(p: &str) -> bool {
     (8..=128).contains(&p.chars().count())
@@ -2288,5 +2356,34 @@ mod version_tests {
         assert_eq!(super::client_version("minelib-garant 0.1.0 v7"), 7);
         assert_eq!(super::client_version("minelib 0.1.0"), 0);
         assert_eq!(super::client_version("relais minelib 0.1.0"), 0);
+    }
+}
+
+#[cfg(test)]
+mod lookalike_tests {
+    use super::*;
+
+    /// (v271) « Je n'arrive pas à ajouter mon pote 1side » : il s'appelle « lside ». Les
+    /// variantes d'un pseudo par ses lettres qui se ressemblent, et le message du relais qui
+    /// propose la bonne (et que le jeu relit pour un bouton « Ajouter »).
+    #[test]
+    fn a_lookalike_pseudo_is_proposed() {
+        let v = lookalikes("1side", 64);
+        assert_eq!(v[0], "1side");
+        assert!(v.contains(&"lside".to_string()), "{v:?}");
+        assert!(v.contains(&"iside".to_string()));
+        assert!(v.contains(&"lslde".to_string()));
+        assert_eq!(lookalikes("Fox", 64), vec!["fox".to_string(), "f0x".to_string()]);
+        assert!(lookalikes("1111111111111111", 256).len() <= 256);
+        let m = unknown_player("1side", Some("lside"));
+        assert_eq!(
+            m,
+            "Joueur « 1side » inconnu. Voulais-tu dire « lside » (un L minuscule, pas le chiffre 1) ?"
+        );
+        assert_eq!(suggested_player(&m), Some("lside"));
+        assert_eq!(unknown_player("1side", None), "Joueur « 1side » inconnu.");
+        assert_eq!(suggested_player("Joueur « 1side » inconnu."), None);
+        let m = unknown_player("lnes", Some("Ines"));
+        assert!(m.ends_with("« Ines » (un I majuscule, pas un L minuscule) ?"), "{m}");
     }
 }

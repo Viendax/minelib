@@ -5938,6 +5938,19 @@ fn trust_of(st: &State, pseudo: &str) -> i32 {
         .unwrap_or(stats::TRUST_START)
 }
 
+/// (v271) Le compte de ce relais dont le pseudo ressemble à `who` à l'œil (1, l et i ; 0 et
+/// o… : `proto::lookalikes`), s'il n'y en a qu'un.
+fn lookalike_account(st: &State, who: &str) -> Option<String> {
+    // Le registre (en mémoire) d'abord ; puis un compte de ce relais (on peut l'ajouter).
+    let mut found = proto::lookalikes(who, 256)
+        .into_iter()
+        .skip(1)
+        .filter(|v| st.registry.lookup(v).is_some())
+        .filter_map(|v| st.accounts.load(&v).map(|a| a.pseudo));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
 /// Bannit un compte pour triche : registre (tous les relais), machines 3 mois,
 /// connexions coupées.
 fn ban_cheater(st: &mut State, target: &str, reason: &str) -> Result<usize, String> {
@@ -7429,9 +7442,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         Request::Friend { pseudo: who, add } => {
             if !who.is_empty() {
                 let Some(found) = st.accounts.load(&who) else {
+                    // (v271) Le pseudo qui lui ressemble (« 1side » pour « lside ») : proposé.
+                    let alike = lookalike_account(st, &who);
                     return Some(err(
                         ErrorCode::Refused,
-                        format!("Joueur « {who} » inconnu."),
+                        proto::unknown_player(&who, alike.as_deref()),
                     ));
                 };
                 let name = found.pseudo.clone();
@@ -10627,6 +10642,34 @@ mod tests {
         };
         let alice = login("Alice");
         let bob = login("Bob");
+        // (v271) « Je n'arrive pas à ajouter mon pote 1side » : il s'appelle « lside », un L
+        // minuscule. Refusé, mais le relais propose le pseudo qui lui ressemble, déconnecté
+        // ou pas ; ajouté par ce nom-là, c'est fait (une demande qui l'attendra).
+        let lside = login("lside");
+        drop(lside);
+        alice.send(Cmd::Friend {
+            pseudo: "1side".into(),
+            add: true,
+        });
+        let m = error(&alice);
+        assert_eq!(proto::suggested_player(&m), Some("lside"), "{m}");
+        assert!(m.contains("un L minuscule, pas le chiffre 1"), "{m}");
+        alice.send(Cmd::Friend {
+            pseudo: "Zorglub".into(),
+            add: true,
+        });
+        assert_eq!(error(&alice), "Joueur « Zorglub » inconnu.");
+        let (l, p, _, _) = add(&alice, "lside");
+        assert_eq!(l, vec![("lside".to_string(), false)]);
+        assert_eq!(p, vec![pending.clone()]);
+        let (l, _, _, _) = {
+            alice.send(Cmd::Friend {
+                pseudo: "lside".into(),
+                add: false,
+            });
+            answer(&alice)
+        };
+        assert!(l.is_empty());
         // Demande : Bob la reçoit ; Alice ne sait rien de lui tant qu'il n'a pas accepté.
         let (l, p, _, _) = add(&alice, "bob");
         assert_eq!(l, vec![("Bob".to_string(), false)]);
