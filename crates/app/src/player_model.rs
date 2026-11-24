@@ -54,6 +54,13 @@ pub struct Pose {
     /// 0 presque toujours (le joueur local seulement : le modèle partagé de la carte
     /// graphique ne le connaît pas).
     pub bow: f32,
+    /// (v303) En l'air (saut, chute, pas en vol) : 1 il monte … 0 au sol … −1 il tombe.
+    pub air: f32,
+    /// (v303) La direction de son déplacement par rapport à son regard (rad) : 0 en avant,
+    /// π en arrière, ±π/2 de côté.
+    pub dir: f32,
+    /// (v303) 0 il marche … 1 il court.
+    pub run: f32,
 }
 
 impl Pose {
@@ -70,6 +77,9 @@ impl Pose {
             held: self.held,
             skin: self.skin.clone(),
             bow: self.bow,
+            air: self.air,
+            dir: self.dir,
+            run: self.run,
         }
     }
 }
@@ -924,9 +934,6 @@ fn crouch_lean(crouch: f32) -> Crouch {
     }
 }
 
-/// (v251) Balancement du bras levé en marchant (part du balancement des jambes) : celui du
-/// bras tendu de la lampe torche. Le même dans `part_matrix` (players.wgsl).
-const RAISED_SWING: f32 = 0.1;
 
 /// Penche du ventre accroupi (radians), et pli du dos à la taille : la poitrine est penchée
 /// de leur somme. Les mêmes dans `part_matrix` (players.wgsl). (v260) Avant, tout le haut du
@@ -1119,29 +1126,156 @@ pub fn squat(drop: f32) -> f32 {
     ((LEG - drop) / reach).clamp(-1.0, 1.0).acos() - (LEG_D / 2.0).atan2(LEG)
 }
 
+/// (v303) « Fais une meilleure animation de marche et de course […], ajoute une animation de
+/// saut […] ; les bras et les jambes peuvent être désynchronisés selon notre direction, et en
+/// saut » : les angles des membres dans une pose (rad). Indices : 0 gauche, 1 droite.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Gait {
+    /// Cuisses : angle vers l'avant ; écart vers le dehors (pas de côté, chute).
+    pub leg: [f32; 2],
+    pub leg_out: [f32; 2],
+    /// Genoux : pli en plus de celui de l'accroupi.
+    pub knee: [f32; 2],
+    /// Bras qui pendent : angle vers l'avant, écart vers le dehors, pli du coude.
+    pub arm: [f32; 2],
+    pub arm_out: [f32; 2],
+    pub elbow: [f32; 2],
+    /// Bras tendu ou levé (un objet, une arme en main) : son léger balancement (opposé d'un
+    /// bras à l'autre), ce qu'il monte et descend à chaque pas et en sautant (les deux bras
+    /// ensemble), et ce dont il baisse en courant (pas en visant avec une arme).
+    pub held: f32,
+    pub lift: f32,
+    pub held_drop: f32,
+}
+
+/// (v303) Amplitudes du pas : la cuisse (marche, en plus en courant), le bras ; le genou en
+/// plus en courant ; le coude du coureur ; le pas de côté ; le retard des bras sur les jambes.
+pub const STRIDE: f32 = 0.75;
+pub const STRIDE_RUN: f32 = 0.2;
+pub const ARM_RUN: f32 = 0.15;
+pub const ARM_BACK: f32 = 0.25;
+pub const KNEE_RUN: f32 = 0.35;
+pub const ELBOW_RUN: f32 = 1.0;
+pub const SIDE_STEP: f32 = 0.3;
+pub const ARM_LAG: f32 = 0.3;
+
+/// (v303) Les angles des membres (`Gait`) : moment du pas `walk` et son ampleur `swing`, en
+/// l'air de `air` (1 il monte … −1 il tombe), déplacement dans la direction `dir` par rapport
+/// au regard, course `run`. Le même calcul que `gait` de players.wgsl, ligne pour ligne.
+///
+/// - Marche : les cuisses se croisent, le genou de la jambe qui revient vers l'avant plie ;
+///   les bras à l'opposé, un peu en retard (`ARM_LAG`), le coude plie quand le bras est
+///   devant. En arrière (`dir` = π) tout s'inverse : c'est la jambe qui recule qui se lève.
+/// - Course : des pas plus grands, les genoux plus hauts, les coudes pliés, les bras tirés
+///   en arrière, qui pompent.
+/// - De côté : les jambes s'écartent l'une après l'autre au lieu de se croiser, les bras ne
+///   balancent presque plus.
+/// - Saut : en montant, une jambe repliée devant, l'autre un peu derrière (laquelle : selon
+///   le moment du pas), les bras jetés vers l'avant, pas à la même hauteur ; en tombant, les
+///   jambes à demi pliées, les bras écartés.
+pub fn gait(walk: f32, swing: f32, air: f32, dir: f32, run: f32) -> Gait {
+    let s = swing.clamp(0.0, 1.0);
+    let r = run.clamp(0.0, 1.0);
+    let up = air.clamp(0.0, 1.0);
+    let down = (-air).clamp(0.0, 1.0);
+    let ground = 1.0 - up.max(down);
+    let f = dir.cos();
+    let side = dir.sin().abs();
+    let (sw, cw) = (walk.sin(), walk.cos());
+    let swa = (walk - ARM_LAG).sin();
+    let step = s * ground;
+    let lead = 0.5 + 0.5 * sw;
+    let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let mut g = Gait::default();
+    for i in 0..2 {
+        // Jambe gauche : +1 ; droite : −1. Bras : l'inverse.
+        let sign = 1.0 - 2.0 * i as f32;
+        let w = if i == 0 { lead } else { 1.0 - lead };
+        let out = (sw * sign).max(0.0);
+        g.leg[i] = (STRIDE + STRIDE_RUN * r) * step * f * sw * sign
+            + up * mix(-0.3, 0.85, w)
+            + down * mix(-0.2, 0.3, w);
+        g.leg_out[i] = SIDE_STEP * step * side * out + 0.12 * down;
+        g.knee[i] = (KNEE_WALK + KNEE_RUN * r)
+            * step
+            * (f.abs() * (cw * sign).max(0.0) + 0.5 * side * out)
+            + up * mix(0.5, 1.3, w)
+            + down * mix(0.25, 0.5, w);
+        g.arm[i] = -(STRIDE + ARM_RUN * r) * step * f * swa * sign - ARM_BACK * r * step
+            + up * mix(0.55, 0.9, w)
+            - 0.2 * down;
+        g.arm_out[i] = 0.06 * side * step + 0.25 * up + 0.75 * down;
+        g.elbow[i] = ELBOW_REST
+            + (ELBOW_WALK * (1.0 - r) + 0.25 * r) * step * (0.5 - 0.5 * swa * sign)
+            + ELBOW_RUN * r * step
+            + 0.5 * up
+            + 0.3 * down;
+    }
+    g.held = 0.05 * step * f * sw;
+    g.lift = 0.03 * step * (2.0 * walk).sin() + 0.15 * up - 0.1 * down;
+    g.held_drop = 0.22 * r * step;
+    g
+}
+
+/// (v303) `Pose::air` d'après ce qu'il fait : au sol 0 ; en l'air, d'après sa vitesse
+/// verticale (blocs/s) : il monte (0,35 … 1) ou il tombe (−0,35 … −1).
+pub fn air_of(airborne: bool, vy: f32) -> f32 {
+    if !airborne {
+        0.0
+    } else if vy > 0.0 {
+        (0.35 + vy / 8.0).min(1.0)
+    } else {
+        -(0.35 - vy / 10.0).min(1.0)
+    }
+}
+
+/// (v303) `Pose::run` d'après sa vitesse à plat (blocs/s) : la marche (4,4) 0, la course
+/// (6,6) 1.
+pub fn run_of(speed: f32) -> f32 {
+    ((speed - 4.7) / 1.6).clamp(0.0, 1.0)
+}
+
+/// (v303) `Pose::dir` : la direction du déplacement `flat` (à plat, dans le monde) par
+/// rapport au regard `yaw` (rad) : 0 en avant, π/2 vers sa droite.
+pub fn heading(flat: Vec3, yaw: f32) -> f32 {
+    let (s, c) = yaw.sin_cos();
+    // Devant lui : (sin, −cos) ; à sa droite : (cos, sin).
+    (flat.x * c + flat.z * s).atan2(flat.x * s - flat.z * c)
+}
+
+/// (v303) L'angle `from` rapproché de `to` de la part `k` (au plus tout), par le plus court.
+pub fn turn_toward(from: f32, to: f32, k: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let d = (to - from + PI).rem_euclid(TAU) - PI;
+    from + d * k.clamp(0.0, 1.0)
+}
+
+impl Pose {
+    /// (v303) Les angles de ses membres (`gait`).
+    pub fn gait(&self) -> Gait {
+        gait(self.walk, self.swing, self.air, self.dir, self.run)
+    }
+}
+
 /// (v290) Les plis des quatre membres dans cette pose : genou gauche, genou droit, coude
 /// gauche, coude droit (rad). Un bras tendu vers le regard ou levé avec un objet reste droit.
 pub fn bends(pose: &Pose) -> [f32; 4] {
     let crouch = pose.crouch.clamp(0.0, 1.0);
     let base = 2.0 * squat(crouch_lean(pose.crouch).drop);
-    // Le genou plie pendant que la jambe revient vers l'avant (son angle, `swing × signe`,
-    // grandit : cos(marche) × signe > 0).
-    let knee = |sign: f32| {
-        (base + KNEE_WALK * pose.swing * (pose.walk.cos() * sign).max(0.0)).min(KNEE_MAX)
-    };
-    // Le coude plie d'autant plus que le bras est en avant (le gauche l'est quand la jambe
-    // gauche est en arrière).
+    // (v303) Le pas, le saut : `gait`. Le genou plie pendant que la jambe revient vers
+    // l'avant ; le coude d'autant plus que le bras est devant.
+    let g = pose.gait();
+    let knee = |i: usize| (base + g.knee[i]).min(KNEE_MAX);
     let aim = aims(pose);
     let held = pose.held.is_some() || aims_right(pose).is_some();
-    let elbow = |sign: f32, straight: bool| {
+    let elbow = |i: usize, straight: bool| {
         if straight {
             0.0
         } else {
-            let ahead = 0.5 + 0.5 * pose.walk.sin() * sign;
-            ELBOW_REST + ELBOW_WALK * pose.swing * ahead + ELBOW_CROUCH * crouch
+            g.elbow[i] + ELBOW_CROUCH * crouch
         }
     };
-    [knee(1.0), knee(-1.0), elbow(-1.0, aim), elbow(1.0, aim || held)]
+    [knee(0), knee(1), elbow(0, aim), elbow(1, aim || held)]
 }
 
 /// (v290) Le repère du segment du bas de chaque membre (pavés 0, 1, 3, 4 de `parts`), et la
@@ -1238,7 +1372,8 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     let base = Mat4::from_translation(pose.feet)
         * Mat4::from_rotation_y(-pose.yaw)
         * Mat4::from_scale(Vec3::splat(PX));
-    let swing = pose.walk.sin() * 0.75 * pose.swing;
+    // (v303) Le pas, la course, le pas de côté, le saut : `gait`.
+    let g = pose.gait();
     let bent = crouch_lean(pose.crouch);
     // `lean` : la penche de la poitrine, à laquelle tiennent les bras.
     let (lean, drop) = (bent.chest, bent.drop);
@@ -1249,10 +1384,13 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     // (v290) Accroupi, la jambe ne se tasse plus : la cuisse part en avant de `squat`, le
     // genou plie du double (`bends`, `lowers`).
     let thigh = squat(drop);
-    for (side, sign) in [(-LEG_X, 1.0f32), (LEG_X, -1.0)] {
+    for (i, side) in [-LEG_X, LEG_X].into_iter().enumerate() {
+        // (Vers le dehors : la jambe gauche vers −x, la droite vers +x.)
+        let apart = g.leg_out[i] * (2.0 * i as f32 - 1.0);
         let xf = base
             * Mat4::from_translation(Vec3::new(side, LEG - drop, 0.0))
-            * Mat4::from_rotation_x(swing * sign + thigh);
+            * Mat4::from_rotation_z(apart)
+            * Mat4::from_rotation_x(g.leg[i] + thigh);
         let (min, max, part) = PARTS[out.len()];
         out.push((xf, min, max, part));
     }
@@ -1298,7 +1436,9 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
                     std::f32::consts::FRAC_PI_2
                         + (pose.pitch.clamp(-1.4, 1.4) - down).max(-AIM_LOWEST)
                         + lean
-                        + swing * sign * 0.1,
+                        + g.held * sign
+                        + g.lift
+                        - if aim { 0.0 } else { g.held_drop },
                 );
             let (min, max, part) = PARTS[out.len()];
             out.push((xf, min, max, part));
@@ -1319,7 +1459,14 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         // (v251) « Le mouvement du bras quand j'avance avec la lampe torche est mieux ; avec un
         // objet, on dirait que mon joueur tape » : le bras levé (Foudre de Zeus) se balance
         // aussi peu que le bras tendu de la lampe (0,1 ; 0,3 avant).
-        let swing_k = if raise != 0.0 { RAISED_SWING } else { 1.0 };
+        // (v303) Le bras levé : son léger balancement (`Gait::held`), baissé un peu en
+        // courant ; le bras qui pend : son pas (`Gait::arm`), écarté en tombant.
+        let i = (side > 0.0) as usize;
+        let (swung, apart) = if raise != 0.0 {
+            (g.held + g.lift - 0.5 * g.held_drop, 0.0)
+        } else {
+            (g.arm[i], g.arm_out[i])
+        };
         // (v256) Le bras qui pend est écarté du corps (`ARM_SPLAY`) : il ne le touche que par
         // le coin du haut de l'épaule. Pas celui qui tient un objet.
         let splay = if side > 0.0 && pose.held.is_some() {
@@ -1329,8 +1476,8 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         };
         let xf = upper
             * Mat4::from_translation(Vec3::new(side, SHOULDER_Y, 0.0))
-            * Mat4::from_rotation_z(splay)
-            * Mat4::from_rotation_x(swing * sign * swing_k + lean * 0.6 + raise);
+            * Mat4::from_rotation_z(splay + apart * sign)
+            * Mat4::from_rotation_x(swung + lean * 0.6 + raise);
         let (min, max, part) = PARTS[out.len()];
         out.push((xf, min, max, part));
     }
@@ -2361,6 +2508,10 @@ pub struct Prev {
     pub walk: f32,
     pub swing: f32,
     pub crouch: f32,
+    /// (v303) En l'air, direction du déplacement, course (`Pose`).
+    pub air: f32,
+    pub dir: f32,
+    pub run: f32,
 }
 
 impl Prev {
@@ -2373,6 +2524,9 @@ impl Prev {
             walk: pose.walk,
             swing: pose.swing,
             crouch: pose.crouch,
+            air: pose.air,
+            dir: pose.dir,
+            run: pose.run,
         }
     }
 }
@@ -2411,6 +2565,12 @@ pub fn instance(pose: &Pose, layer: u32, prev: &Prev) -> PlayerInstance {
         prev_walk: prev.walk,
         prev_swing: prev.swing,
         prev_crouch: prev.crouch,
+        air: pose.air,
+        dir: pose.dir,
+        run: pose.run,
+        prev_air: prev.air,
+        prev_dir: prev.dir,
+        prev_run: prev.run,
     }
 }
 
@@ -2934,6 +3094,9 @@ pub fn hit_boxes(feet: Vec3, yaw: f32, pitch: f32, crouch: f32) -> Vec<(Mat4, Ve
         held: Some(Held::Gear(0)),
         skin: None,
         bow: 0.0,
+        air: 0.0,
+        dir: 0.0,
+        run: 0.0,
     };
     // (v290) Les pavés dessinés : accroupi, chaque jambe en fait deux (cuisse, bas de jambe).
     segments(&pose)
@@ -3024,9 +3187,9 @@ mod tests {
             Mat4::from_scale(Vec3::new(if bend == 0.0 { 1.0 } else { LOWER_NARROW }, 1.0, 1.0))
         };
         if part < 9 {
-            let sign = if part == 7 { 1.0 } else { -1.0 };
+            let g = gait(p.walk, p.swing, p.air, p.dir, p.run);
             let knee = (2.0 * shader_squat(CROUCH_HIP_DROP * crouch)
-                + KNEE_WALK * p.swing * (p.walk.cos() * sign).max(0.0))
+                + g.knee[(part - 7) as usize])
             .min(KNEE_MAX);
             return shader_limb_matrix(part - 7, p)
                 * t(0.0, -LEG / 2.0, -LEG_D / 2.0)
@@ -3039,12 +3202,10 @@ mod tests {
         } else {
             p.skin & 0x1f0000 != 0
         };
-        let sign = if part == 9 { -1.0 } else { 1.0 };
         let elbow = if straight {
             0.0
         } else {
-            ELBOW_REST
-                + ELBOW_WALK * p.swing * (0.5 + 0.5 * p.walk.sin() * sign)
+            gait(p.walk, p.swing, p.air, p.dir, p.run).elbow[(part - 9) as usize]
                 + ELBOW_CROUCH * crouch
         };
         let (cut, edge) = ((ARM_UP - ARM_DOWN) / 2.0, ARM_W / 2.0);
@@ -3068,7 +3229,7 @@ mod tests {
         let base = Mat4::from_translation(Vec3::from(p.feet))
             * Mat4::from_rotation_y(-p.yaw)
             * Mat4::from_scale(Vec3::splat(px));
-        let swing = p.walk.sin() * 0.75 * p.swing;
+        let g = gait(p.walk, p.swing, p.air, p.dir, p.run);
         let crouch = p.crouch.clamp(0.0, 1.0);
         let belly = CROUCH_BELLY_LEAN * crouch;
         let bend = CROUCH_BEND * crouch;
@@ -3077,10 +3238,16 @@ mod tests {
         let pitch = p.pitch.clamp(-1.4, 1.4);
         let thigh = shader_squat(drop);
         if part == 0 {
-            return base * t(-LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(swing + thigh);
+            return base
+                * t(-LEG_X, LEG - drop, 0.0)
+                * Mat4::from_rotation_z(-g.leg_out[0])
+                * Mat4::from_rotation_x(g.leg[0] + thigh);
         }
         if part == 1 {
-            return base * t(LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(-swing + thigh);
+            return base
+                * t(LEG_X, LEG - drop, 0.0)
+                * Mat4::from_rotation_z(g.leg_out[1])
+                * Mat4::from_rotation_x(g.leg[1] + thigh);
         }
         if part == 6 {
             return base * t(0.0, LEG - drop, 0.0) * Mat4::from_rotation_x(-belly);
@@ -3107,35 +3274,39 @@ mod tests {
             } else {
                 0.0
             };
+            // (v303) En visant avec une arme (bit 17), le bras ne baisse pas en courant.
+            let run_drop = if p.skin & 0x20000 != 0 { 0.0 } else { g.held_drop };
             return upper
                 * t(side, SHOULDER_Y, 0.0)
                 * Mat4::from_rotation_y(turn)
                 * Mat4::from_rotation_x(
-                    1.570_796_4 + (pitch - down).max(-1.4) + lean + swing * sign * 0.1,
+                    1.570_796_4 + (pitch - down).max(-1.4) + lean + g.held * sign + g.lift
+                        - run_drop,
                 );
         }
         if part == 3 {
             return upper
                 * t(-ARM_X, SHOULDER_Y, 0.0)
-                * Mat4::from_rotation_z(-ARM_SPLAY)
-                * Mat4::from_rotation_x(-swing + lean * 0.6);
+                * Mat4::from_rotation_z(-(ARM_SPLAY + g.arm_out[0]))
+                * Mat4::from_rotation_x(g.arm[0] + lean * 0.6);
         }
         if part == 4 {
-            let (mut raise, mut k) = (0.0, 1.0);
+            let mut raise = 0.0;
             if p.skin & 0x80000 != 0 {
                 raise = ZEUS_RAISE;
-                k = RAISED_SWING;
             } else if p.skin & 0x10000 != 0 {
                 raise = (0.65 + 0.6 * pitch).clamp(0.0, 2.0);
-                if raise != 0.0 {
-                    k = RAISED_SWING;
-                }
+            }
+            let (mut swung, mut out) = (g.arm[1], g.arm_out[1]);
+            if raise != 0.0 {
+                swung = g.held + g.lift - 0.5 * g.held_drop;
+                out = 0.0;
             }
             let splay = if p.skin & 0x10000 != 0 { 0.0 } else { ARM_SPLAY };
             return upper
                 * t(ARM_X, SHOULDER_Y, 0.0)
-                * Mat4::from_rotation_z(splay)
-                * Mat4::from_rotation_x(swing * k + lean * 0.6 + raise);
+                * Mat4::from_rotation_z(splay + out)
+                * Mat4::from_rotation_x(swung + lean * 0.6 + raise);
         }
         let n = chest_at + Vec3::new(0.0, BODY_H * lean.cos(), -BODY_H * lean.sin());
         base * t(n.x, n.y, n.z) * Mat4::from_rotation_x(pitch)
@@ -3177,6 +3348,9 @@ mod tests {
                 held: None,
                 skin: None,
                 bow: 0.0,
+                air: 0.0,
+                dir: 0.0,
+                run: 0.0,
             };
             let m = zeus_back_frame(&pose).unwrap();
             // Repère du joueur : x à droite, z vers l'arrière.
@@ -3231,8 +3405,83 @@ mod tests {
                 ][n],
                 skin: (n > 0).then(|| skin.clone()),
                 bow: 0.0,
+                // (v303) En sautant, de côté, à reculons, en courant.
+                air: [0.0, 0.0, 0.7, -0.8, 0.0, 0.4][n],
+                dir: [0.0, 1.57, 3.1, 0.6, -1.2, 0.0][n],
+                run: [0.0, 1.0, 0.0, 0.5, 0.3, 0.0][n],
             })
             .collect()
+    }
+
+    /// (v303) « Une meilleure animation de marche et de course, une animation de saut, les
+    /// bras et les jambes désynchronisés selon notre direction et en saut » (`gait`).
+    #[test]
+    fn the_gait_walks_runs_sidesteps_and_jumps() {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        // En avant, en marchant : les cuisses comme avant (± 0,75 × l'ampleur), le genou de
+        // la jambe qui revient vers l'avant plié, l'autre droit ; les bras à l'opposé des
+        // jambes, un peu en retard.
+        for k in 0..16 {
+            let walk = k as f32 * 0.4;
+            let g = gait(walk, 0.8, 0.0, 0.0, 0.0);
+            let swing = walk.sin() * 0.75 * 0.8;
+            assert!((g.leg[0] - swing).abs() < 1e-5 && (g.leg[1] + swing).abs() < 1e-5);
+            assert_eq!(g.leg_out, [0.0; 2]);
+            let knee = |sign: f32| KNEE_WALK * 0.8 * (walk.cos() * sign).max(0.0);
+            assert!((g.knee[0] - knee(1.0)).abs() < 1e-5 && (g.knee[1] - knee(-1.0)).abs() < 1e-5);
+            assert!(g.knee[0].min(g.knee[1]) == 0.0);
+            let arm = -(walk - ARM_LAG).sin() * 0.75 * 0.8;
+            assert!((g.arm[0] - arm).abs() < 1e-5 && (g.arm[1] + arm).abs() < 1e-5);
+            assert!(g.elbow.iter().all(|e| (ELBOW_REST..0.7).contains(e)), "{:?}", g.elbow);
+            // À reculons : les mêmes angles, inversés ; la jambe levée est celle qui recule.
+            let back = gait(walk, 0.8, 0.0, PI, 0.0);
+            assert!((back.leg[0] + g.leg[0]).abs() < 1e-5 && (back.knee[0] - g.knee[0]).abs() < 1e-5);
+            // De côté : les jambes ne se croisent plus, elles s'écartent l'une après l'autre ;
+            // les bras ne balancent presque plus.
+            let side = gait(walk, 0.8, 0.0, FRAC_PI_2, 0.0);
+            assert!(side.leg[0].abs() < 1e-5 && side.arm[0].abs() < 1e-5, "{side:?}");
+            assert!(side.leg_out[0].min(side.leg_out[1]) == 0.0);
+            assert!(side.leg_out[0] + side.leg_out[1] <= SIDE_STEP * 0.8 + 1e-5);
+            // En courant : des pas plus grands, les coudes pliés, les bras tirés en arrière.
+            let run = gait(walk, 1.0, 0.0, 0.0, 1.0);
+            assert!((run.leg[0] - walk.sin() * (STRIDE + STRIDE_RUN)).abs() < 1e-5);
+            assert!(run.elbow.iter().all(|e| *e > 1.1 && *e < 1.6), "{:?}", run.elbow);
+            assert!(run.arm[0] + run.arm[1] < -0.4, "{:?}", run.arm);
+            assert!(run.knee[0].max(run.knee[1]) <= KNEE_WALK + KNEE_RUN + 1e-5);
+            // En montant : une jambe repliée devant, l'autre derrière, pas les mêmes ; les
+            // bras jetés vers l'avant, pas à la même hauteur (sauf au milieu du pas) ; plus de
+            // pas. En tombant : les jambes à demi pliées, les bras écartés.
+            let up = gait(walk, 0.8, 1.0, 0.0, 0.0);
+            let (a, b) = (up.leg[0].max(up.leg[1]), up.leg[0].min(up.leg[1]));
+            assert!(a >= 0.27 && b <= 0.28 && a + b > 0.5, "{:?}", up.leg);
+            assert!(up.knee.iter().all(|k| (0.5..=1.3).contains(k)) && up.arm.iter().all(|x| *x >= 0.55));
+            if walk.sin().abs() > 0.3 {
+                assert!((up.leg[0] - up.leg[1]).abs() > 0.3 && (up.arm[0] - up.arm[1]).abs() > 0.1);
+            }
+            let down = gait(walk, 0.8, -1.0, 0.0, 0.0);
+            assert!(down.arm_out.iter().all(|x| *x > 0.7) && down.leg_out.iter().all(|x| *x > 0.1));
+            assert!(down.knee.iter().all(|k| (0.25..=0.5).contains(k)), "{:?}", down.knee);
+            // Le bras qui tient un objet : à peine remué (moins de 5°), baissé en courant.
+            assert!(g.held.abs() + g.lift.abs() < 0.08 && g.held_drop == 0.0);
+            assert!((run.held_drop - 0.22).abs() < 1e-5);
+        }
+        // Immobile : rien ne bouge, les coudes au repos.
+        let still = gait(2.0, 0.0, 0.0, 1.0, 0.0);
+        assert_eq!((still.leg, still.knee, still.arm, still.leg_out), ([0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2]));
+        assert_eq!(still.elbow, [ELBOW_REST; 2]);
+        // Ce qu'on en déduit : en l'air d'après la vitesse verticale, la course d'après la
+        // vitesse, la direction par rapport au regard.
+        assert_eq!(air_of(false, 5.0), 0.0);
+        assert!(air_of(true, 8.0) > 0.99 && (air_of(true, 0.1) - 0.36).abs() < 0.01);
+        assert!(air_of(true, -0.1) < -0.35 && air_of(true, -20.0) == -1.0);
+        assert_eq!((run_of(4.4), run_of(6.6)), (0.0, 1.0));
+        // Le regard vers −z (lacet 0) : avancer 0, vers +x (sa droite) π/2, reculer π.
+        assert!(heading(Vec3::NEG_Z, 0.0).abs() < 1e-5);
+        assert!((heading(Vec3::X, 0.0) - FRAC_PI_2).abs() < 1e-5);
+        assert!((heading(Vec3::Z, 0.0).abs() - PI).abs() < 1e-5);
+        assert!((heading(Vec3::X, FRAC_PI_2)).abs() < 1e-5);
+        // Par le plus court : de 3 à −3 rad, on passe par π.
+        assert!(turn_toward(3.0, -3.0, 0.5) > 3.0);
     }
 
     /// (v234) La tête reste posée au milieu du haut du corps (le cou), debout comme penché
@@ -3291,6 +3540,9 @@ mod tests {
                     held: Some(held),
                     skin: None,
                     bow: 0.0,
+                    air: 0.0,
+                    dir: 0.0,
+                    run: 0.0,
                 };
                 let arm = right_arm_matrix(&pose).unwrap();
                 // De l'épaule (z = 1 de la boîte du bras) au poing (z = 0).
@@ -3319,6 +3571,9 @@ mod tests {
             held: Some(Held::Block(BlockId::STONE)),
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let (frame, min, max, _) = held_parts(&pose)[0];
         let m = held_item_matrix(&pose).unwrap();
@@ -3345,6 +3600,9 @@ mod tests {
                 held: None,
                 skin: None,
                 bow: 0.0,
+                air: 0.0,
+                dir: 0.0,
+                run: 0.0,
             };
             let mut hi = f32::MIN;
             for (xf, mn, mx, _) in parts(&pose) {
@@ -3390,6 +3648,9 @@ mod tests {
                 held: Some(Held::Zeus),
                 skin: None,
                 bow: 0.0,
+                air: 0.0,
+                dir: 0.0,
+                run: 0.0,
             };
             let eye = crate::session::eye_of(pose.feet, 0.0);
             let view = (Mat4::from_translation(eye)
@@ -3472,6 +3733,9 @@ mod tests {
             held,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let p = parts(&pose(None));
         assert_eq!(p.len(), 7);
@@ -3560,6 +3824,9 @@ mod tests {
             held: None,
             skin: Some(skin),
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         // Un carré : son milieu et sa couleur ; deux carrés sont les mêmes au centième de
         // millimètre et au dix-millième de couleur près (les deux dessins ne font pas leurs
@@ -3637,6 +3904,9 @@ mod tests {
             held: None,
             skin: None,
             bow,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let up = mouth_point(&straight(0.0));
         assert!((up.y - feet.y - 1.63).abs() < 0.06 && (up.z - feet.z + 0.1).abs() < 0.06, "{up}");
@@ -3701,6 +3971,9 @@ mod tests {
             held,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let poses = [
             pose(0.0, 0.0, 0.0, None),
@@ -3765,6 +4038,9 @@ mod tests {
                     held: None,
                     skin: None,
                     bow: 0.0,
+                    air: 0.0,
+                    dir: 0.0,
+                    run: 0.0,
                 };
                 // (v278) La caméra avance avec la tête accroupie.
                 let eye = crate::session::eye_of(pose.feet, crouch)
@@ -3833,6 +4109,9 @@ mod tests {
             held: None,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let feet = pose(0.0).feet;
         // De face (il regarde vers −z) : au milieu de la poitrine, puis dans la jambe droite.
@@ -4136,6 +4415,9 @@ mod tests {
             held: None,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let v = build(&pose);
         assert!(v.len() > 5000 && v.len().is_multiple_of(3));
@@ -4206,6 +4488,9 @@ mod tests {
                 held: None,
                 skin: None,
                 bow: 0.0,
+                air: 0.0,
+                dir: 0.0,
+                run: 0.0,
             };
             let boxes = shadow_boxes(&pose);
             // (v273) Immobile aussi, une boîte par jambe (elles sont écartées depuis la v256) :
@@ -4270,6 +4555,9 @@ mod tests {
             held: None,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let boxes = shadow_boxes(&pose);
         let lamp = pose.feet + Vec3::new(1.5, 3.0, 2.0);
@@ -4298,6 +4586,9 @@ mod tests {
             held: None,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         assert_eq!(shadow_boxes(&walking).len(), 9);
         assert_eq!(shadow_boxes(&pose).len(), 7, "immobile : les membres presque droits");
@@ -4327,6 +4618,9 @@ mod tests {
                 held: None,
                 skin: None,
                 bow: 0.0,
+                air: 0.0,
+                dir: 0.0,
+                run: 0.0,
             };
             let boxes = shadow_boxes(&pose);
             let base = Mat4::from_translation(pose.feet)
@@ -4367,6 +4661,9 @@ mod tests {
             held: None,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let seen = first_person_feet(&pose);
         let forward = Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos());
@@ -4397,6 +4694,9 @@ mod held_tests {
             held: Some(Held::Torch([255, 200, 100])),
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let hand = hand_frame(&pose).unwrap().transform_point3(Vec3::ZERO);
         let tip = torch_tip(&pose).unwrap();

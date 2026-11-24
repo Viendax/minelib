@@ -209,6 +209,9 @@ pub fn preview(
         held: None,
         skin,
         bow: 0.0,
+        air: 0.0,
+        dir: 0.0,
+        run: 0.0,
     };
     let k = height / 1.9;
     // Un peu vu d'en haut, avec une légère perspective : on voit que c'est en volume.

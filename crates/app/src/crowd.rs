@@ -240,7 +240,7 @@ impl Crowd {
         // Leur marche, dans la foulée (voir `Npc::walk`).
         for n in &mut self.npcs {
             let (pos, yaw, pitch) = (n.pos, n.yaw, n.pitch);
-            n.walk.update(pos, yaw, pitch, 0.0, dt);
+            n.walk.update(pos, yaw, pitch, 0.0, n.air > 0.0, dt);
         }
         // Abri repris pour quelques joueurs par image : tous en une minute environ.
         for _ in 0..RECHECK_PER_FRAME.min(self.npcs.len()) {
@@ -862,7 +862,7 @@ impl RemoteCrowd {
                 glide(world, n, dt);
             }
             let (pos, yaw, pitch) = (n.pos, n.yaw, n.pitch);
-            n.walk.update(pos, yaw, pitch, 0.0, dt);
+            n.walk.update(pos, yaw, pitch, 0.0, n.air > 0.0, dt);
         }
     }
 

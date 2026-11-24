@@ -93,6 +93,15 @@ pub struct PlayerInstance {
     pub prev_walk: f32,
     pub prev_swing: f32,
     pub prev_crouch: f32,
+    /// (v303) Le reste de son allure (`gait` de players.wgsl) : en l'air (1 il monte … −1
+    /// il tombe), la direction de son déplacement par rapport à son regard (rad), sa course
+    /// (0 … 1) ; puis les mêmes à l'image d'avant.
+    pub air: f32,
+    pub dir: f32,
+    pub run: f32,
+    pub prev_air: f32,
+    pub prev_dir: f32,
+    pub prev_run: f32,
 }
 
 impl PlayerInstance {
@@ -136,7 +145,7 @@ fn half(x: f32) -> u16 {
 /// l'ordre déclaré : cet ordre doit donc suivre celui des champs de la structure (essai
 /// `instance_attributes_follow_the_struct_fields`). Les emplacements 0 à 3 et 9 sont pris
 /// par le modèle (`MESH`).
-const PLAYER_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+const PLAYER_ATTRS: [wgpu::VertexAttribute; 10] = wgpu::vertex_attr_array![
     4 => Float32x3,
     5 => Float32x2,
     6 => Float32x3,
@@ -144,7 +153,9 @@ const PLAYER_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
     8 => Uint32,
     10 => Float32x3,
     11 => Float32x2,
-    12 => Float32x3
+    12 => Float32x3,
+    13 => Float32x3,
+    14 => Float32x3
 ];
 
 /// Joueurs dessinés au plus par image, et skins différents gardés sur la carte graphique.
@@ -303,7 +314,7 @@ impl Players {
             3 => Float32x3,
             9 => Float32x4
         ];
-        const INSTANCE: [wgpu::VertexAttribute; 8] = PLAYER_ATTRS;
+        const INSTANCE: [wgpu::VertexAttribute; 10] = PLAYER_ATTRS;
         let pipeline = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -1461,6 +1472,8 @@ mod tests {
             (10, std::mem::offset_of!(PlayerInstance, prev_feet)),
             (11, std::mem::offset_of!(PlayerInstance, prev_yaw)),
             (12, std::mem::offset_of!(PlayerInstance, prev_walk)),
+            (13, std::mem::offset_of!(PlayerInstance, air)),
+            (14, std::mem::offset_of!(PlayerInstance, prev_air)),
         ];
         assert_eq!(PLAYER_ATTRS.len(), want.len());
         for (a, (location, offset)) in PLAYER_ATTRS.iter().zip(want) {
@@ -1505,7 +1518,8 @@ mod tests {
     #[test]
     fn player_buffers_match_the_shader_layout() {
         assert_eq!(std::mem::size_of::<PlayerVertex>(), 52);
-        // (48, plus la pose de l'image d'avant : pieds, regard, marche.)
-        assert_eq!(std::mem::size_of::<PlayerInstance>(), 80);
+        // (48, plus la pose de l'image d'avant : pieds, regard, marche ; (v303) plus le
+        // reste de l'allure, aujourd'hui et à l'image d'avant.)
+        assert_eq!(std::mem::size_of::<PlayerInstance>(), 104);
     }
 }

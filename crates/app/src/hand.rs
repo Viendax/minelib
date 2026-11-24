@@ -811,6 +811,9 @@ mod tests {
                     held: Some(held),
                     skin: None,
                     bow: 0.0,
+                    air: 0.0,
+                    dir: 0.0,
+                    run: 0.0,
                 };
                 let eye = crate::session::eye_of(pose.feet, 0.0);
                 let to_world = Mat4::from_translation(eye)

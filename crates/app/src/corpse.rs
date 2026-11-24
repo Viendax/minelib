@@ -507,6 +507,9 @@ mod tests {
             held: None,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         crate::player_model::stance(&pose)
     }

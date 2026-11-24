@@ -852,6 +852,11 @@ pub struct Session {
     pub pseudo: String,
     bots_auto: bool,
     walk_amp: f32,
+    /// (v303) Le reste de l'allure de notre modèle (`player_model::Pose`) : en l'air,
+    /// direction du déplacement par rapport au regard, course ; et accroupi en vol qui
+    /// descend (0 … 1).
+    anim: (f32, f32, f32),
+    fly_crouch: f32,
     /// Portes et trappes ouvertes pendant la partie : bloc fermé d'origine (pour refermer).
     opened: HashMap<[i32; 3], BlockId>,
     /// Raytracing : coin de la grille envoyée au GPU, changements depuis, délai.
@@ -1248,6 +1253,8 @@ impl Session {
             pseudo: String::new(),
             bots_auto: true,
             walk_amp: 0.0,
+            anim: (0.0, 0.0, 0.0),
+            fly_crouch: 0.0,
             opened: HashMap::new(),
             vox_origin: None,
             vox_dirty: false,
@@ -1654,6 +1661,9 @@ impl Session {
                         held: None,
                         skin: None,
                         bow: 0.0,
+                        air: 0.0,
+                        dir: 0.0,
+                        run: 0.0,
                     };
                     let away = pos - from;
                     let push = Vec3::new(away.x, 0.0, away.z).normalize_or_zero() * 2.2;
@@ -2268,7 +2278,8 @@ impl Session {
                     &mut self.world,
                     self.player.pos,
                     (self.player.yaw, self.player.pitch),
-                    self.player.crouch,
+                    // (v303) Accroupi aussi pour les autres quand on descend en vol.
+                    self.player.crouch.max(self.fly_crouch),
                     speed,
                     self.fps_avg,
                     dt,
@@ -2570,12 +2581,14 @@ impl Session {
             // de tous les pseudos, par image.
             self.walk_stamp = self.walk_stamp.wrapping_add(1);
             let (stamp, walks) = (self.walk_stamp, &mut self.walks);
+            // (v303) (Les autres joueurs : pas encore de saut, il faudrait que leur jeu le
+            // dise ; leur direction et leur course se voient à leur déplacement.)
             let mut mark = |pseudo: &str, pos: Vec3, yaw: f32, pitch: f32, crouch: f32| {
                 let w = match walks.get_mut(pseudo) {
                     Some(w) => w,
                     None => walks.entry(pseudo.to_string()).or_insert(Walk::new(pos)),
                 };
-                w.update(pos, yaw, pitch, crouch, dt);
+                w.update(pos, yaw, pitch, crouch, false, dt);
                 w.stamp = stamp;
             };
             if let Some(n) = &self.net {
@@ -2593,6 +2606,29 @@ impl Session {
             self.others_ladder_noise(dt);
             let target = (speed / 4.3).min(1.0);
             self.walk_amp += (target - self.walk_amp) * (dt * 10.0).min(1.0);
+            // (v303) Le reste de l'allure de notre modèle : le saut, la direction du
+            // déplacement par rapport au regard, la course ; « et qu'on se sneak quand on
+            // descend en vol » : en vol, tant qu'on descend, il se met accroupi (lui
+            // seulement : ni la caméra ni notre boîte ne bougent).
+            {
+                let p = &self.player;
+                let free = !p.flying && !p.on_ladder && p.swimming.is_none() && !p.noclip;
+                let air = crate::player_model::air_of(!p.on_ground && free, p.vel.y);
+                self.anim.0 += (air - self.anim.0) * (dt * 12.0).min(1.0);
+                let flat = Vec3::new(p.vel.x, 0.0, p.vel.z);
+                if flat.length() > 0.3 {
+                    let to = crate::player_model::heading(flat, p.yaw);
+                    self.anim.1 = crate::player_model::turn_toward(self.anim.1, to, dt * 10.0);
+                }
+                let run = crate::player_model::run_of(flat.length());
+                self.anim.2 += (run - self.anim.2) * (dt * 8.0).min(1.0);
+                let sinking = p.flying && !p.noclip && p.vel.y < -0.5;
+                let step = if sinking { dt / FLY_CROUCH_S } else { -dt / FLY_CROUCH_S };
+                self.fly_crouch = (self.fly_crouch + step).clamp(0.0, 1.0);
+                if let Some(fixed) = test_gait() {
+                    self.anim = fixed;
+                }
+            }
             self.hand_light = self.light_at_player(held);
             if !editing {
                 self.handle_blocks(input, dt);
@@ -4782,6 +4818,9 @@ impl Session {
             held,
             skin: None,
             bow: 0.0,
+            air: w.map_or(0.0, |w| w.air),
+            dir: w.map_or(0.0, |w| w.dir),
+            run: w.map_or(0.0, |w| w.run),
         }
     }
 
@@ -6060,6 +6099,11 @@ impl Session {
         test_pose().map_or((self.walk_phase, self.walk_amp), |p| (p.0, p.1))
     }
 
+    /// (v303) L'accroupi de notre modèle : le nôtre, ou celui du vol qui descend.
+    fn pose_crouch(&self) -> f32 {
+        self.player.crouch.max(self.fly_crouch)
+    }
+
     fn body_pose(&self) -> crate::player_model::Pose {
         let (walk, swing) = self.stride();
         crate::player_model::Pose {
@@ -6068,12 +6112,15 @@ impl Session {
             pitch: self.player.pitch + self.eat_turn.1,
             walk,
             swing,
-            crouch: self.player.crouch,
+            crouch: self.pose_crouch(),
             light: self.hand_light,
             // (v281) Le bras tel qu'il est dessiné. (v290) La main vide pend.
             held: self.model_held(),
             skin: None,
             bow: self.eat_bow,
+            air: self.anim.0,
+            dir: self.anim.1,
+            run: self.anim.2,
         }
     }
 
@@ -6125,11 +6172,14 @@ impl Session {
             pitch: self.player.pitch + self.eat_turn.1,
             walk,
             swing,
-            crouch: self.player.crouch,
+            crouch: self.pose_crouch(),
             light: self.hand_light,
             held: Some(held),
             skin: None,
             bow: self.eat_bow,
+            air: self.anim.0,
+            dir: self.anim.1,
+            run: self.anim.2,
         }
     }
 
@@ -11412,6 +11462,9 @@ impl Session {
             held: Some(Held::Gear(weapon)),
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let near = |feet: Vec3| (feet + Vec3::Y * 0.9).distance_squared(hit);
         let mut best: Option<(f32, String, Pose)> = None;
@@ -11513,11 +11566,14 @@ impl Session {
             pitch: self.player.pitch + self.eat_turn.1,
             walk,
             swing,
-            crouch: self.player.crouch,
+            crouch: self.pose_crouch(),
             light: self.hand_light,
             held,
             skin: self.worn_skin(),
             bow: self.eat_bow,
+            air: self.anim.0,
+            dir: self.anim.1,
+            run: self.anim.2,
         };
         // (v272) Où sont, dans cette pose, l'endroit que L'Évidé vise et nos morsures qui
         // saignent : lus à l'image suivante (`Prey::spot`, gouttes de sang).
@@ -11574,6 +11630,9 @@ impl Session {
                         held: pose.held,
                         skin: pose.skin.clone(),
                         bow,
+                        air: p.air,
+                        dir: p.dir,
+                        run: p.run,
                     })
                 })
                 .filter(|o| o.len() == m.len());
@@ -11685,6 +11744,9 @@ impl Session {
                     // joueurs portent la même tenue d'équipe qu'eux.
                     skin: self.skins.worn(&v.pseudo, v.team),
                     bow: 0.0,
+                    air: w.air,
+                    dir: w.dir,
+                    run: w.run,
                 };
                 let layer = layers.layer(other.skin.as_ref(), renderer);
                 let prev = Walk::prev_of(&self.walks, &v.pseudo, &other);
@@ -11919,6 +11981,9 @@ impl Session {
                     }),
                     skin: o.skin.clone(),
                     bow: 0.0,
+                    air: w.map_or(0.0, |w| w.air),
+                    dir: w.map_or(0.0, |w| w.dir),
+                    run: w.map_or(0.0, |w| w.run),
                 };
                 if other.held.is_some() {
                     model.extend(crate::player_model::held_model(&other, true));
@@ -13093,6 +13158,17 @@ fn test_pose() -> Option<(f32, f32, bool)> {
     })
 }
 
+/// (v303) Essais : MINELIB_ALLURE=<en l'air −1 à 1>,<direction en degrés>,<course 0 à 1> :
+/// l'allure de notre modèle figée là (captures du saut, du pas de côté, de la course).
+fn test_gait() -> Option<(f32, f32, f32)> {
+    static GAIT: std::sync::OnceLock<Option<(f32, f32, f32)>> = std::sync::OnceLock::new();
+    *GAIT.get_or_init(|| {
+        let v = std::env::var("MINELIB_ALLURE").ok()?;
+        let mut it = v.split(',').map(|x| x.trim().parse::<f32>());
+        Some((it.next()?.ok()?, it.next()?.ok()?.to_radians(), it.next()?.ok()?))
+    })
+}
+
 fn near_box(b: &ShadowBox, p: Vec3, margin: f32) -> bool {
     let (mn, mx) = (Vec3::from(b.min) - margin, Vec3::from(b.max) + margin);
     p.cmpge(mn).all() && p.cmple(mx).all()
@@ -13185,6 +13261,11 @@ pub struct Walk {
     prev: crate::player_model::Prev,
     last: Vec3,
     speed: f32,
+    /// (v303) Le reste de son allure (`player_model::Pose`) : en l'air, la direction de son
+    /// déplacement par rapport à son regard, sa course.
+    pub air: f32,
+    pub dir: f32,
+    pub run: f32,
 }
 
 impl Walk {
@@ -13207,7 +13288,8 @@ impl Walk {
             .unwrap_or_else(|| crate::player_model::Prev::still(pose))
     }
 
-    pub fn update(&mut self, pos: Vec3, yaw: f32, pitch: f32, crouch: f32, dt: f32) {
+    /// `airborne` : il saute ou tombe (pas en vol).
+    pub fn update(&mut self, pos: Vec3, yaw: f32, pitch: f32, crouch: f32, airborne: bool, dt: f32) {
         let d = pos - self.last;
         self.prev = crate::player_model::Prev {
             feet: self.last,
@@ -13216,6 +13298,9 @@ impl Walk {
             walk: self.phase,
             swing: self.amp,
             crouch,
+            air: self.air,
+            dir: self.dir,
+            run: self.run,
         };
         self.last = pos;
         let v = if dt > 0.0 {
@@ -13229,6 +13314,16 @@ impl Walk {
         self.phase = (self.phase + stride_rate(self.speed) * dt) % std::f32::consts::TAU;
         let target = (self.speed / 4.3).min(1.0);
         self.amp += (target - self.amp) * (dt * 10.0).min(1.0);
+        // (v303) Dans quelle direction il va par rapport à son regard, s'il court, s'il saute.
+        if v > 0.3 {
+            let to = crate::player_model::heading(Vec3::new(d.x, 0.0, d.z), yaw);
+            self.dir = crate::player_model::turn_toward(self.dir, to, dt * 10.0);
+        }
+        let run = crate::player_model::run_of(self.speed);
+        self.run += (run - self.run) * (dt * 8.0).min(1.0);
+        let vy = if dt > 0.0 && d.y.abs() < 3.0 { d.y / dt } else { 0.0 };
+        let air = crate::player_model::air_of(airborne, vy);
+        self.air += (air - self.air) * (dt * 12.0).min(1.0);
     }
 }
 
@@ -13240,6 +13335,9 @@ impl Walk {
 pub fn stride_rate(speed: f32) -> f32 {
     2.6 * speed.clamp(0.0, STRIDE_TOP)
 }
+
+/// (v303) En vol, le temps (s) de se mettre accroupi quand on descend, et d'en revenir.
+const FLY_CROUCH_S: f32 = 0.15;
 
 /// (v247) Vitesse (blocs/s) au-delà de laquelle la cadence ne monte plus : la marche.
 const STRIDE_TOP: f32 = 4.4;
@@ -14237,6 +14335,9 @@ mod f5_camera_tests {
                             held: None,
                             skin: None,
                             bow: 0.0,
+                            air: 0.0,
+                            dir: 0.0,
+                            run: 0.0,
                         };
                         for b in crate::player_model::shadow_boxes(&pose) {
                             assert!(
@@ -14279,6 +14380,9 @@ mod f5_camera_tests {
             held: None,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let eye = feet + Vec3::Y * crate::player::EYE;
         let (sp, cp) = pose.pitch.sin_cos();
@@ -14462,6 +14566,9 @@ mod slab_tests {
                         held: Some(crate::player_model::Held::Zeus),
                         skin: None,
                         bow: 0.0,
+                        air: 0.0,
+                        dir: 0.0,
+                        run: 0.0,
                     };
                     let at = crate::player_model::zeus_frame(&pose)
                         .unwrap()
@@ -14488,6 +14595,9 @@ mod slab_tests {
             held: Some(crate::player_model::Held::Zeus),
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let boxes = crate::player_model::shadow_boxes(&pose);
         let mid = (Vec3::from(boxes[0].min) + Vec3::from(boxes[0].max)) * 0.5;
@@ -14512,6 +14622,9 @@ mod slab_tests {
             held: None,
             skin: None,
             bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
         };
         let boxes = crate::player_model::shadow_boxes(&pose);
         let sun = Vec3::new(0.3, 0.9, 0.2).normalize().to_array();
