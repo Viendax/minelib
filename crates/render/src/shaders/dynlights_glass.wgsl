@@ -145,8 +145,9 @@ fn dg_face(o: vec3<f32>, d: vec3<f32>, t: f32, axis: i32, step: vec3<i32>, pal: 
 /// case par case depuis la distance `t_start` (avant : de l'air, d'après la carte de teinte ;
 /// une case de verre au départ : depuis la lumière). `own` : la lumière est dans un bloc
 /// lumineux, sa propre case ne compte pas. w = 1 : trajet connu ; 0 : il sort de la grille de
-/// blocs (la carte de teinte décide).
-fn dl_glass_exact(o: vec3<f32>, q: vec3<f32>, t_start: f32, own: bool) -> vec4<f32> {
+/// blocs (la carte de teinte décide). (v278) `t_stop` : plus de verre au-delà (d'après la
+/// carte de teinte) : la marche s'arrête là, sortie du dernier verre comprise.
+fn dl_glass_exact(o: vec3<f32>, q: vec3<f32>, t_start: f32, t_stop: f32, own: bool) -> vec4<f32> {
     let to = q - o;
     let max_t = length(to);
     if max_t < 1e-4 {
@@ -206,6 +207,11 @@ fn dl_glass_exact(o: vec3<f32>, q: vec3<f32>, t_start: f32, own: bool) -> vec4<f
             end_axis = axis;
             break;
         }
+        // (v278) « Pas trop gourmand » : plus de verre au-delà du dernier que voit la carte de
+        // teinte (une fois sorti de celui où l'on est).
+        if t > t_stop && !in_glass {
+            break;
+        }
         let raw = dg_voxel(cell);
         if raw == 0xffffu {
             return vec4<f32>(filt, 0.0);
@@ -251,4 +257,200 @@ fn dl_glass_exact(o: vec3<f32>, q: vec3<f32>, t_start: f32, own: bool) -> vec4<f
         filt *= dg_face(o, d, end_t, end_axis, step, glass_pal, true);
     }
     return vec4<f32>(filt, 1.0);
+}
+
+/// (v278) Plante en croix (deux plans en diagonale de la case, de 0,1 à 0,9) : distance du
+/// premier point opaque de sa texture sur le trajet (< 0 : la lumière passe). Comme
+/// `cross_hit` de shadow_bake.wgsl.
+fn dg_cross_hit(o: vec3<f32>, d: vec3<f32>, cell: vec3<i32>, t_in: f32, layer: u32) -> f32 {
+    let lo = o - vec3<f32>(cell);
+    let ta = select(-1.0, -(lo.x - lo.z) / (d.x - d.z), abs(d.x - d.z) > 1e-6);
+    let tb = select(-1.0, (1.0 - lo.x - lo.z) / (d.x + d.z), abs(d.x + d.z) > 1e-6);
+    var best = -1.0;
+    for (var k = 0; k < 2; k++) {
+        let first = select(tb, ta, ta <= tb);
+        let second = select(ta, tb, ta <= tb);
+        let t = select(second, first, k == 0);
+        if t >= t_in - 1e-4 && best < 0.0 {
+            let q = lo + d * t;
+            if q.x >= 0.1 && q.x <= 0.9 && q.y >= 0.0 && q.y <= 1.0 {
+                let p = o + d * t;
+                let a = textureSampleLevel(blocks, block_sampler, fract(vec2<f32>(p.x, -p.y)), i32(layer), 0.0).a;
+                if a >= 0.5 {
+                    best = t;
+                }
+            }
+        }
+    }
+    return best;
+}
+
+/// (v278) La lumière partie de `o` (sa position) arrive-t-elle au point éclairé `q` ? Suivie
+/// case par case dans la grille de blocs, de la distance `t_from` à `t_to` seulement (le tour
+/// des bloqueurs que voit la carte d'ombre, voir `dl_block_edge`). 0 : un bloc l'arrête ;
+/// 1 : elle passe ; −1 : la marche sort de la grille (la carte d'ombre décide). Mêmes formes
+/// que `shadow_march` de shadow_bake.wgsl, qui fait la carte : dalles, escaliers, clôtures,
+/// vitres, plantes, trous des textures (feuillage, rails) ; le verre ne l'arrête pas (il la
+/// teinte, `dl_glass_exact`), une torche non plus ; `own` : la lumière est dans un bloc
+/// lumineux, sa propre case ne compte pas ; dans un bloc à trous (feuillage), elle en sort
+/// par les trous de la face qu'elle traverse.
+fn dl_block_exact(o: vec3<f32>, q: vec3<f32>, t_from: f32, t_to: f32, own: bool) -> f32 {
+    let to = q - o;
+    let max_t = length(to);
+    if max_t < 1e-4 {
+        return 1.0;
+    }
+    let d = to / max_t;
+    // Jusqu'au point lui-même au plus (il est déjà décollé de sa face).
+    let t_end = min(t_to, max_t - 1e-3);
+    let start = vec3<i32>(floor(o));
+    var t0 = clamp(t_from, 0.0, max(t_end, 0.0));
+    // Dans le premier bloc depuis la lumière : depuis elle (sa propre case, ses trous).
+    if t0 < 1.0 {
+        t0 = 0.0;
+    }
+    var cell = vec3<i32>(floor(o + d * t0));
+    let step = vec3<i32>(sign(d));
+    let inv = 1.0 / max(abs(d), vec3<f32>(1e-6));
+    // Temps (depuis `o`) des prochaines limites de case, comme si la marche était partie de `o`.
+    var t_max = (select(vec3<f32>(cell), vec3<f32>(cell) + 1.0, d > vec3<f32>(0.0)) - o) * sign(d) * inv;
+    t_max = select(t_max, vec3<f32>(1e9), abs(d) < vec3<f32>(1e-6));
+    var axis = 1;
+    var t = t0;
+    // Au plus ~√3 cases par bloc parcouru (borne lue à l'exécution : pas de déroulement).
+    let n = i32(ceil(max(t_end - t0, 0.0) * 1.8)) + 3;
+    for (var i = 0; i < 160; i++) {
+        if i >= n {
+            break;
+        }
+        if i > 0 {
+            if t_max.x < t_max.y && t_max.x < t_max.z {
+                t = t_max.x;
+                cell.x += step.x;
+                t_max.x += inv.x;
+                axis = 0;
+            } else if t_max.y < t_max.z {
+                t = t_max.y;
+                cell.y += step.y;
+                t_max.y += inv.y;
+                axis = 1;
+            } else {
+                t = t_max.z;
+                cell.z += step.z;
+                t_max.z += inv.z;
+                axis = 2;
+            }
+        }
+        if t > t_end {
+            break;
+        }
+        let raw = dg_voxel(cell);
+        if raw == 0xffffu {
+            return -1.0;
+        }
+        let id = raw & 4095u;
+        let at_start = all(cell == start);
+        if id == 0u || (own && at_start) {
+            continue;
+        }
+        let pal = textureLoad(palette, i32(id), 0);
+        // Verre : il teinte la lumière, il ne l'arrête pas. Torche : elle n'en fait pas.
+        if ((pal.w >> 11u) & 1u) == 1u || ((pal.w >> 8u) & 7u) != 0u {
+            continue;
+        }
+        let shp = textureLoad(palette, i32(id) + 4096, 0);
+        let kind = shp.w & 3u;
+        let partial = kind != 0u && kind != 3u;
+        let holed = kind == 3u || (kind == 0u && ((shp.w >> 4u) & 1u) != 0u);
+        // Lumière posée dans un bloc à trous (feuillage, verre clair) ou une plante : elle en
+        // sort. D'un bloc plein à trous, par les trous de la face qu'elle traverse en sortant.
+        if at_start && holed {
+            if kind == 0u {
+                let tx = select(t_max.x, 1e9, abs(d.x) < 1e-6);
+                let ty = select(t_max.y, 1e9, abs(d.y) < 1e-6);
+                let tz = select(t_max.z, 1e9, abs(d.z) < 1e-6);
+                let te = min(tx, min(ty, tz));
+                let p = o + d * te;
+                var uv = vec2<f32>(p.z, -p.y);
+                var layer = pal.y;
+                if ty <= tx && ty <= tz {
+                    uv = vec2<f32>(p.x, p.z);
+                    layer = select(pal.x, pal.z, step.y < 0);
+                } else if tz <= tx {
+                    uv = vec2<f32>(p.x, -p.y);
+                }
+                let a = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), 0.0).a;
+                if a >= 0.5 && te <= t_end {
+                    return 0.0;
+                }
+            }
+            continue;
+        }
+        var ht = t;
+        var hax = axis;
+        var hit = true;
+        if kind == 3u {
+            // Plante : ses deux plans, trous de la texture compris.
+            ht = dg_cross_hit(o, d, cell, t, pal.y);
+            hit = ht >= 0.0;
+        } else if partial {
+            let sh = dg_shape_hit(o, d, cell, shp, t);
+            hit = sh.x >= 0.0;
+            ht = sh.x;
+            hax = i32(sh.y);
+        }
+        // Trous de la texture (feuillage, rail, échelle) : la lumière passe.
+        if hit && (partial || (kind == 0u && ((shp.w >> 4u) & 1u) != 0u)) {
+            let p = o + d * ht;
+            var uv = vec2<f32>(p.x, p.z);
+            var layer = select(pal.z, pal.x, step.y < 0);
+            if hax == 0 {
+                uv = vec2<f32>(p.z, -p.y);
+                layer = pal.y;
+            } else if hax == 2 {
+                uv = vec2<f32>(p.x, -p.y);
+                layer = pal.y;
+            }
+            hit = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), 0.0).a >= 0.5;
+        }
+        if hit && ht <= t_end {
+            return 0.0;
+        }
+    }
+    return 1.0;
+}
+
+/// (v278) Ombre des blocs, exacte, en `p` (normale `n`) près d'un bord de l'ombre de `L`
+/// (`dir` : direction lumière → point, `range` : portée) : les bloqueurs que voit la carte
+/// d'ombre autour de cette direction (4 × 4 texels) disent où les chercher ; la lumière est
+/// suivie bloc par bloc de un bloc et demi avant le plus proche à un bloc et demi après le
+/// plus loin (`dl_block_exact`). 0 ou 1 ; −1 : la carte décide (rien vu, ou hors de la
+/// grille).
+fn dl_block_edge(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, dir: vec3<f32>, range: f32) -> f32 {
+    let su = dl_shadow_uv(L, fr, dir);
+    if su.z < 0.5 {
+        return -1.0;
+    }
+    let lp = L.pos_range.xyz;
+    let q = p + n * 0.02;
+    let lim = length(q - lp) / range;
+    // Texels de la case seulement (pas ceux d'une lumière voisine).
+    let atlas = max(dh.sh.y, 1.0);
+    let rect = dl_light_rect(L, fr, dir);
+    let lo = vec2<i32>(ceil(rect.xy * atlas - 0.001));
+    let hi = max(vec2<i32>(floor((rect.xy + rect.z) * atlas + 0.001)) - 1, lo);
+    let c = vec2<i32>(floor(su.xy * atlas - 1.5));
+    var zmin = 2.0;
+    var zmax = -1.0;
+    for (var k = 0; k < 16; k++) {
+        let z = textureLoad(shadow_atlas, clamp(c + vec2<i32>(k % 4, k / 4), lo, hi), 0);
+        if z < lim {
+            zmin = min(zmin, z);
+            zmax = max(zmax, z);
+        }
+    }
+    if zmax < 0.0 {
+        return -1.0;
+    }
+    return dl_block_exact(lp, q, zmin * range - 1.5, zmax * range + 1.5, L.tint.y > 0.5);
 }

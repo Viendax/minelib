@@ -902,7 +902,7 @@ mod tests {
                 .collect()
         };
         let l = cell(b'l');
-        for other in [b'1', b'I', b'i', b'|'] {
+        for &other in b"1Ii|" {
             let o = cell(other);
             let diff = l.iter().zip(&o).filter(|(a, b)| a != b).count();
             assert!(diff >= 4, "l et {} : {diff} pixels de différence", other as char);

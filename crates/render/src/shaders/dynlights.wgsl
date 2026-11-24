@@ -372,21 +372,25 @@ fn dl_surface_tint(L: DynLight, fr: DlFrame, d: vec3<f32>, dist: f32, range: f32
     let hi = max(vec2<i32>(floor((rect.xy + rect.z) * dims + 0.001)) - 1, lo);
     let c = vec2<i32>(floor(su.xy * dims));
     let t = dist / max(range, 1e-3);
-    // Distance (rapportée à la portée) du premier verre vu autour de cette direction.
+    // Distance (rapportée à la portée) du premier verre vu autour de cette direction, et
+    // (v278) de la dernière surface de verre.
     var first = 2.0;
+    var last = 0.0;
     for (var k = 0; k < 9; k++) {
         let o = vec2<i32>(k % 3 - 1, k / 3 - 1);
         let tq = textureLoad(tint_atlas, clamp(c + o, lo, hi), 0);
         if any(tq != vec4<u32>(0u)) {
             first = min(first, unpack2x16float(tq.y).y);
+            last = max(last, unpack2x16float(tq.w).y);
         }
     }
     // Pas de verre avant ce point, ni à côté : la lumière arrive de sa couleur.
     if first > t + 0.004 {
         return vec3<f32>(1.0);
     }
-    // Suivie depuis un bloc avant le premier verre vu (la marge d'un texel de la carte).
-    let exact = dl_glass_exact(L.pos_range.xyz, q, first * range - 1.0, L.tint.y > 0.5);
+    // Suivie depuis un bloc avant le premier verre vu (la marge d'un texel de la carte), (v278)
+    // jusqu'à un bloc et demi après la dernière surface de verre vue (plus loin : de l'air).
+    let exact = dl_glass_exact(L.pos_range.xyz, q, first * range - 1.0, last * range + 1.5, L.tint.y > 0.5);
     if exact.w > 0.5 {
         return exact.rgb;
     }
@@ -403,6 +407,13 @@ const DL_GOLDEN = vec2<f32>(-0.73736887, 0.67549029);
 /// bruit). `dir` : direction lumière → point, `ndt` : n · (point − lumière), `dist` :
 /// distance, `eps` : marge.
 fn dl_shadow_tent(L: DynLight, fr: DlFrame, dir: vec3<f32>, n: vec3<f32>, ndt: f32, dist: f32, range: f32, eps: f32) -> f32 {
+    return dl_tent_edge(L, dl_tent_sum(L, fr, dir, n, ndt, dist, range, eps));
+}
+
+/// (v278) Le filtre en tente avant son bord resserré : part des texels éclairés autour (0 :
+/// tous dans l'ombre, 1 : aucun). Entre les deux, le point est près d'un bord de l'ombre (à
+/// deux texels au plus).
+fn dl_tent_sum(L: DynLight, fr: DlFrame, dir: vec3<f32>, n: vec3<f32>, ndt: f32, dist: f32, range: f32, eps: f32) -> f32 {
     var rect = fr.rect;
     var c: vec3<f32>;
     var nb: vec3<f32>;
@@ -445,7 +456,11 @@ fn dl_shadow_tent(L: DynLight, fr: DlFrame, dir: vec3<f32>, n: vec3<f32>, ndt: f
     // marches), le bord reste net au lieu d'un flou de trois texels. (v202) Sauf pour une
     // lumière portée (shadow.w) : elle bouge sans cesse, sa carte est refaite à chaque pas
     // et chaque bord y saute d'un texel ; en pente douce, il glisse.
-    let v = sum * (1.0 / 16.0);
+    return sum * (1.0 / 16.0);
+}
+
+/// Bord resserré du filtre en tente (voir `dl_tent_sum`).
+fn dl_tent_edge(L: DynLight, v: f32) -> f32 {
     return select(smoothstep(0.35, 0.65, v), v, L.shadow.w > 0.5);
 }
 
@@ -479,7 +494,20 @@ fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, s
     // Ombre nette (réglage, ou source sans taille) : bords lissés.
     let bulb = select(dh.sh.x, L.cone.w, L.cone.w > 0.0);
     if !DL_SOFT_SHADOWS || bulb < 0.01 || L.shadow.z > 0.5 {
-        return dl_shadow_tent(L, fr, dir, n, ndt, dist, range, eps);
+        let v = dl_tent_sum(L, fr, dir, n, ndt, dist, range, eps);
+        // (v278) « Équilibre les deux, que ça rende à peu près pareil (que le verre) et que ce
+        // ne soit pas trop gourmand » : près d'un bord de l'ombre (des texels éclairés et
+        // d'autres non autour), la lumière est suivie bloc par bloc dans la grille, seulement
+        // autour des bloqueurs que voit la carte (`dl_block_edge`, éclairage différé) : le bord
+        // a la forme exacte des blocs, comme la tache du verre, lissé par l'anticrénelage.
+        // Ailleurs (loin de tout bord, ou hors de la grille), la carte seule.
+        if v > 0.0 && v < 1.0 {
+            let e = dl_block_edge(L, fr, p, n, dir, range);
+            if e >= 0.0 {
+                return e;
+            }
+        }
+        return dl_tent_edge(L, v);
     }
     // Repère autour de la direction centrale (échantillons en angle autour d'elle).
     let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(dir.y) > 0.9);

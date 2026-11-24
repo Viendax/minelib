@@ -2289,20 +2289,25 @@ pub fn chest_point(feet: Vec3, yaw: f32, crouch: f32) -> Vec3 {
 /// visage, devant. Reculé d'autant, le corps se voit comme on voit le sien en baissant les
 /// yeux (la poitrine, le ventre, les jambes, les pieds), sans que la caméra soit dedans.
 pub const FIRST_PERSON_BACK: f32 = 0.15;
-/// (v267) Recul au plus (accroupi, la tête du modèle avance de 0,32 bloc : le corps suivrait
-/// d'autant ; au-delà de la demi-largeur du joueur, il entrerait dans le mur derrière lui).
-const FIRST_PERSON_BACK_MAX: f32 = 0.3;
 /// (v267) Le regard doit être baissé d'au moins cet angle (radians) pour qu'un morceau du
 /// corps entre dans l'image : au-dessus, rien n'est construit.
 pub const FIRST_PERSON_PITCH: f32 = -0.15;
 
 /// (v273) Pieds du corps vu de ses propres yeux (`first_person_body`) : reculés de
-/// `FIRST_PERSON_BACK` (plus accroupi). Son ombre y est aussi (« mon ombre au soleil n'est
-/// plus la bonne par rapport à mon joueur ») : sous les pieds qu'on voit, pas 0,15 bloc devant.
+/// `FIRST_PERSON_BACK`. Son ombre y est aussi (« mon ombre au soleil n'est plus la bonne par
+/// rapport à mon joueur ») : sous les pieds qu'on voit, pas 0,15 bloc devant. (v278) Accroupi
+/// aussi : c'est la caméra qui avance avec la tête (`first_person_ahead`), le corps ne recule
+/// plus (avant : de la tête en plus, 0,3 bloc au plus).
 pub fn first_person_feet(pose: &Pose) -> Vec3 {
-    let (ahead, _) = head_place(pose.crouch);
-    let back = (ahead + FIRST_PERSON_BACK).min(FIRST_PERSON_BACK_MAX);
-    pose.feet - Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos()) * back
+    pose.feet - Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos()) * FIRST_PERSON_BACK
+}
+
+/// (v278) « En première personne, quand je sneak, c'est pas mon corps qui doit reculer, c'est ma
+/// caméra qui doit avancer proportionnellement à la tête » : de combien la caméra avance (vers
+/// le regard, à l'horizontale), du chemin que fait la tête du modèle en s'accroupissant
+/// (`head_place` : 0,32 bloc accroupi tout à fait, rien debout).
+pub fn first_person_ahead(yaw: f32, crouch: f32) -> Vec3 {
+    Vec3::new(yaw.sin(), 0.0, -yaw.cos()) * head_place(crouch).0
 }
 
 /// (v267) Le corps du joueur vu de ses propres yeux, à dessiner avec son bras de la première
@@ -3309,7 +3314,9 @@ mod tests {
                     skin: None,
                     bow: 0.0,
                 };
-                let eye = crate::session::eye_of(pose.feet, crouch);
+                // (v278) La caméra avance avec la tête accroupie.
+                let eye = crate::session::eye_of(pose.feet, crouch)
+                    + first_person_ahead(pose.yaw, crouch);
                 let view = (Mat4::from_translation(eye)
                     * Mat4::from_rotation_y(-pose.yaw)
                     * Mat4::from_rotation_x(pitch))
@@ -3330,8 +3337,9 @@ mod tests {
                     })
                     .count();
                 // (Debout sans bouger, le regard à peine baissé, on ne voit pas encore son
-                // corps : il est sous soi.)
-                if pitch <= -1.0 {
+                // corps : il est sous soi. (v278) Accroupi, la caméra avance avec la tête : le
+                // corps plié est sous elle, on le voit en baissant les yeux tout à fait.)
+                if pitch <= -1.0 && (crouch == 0.0 || pitch <= -1.5) {
                     assert!(seen > 600, "accroupi {crouch}, regard {pitch} : {seen} sommets vus");
                 }
                 // Le plan proche ne coupe aucun carré dans l'image (on verrait dedans) : là

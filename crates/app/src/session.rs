@@ -2423,9 +2423,10 @@ impl Session {
             }
         }
         let _s = perf::scope("visée");
+        // (v278) Depuis la caméra (elle avance accroupi).
         self.hit = raycast(
             &self.world,
-            self.player.eye().into(),
+            self.aim_eye().into(),
             self.player.look_dir().into(),
             REACH,
         );
@@ -2924,7 +2925,7 @@ impl Session {
     /// touche aussi par derrière ou par le côté : point visé (−1, −1), on peut le casser ou
     /// le copier, pas cliquer dans sa page.
     fn aimed_screen(&self, range: f32) -> Option<(usize, f32, [f32; 2])> {
-        let eye = self.player.eye();
+        let eye = self.aim_eye();
         let dir = self.player.look_dir();
         // Jusqu'au premier bloc visé, un rien au-delà : l'écran est collé à son mur.
         let seen = minelib_world::raycast::raycast(&self.world, eye.into(), dir.into(), range);
@@ -2991,7 +2992,7 @@ impl Session {
     /// Cadre (carte importée) que le joueur vise, devant tout bloc visible.
     fn aimed_frame(&self) -> Option<usize> {
         let frames = self.frames.as_ref().filter(|f| !f.is_empty())?;
-        let eye = self.player.eye();
+        let eye = self.aim_eye();
         let dir = self.player.look_dir();
         // Jusqu'au premier bloc visible : une barrière invisible (la collision que la
         // carte met autour du cadre) ne le protège pas.
@@ -3522,9 +3523,10 @@ impl Session {
             || (keys.held(input, Action::Attack) && self.break_cooldown <= 0.0);
         let placing = keys.pressed(input, Action::Use)
             || (keys.held(input, Action::Use) && self.place_cooldown <= 0.0);
+        // (v278) Depuis la caméra (elle avance accroupi).
         let hit = raycast(
             &self.world,
-            self.player.eye().into(),
+            self.aim_eye().into(),
             self.player.look_dir().into(),
             REACH,
         );
@@ -5686,6 +5688,39 @@ impl Session {
 
     /// Caméra de l'image : (position, vue, direction du regard). Caméra libre de l'éditeur,
     /// sinon les yeux du joueur, ou derrière lui (F5).
+    /// (v278) La caméra à la première personne hors mode FPS : les yeux, la marche montée en
+    /// douceur (`step_offset`), la tête pliée pour manger (`bow_shift`, v272) et, accroupi, la
+    /// tête qui avance : « quand je sneak, c'est pas mon corps qui doit reculer, c'est ma caméra
+    /// qui doit avancer proportionnellement à la tête » (`first_person_ahead`). Jamais dans un
+    /// bloc devant soi : elle s'arrête à 0,1 bloc de lui.
+    fn first_person_eye(&self) -> Vec3 {
+        let mut eye = self.player.eye() + Vec3::Y * self.step_offset;
+        if self.eat_bow != 0.0 {
+            eye += crate::player_model::bow_shift(&self.body_pose());
+        }
+        let ahead = crate::player_model::first_person_ahead(self.player.yaw, self.player.crouch);
+        let len = ahead.length();
+        if len > 1e-4 {
+            let dir = ahead / len;
+            let room = raycast(&self.world, eye.into(), dir.into(), len + 0.1)
+                .map_or(len, |h| (h.distance - 0.1).max(0.0));
+            eye += dir * len.min(room);
+        }
+        eye
+    }
+
+    /// (v278) D'où l'on vise (blocs, écrans, cadres) : la caméra à la première personne hors
+    /// mode FPS (elle avance accroupi : on vise ce qu'on voit au viseur), les yeux du joueur
+    /// sinon (troisième personne, mode FPS, caméra libre).
+    fn aim_eye(&self) -> Vec3 {
+        let first = self.perspective == 0 && self.light_editor.free_cam.is_none();
+        if first && self.game.mode != GameMode::Fps {
+            self.first_person_eye()
+        } else {
+            self.player.eye()
+        }
+    }
+
     fn view_camera(&self) -> (Vec3, Mat4, Vec3) {
         if let Some(c) = self.light_editor.free_cam {
             return (c.pos, c.view(), c.look());
@@ -5698,17 +5733,14 @@ impl Session {
             // comptées depuis la caméra, sans la translation de la vue) ; sans elle, la caméra
             // sautait d'un coup sur une dalle, et la vue (tri des chunks, lumières) ne tombait
             // plus juste avec l'image.
-            // (v272) Plié pour manger : la caméra plonge avec la tête.
-            let bow = if self.eat_bow == 0.0 {
-                Vec3::ZERO
+            // (v272) Plié pour manger : la caméra plonge avec la tête. (v278) Accroupi, elle
+            // avance avec elle (voir `first_person_eye`) ; en mode FPS, les yeux du joueur.
+            let eye = if fps_mode {
+                self.player.eye() + Vec3::Y * self.step_offset
             } else {
-                crate::player_model::bow_shift(&self.body_pose())
+                self.first_person_eye()
             };
-            (
-                self.player.eye() + Vec3::Y * self.step_offset + bow,
-                self.view_with_punch(),
-                self.player.look_dir(),
-            )
+            (eye, self.view_with_punch(), self.player.look_dir())
         } else {
             let eye = self.player.eye();
             let look = self.player.look_dir();
@@ -7964,7 +7996,9 @@ impl Session {
     fn view_with_punch(&self) -> Mat4 {
         if self.game.mode != GameMode::Fps {
             // Marche montée ou descendue : la caméra suit en douceur (voir `smooth_steps`).
-            let eye = self.player.eye() + Vec3::Y * self.step_offset;
+            // (v278) La même place que `view_camera` (la tête pliée pour manger, accroupie) :
+            // la vue (tri des chunks, cases des lumières) tombe juste avec l'image.
+            let eye = self.first_person_eye();
             return Mat4::look_to_rh(eye, self.player.look_dir(), Vec3::Y);
         }
         let p = (self.player.pitch + self.fps.punch.0.to_radians()).clamp(-1.55, 1.55);
