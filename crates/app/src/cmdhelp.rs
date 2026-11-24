@@ -34,6 +34,11 @@ pub const HELP: &[Help] = &[
             ("/fps set door on|off", "portes qu'on ouvre en partie, ou fixes"),
             ("/fps set doorsync on|off", "doubles portes ensemble ou séparées"),
             ("/fps set time <heure | default>", "heure de la carte en partie"),
+            (
+                "/fps showelements on|off",
+                "portes (vert clair, doubles : vert foncé), sites (rouge), départs CT (bleu) et T \
+                 (jaune) vus à travers les murs",
+            ),
         ],
     },
     Help {

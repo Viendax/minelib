@@ -359,6 +359,9 @@ pub struct Session {
     /// Points de mesure de la lumière de chaque chunk : combien sont aux têtes d'entités
     /// (les suivants sont aux cadres).
     probe_split: HashMap<ChunkPos, usize>,
+    /// (v255) `/fps showelements` : portes, sites et départs de la carte FPS montrés à travers
+    /// les murs, hors partie (`None` : masqués).
+    fps_elements: Option<FpsElements>,
     /// Cadres des murs (cartes importées).
     frames: Option<crate::frames::Frames>,
     /// Temps passé à avancer sans touche tenue (diagnostic), et déjà noté au journal.
@@ -771,6 +774,7 @@ impl Session {
             heads: None,
             head_skins_at: None,
             probe_split: HashMap::new(),
+            fps_elements: None,
             frames: None,
             coast: 0.0,
             coast_logged: false,
@@ -2184,6 +2188,8 @@ impl Session {
             self.player.pos.x,
             self.player.pos.z,
         );
+        // (v255) `/fps showelements` : zones relues, portes cherchées.
+        self.update_fps_elements(dt);
         // Têtes des chunks maillés : blocs « tête » et lumière reçue (têtes d'entités, puis
         // cadres : voir `set_probes`).
         if self.heads.is_some() {
@@ -7621,6 +7627,10 @@ impl Session {
                         if map.doors() { "utilisables" } else { "fixes" },
                         if map.door_sync() { "ensemble" } else { "séparées" }
                     ),
+                    format!(
+                        "éléments affichés à travers les murs : {}",
+                        on(self.fps_elements.is_some())
+                    ),
                 ]
             }
             "bot" | "start" | "restart" => {
@@ -7670,7 +7680,43 @@ impl Session {
         use minelib_net::game::Zone;
         const USAGE: &str = "Usage : /fps set spawn ct | spawn t | site a | site b | site c \
                              (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door on|off, /fps set doorsync on|off, /fps clear …, \
-                             /fps info";
+                             /fps showelements on|off, /fps info";
+        // (v255) « Un /fps showelements true/false pour voir les portes, sites et spawns à
+        // travers les murs (comme une sélection de la baguette) en build » : un affichage,
+        // permis aussi pendant une partie de bots (il ne se voit qu'hors mode FPS).
+        if matches!(
+            args.first().map(|a| a.to_lowercase()).as_deref(),
+            Some("showelements" | "showelement" | "elements" | "éléments")
+        ) {
+            let on = match args.get(1) {
+                Some(w) => match chat::switch(w) {
+                    Some(on) => on,
+                    None => {
+                        self.chat
+                            .say("Usage : /fps showelements on|off (ou true|false).", chat::GREY);
+                        return;
+                    }
+                },
+                None => self.fps_elements.is_none(),
+            };
+            if on {
+                self.fps_elements = Some(FpsElements {
+                    map: crate::fpsmap::load(&self.dir),
+                    ..Default::default()
+                });
+                self.chat.say(
+                    "Éléments de la carte FPS montrés à travers les murs (hors partie) : portes \
+                     simples en vert clair, doubles portes en vert foncé, sites en rouge, départ \
+                     CT en bleu, départ T en jaune. /fps showelements off pour les masquer.",
+                    chat::LIGHT_PURPLE,
+                );
+            } else {
+                self.fps_elements = None;
+                self.chat
+                    .say("Éléments de la carte FPS masqués.", chat::LIGHT_PURPLE);
+            }
+            return;
+        }
         if self.net.is_some() {
             let msg = if self.online_match() {
                 "Les réglages de carte se font hors partie en ligne."
@@ -9476,6 +9522,81 @@ impl Session {
         }
     }
 
+    /// (v255) `/fps showelements` : zones de la carte relues toutes les secondes, et portes
+    /// cherchées dans quelques chunks chargés par image (les plus proches d'abord, puis tous de
+    /// nouveau, en boucle) ; celles des chunks déchargés oubliées.
+    fn update_fps_elements(&mut self, dt: f32) {
+        let Some(e) = self.fps_elements.as_mut() else {
+            return;
+        };
+        e.map_age += dt;
+        if e.map_age >= 1.0 {
+            e.map_age = 0.0;
+            e.map = crate::fpsmap::load(&self.dir);
+        }
+        if e.queue.is_empty() {
+            let me = ChunkPos::containing(
+                self.player.pos.x.floor() as i32,
+                self.player.pos.z.floor() as i32,
+            );
+            let mut loaded: Vec<ChunkPos> = self.world.loaded().collect();
+            let keep: HashSet<ChunkPos> = loaded.iter().copied().collect();
+            e.doors.retain(|c, _| keep.contains(c));
+            // Les plus proches à la fin : `pop` les prend d'abord.
+            loaded.sort_by_key(|c| std::cmp::Reverse((c.x - me.x).pow(2) + (c.z - me.z).pow(2)));
+            e.queue = loaded;
+        }
+        for _ in 0..ELEMENT_CHUNKS_PER_FRAME {
+            let Some(c) = e.queue.pop() else { break };
+            let found = chunk_doors(&self.world, c);
+            if found.is_empty() {
+                e.doors.remove(&c);
+            } else {
+                e.doors.insert(c, found);
+            }
+        }
+    }
+
+    /// (v255) `/fps showelements` : le nom de chaque zone de la carte (« Site A », « Départ CT »…)
+    /// au-dessus de sa boîte, de sa couleur, à travers les murs.
+    fn draw_element_names(&self, ui: &mut Ui, size: (f32, f32), s: f32) {
+        let Some(e) = &self.fps_elements else { return };
+        if self.game.mode == GameMode::Fps {
+            return;
+        }
+        let proj = Mat4::perspective_rh(
+            self.fov.to_radians(),
+            size.0 / size.1.max(1.0),
+            0.05,
+            1000.0,
+        );
+        let vp = proj * self.view_with_punch();
+        for (zone, name, color) in element_zones(&e.map) {
+            let top = Vec3::new(
+                (zone.min[0] + zone.max[0] + 1) as f32 * 0.5,
+                zone.max[1] as f32 + 1.6,
+                (zone.min[2] + zone.max[2] + 1) as f32 * 0.5,
+            );
+            let c = vp * top.extend(1.0);
+            if c.w <= 0.0 {
+                continue;
+            }
+            let (x, y) = (
+                (c.x / c.w * 0.5 + 0.5) * size.0,
+                (0.5 - c.y / c.w * 0.5) * size.1,
+            );
+            let w = Ui::text_width(&name, s);
+            ui.rect(x - w * 0.5 - s, y - s, w + 2.0 * s, 9.0 * s, [0.0, 0.0, 0.0, 0.45]);
+            let shown = [
+                color[0].min(1.0),
+                color[1].min(1.0),
+                color[2].min(1.0),
+                1.0,
+            ];
+            ui.text(x - w * 0.5, y, s, shown, name);
+        }
+    }
+
     /// Construction en ligne : pseudos des joueurs proches. (v243) Pas ceux de la partie FPS du
     /// serveur quand on y est (on ne voit pas ses adversaires à travers les murs).
     fn draw_build_names(&self, ui: &mut Ui, size: (f32, f32), s: f32) {
@@ -9717,6 +9838,7 @@ impl Session {
         }
         self.draw_net(ui, size, input, s);
         self.draw_build_names(ui, size, s);
+        self.draw_element_names(ui, size, s);
         self.draw_voice(ui, size, input, s);
         if self.hurt > 0.0 {
             ui.rect(0.0, 0.0, size.0, size.1, [0.7, 0.0, 0.0, self.hurt * 0.6]);
@@ -10476,6 +10598,17 @@ impl Session {
                     0.05,
                 );
                 v.extend(selection_lines(&self.we, proj * view, cam));
+            }
+            // (v255) `/fps showelements` : portes, sites et départs, à travers les murs.
+            if let Some(e) = &self.fps_elements {
+                if self.game.mode != GameMode::Fps && !hud_off {
+                    let proj = Mat4::perspective_infinite_reverse_rh(
+                        fov.to_radians(),
+                        renderer.aspect(),
+                        0.05,
+                    );
+                    v.extend(element_lines(e, proj * view, cam));
+                }
             }
             v
         };
@@ -11907,80 +12040,236 @@ fn selection_lines(
     eye: Vec3,
 ) -> Vec<minelib_render::VmVertex> {
     let mut out = Vec::new();
-    // Profondeur devant la caméra (w du clip, linéaire le long d'un segment).
-    let depth = |p: Vec3| (vp * p.extend(1.0)).w;
-    const NEAR: f32 = 0.06;
-    let mut line = |a: Vec3, b: Vec3, c: [f32; 4]| {
-        // Arête découpée en morceaux (épaisseur adaptée à la distance de chacun), et chaque
-        // morceau coupé au ras de la caméra : quand on est dans la sélection, les arêtes
-        // qui passent derrière nous restent visibles devant.
-        let pieces = ((b - a).length() / 1.5).ceil().max(1.0) as usize;
-        for k in 0..pieces {
-            let mut p0 = a.lerp(b, k as f32 / pieces as f32);
-            let mut p1 = a.lerp(b, (k + 1) as f32 / pieces as f32);
-            let (w0, w1) = (depth(p0), depth(p1));
-            if w0 < NEAR && w1 < NEAR {
-                continue;
-            }
-            if w0 < NEAR {
-                p0 = p0.lerp(p1, (NEAR - w0) / (w1 - w0));
-            } else if w1 < NEAR {
-                p1 = p1.lerp(p0, (NEAR - w1) / (w0 - w1));
-            }
-            let mid = (p0 + p1) * 0.5;
-            let w = (p1 - p0).cross(mid - eye).normalize_or_zero()
-                * (0.012 * (mid - eye).length().max(1.0)).min(0.08);
-            for p in [p0 - w, p1 - w, p1 + w, p1 + w, p0 + w, p0 - w] {
-                let q = vp * p.extend(1.0);
-                out.push(minelib_render::VmVertex {
-                    clip: [q.x, q.y, q.z, q.w.max(1e-3)],
-                    uv: [0.0, 0.0],
-                    layer: minelib_render::NO_TEXTURE,
-                    _pad: 0,
-                    color: c,
-                });
-            }
-        }
-    };
-    let cube = |lo: Vec3, hi: Vec3, c: [f32; 4], line: &mut dyn FnMut(Vec3, Vec3, [f32; 4])| {
-        let v = |x: bool, y: bool, z: bool| {
-            Vec3::new(
-                if x { hi.x } else { lo.x },
-                if y { hi.y } else { lo.y },
-                if z { hi.z } else { lo.z },
-            )
-        };
-        for a in [false, true] {
-            for b in [false, true] {
-                line(v(false, a, b), v(true, a, b), c);
-                line(v(a, false, b), v(a, true, b), c);
-                line(v(a, b, false), v(a, b, true), c);
-            }
-        }
-    };
     let f = |p: [i32; 3]| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
     if let Some((a, b)) = we.region() {
-        cube(
+        push_box(
+            &mut out,
+            vp,
+            eye,
             f(a) - Vec3::splat(0.01),
             f(b) + Vec3::splat(1.01),
             [0.1, 0.45, 1.6, 1.0],
-            &mut line,
         );
     }
     if let Some(p) = we.pos1 {
-        cube(
+        push_box(
+            &mut out,
+            vp,
+            eye,
             f(p) - Vec3::splat(0.02),
             f(p) + Vec3::splat(1.02),
             [1.6, 0.15, 0.1, 1.0],
-            &mut line,
         );
     }
     if let Some(p) = we.pos2 {
-        cube(
+        push_box(
+            &mut out,
+            vp,
+            eye,
             f(p) - Vec3::splat(0.02),
             f(p) + Vec3::splat(1.02),
             [0.3, 0.8, 1.8, 1.0],
-            &mut line,
+        );
+    }
+    out
+}
+
+/// Un trait de `a` à `b` (couleur `c`), dessiné avec la main : toujours visible, à travers
+/// les murs. Découpé en morceaux (épaisseur adaptée à la distance de chacun), et chaque
+/// morceau coupé au ras de la caméra : quand on est dans la boîte, les arêtes qui passent
+/// derrière nous restent visibles devant.
+fn push_line(
+    out: &mut Vec<minelib_render::VmVertex>,
+    vp: Mat4,
+    eye: Vec3,
+    a: Vec3,
+    b: Vec3,
+    c: [f32; 4],
+) {
+    // Profondeur devant la caméra (w du clip, linéaire le long d'un segment).
+    let depth = |p: Vec3| (vp * p.extend(1.0)).w;
+    const NEAR: f32 = 0.06;
+    let pieces = ((b - a).length() / 1.5).ceil().max(1.0) as usize;
+    for k in 0..pieces {
+        let mut p0 = a.lerp(b, k as f32 / pieces as f32);
+        let mut p1 = a.lerp(b, (k + 1) as f32 / pieces as f32);
+        let (w0, w1) = (depth(p0), depth(p1));
+        if w0 < NEAR && w1 < NEAR {
+            continue;
+        }
+        if w0 < NEAR {
+            p0 = p0.lerp(p1, (NEAR - w0) / (w1 - w0));
+        } else if w1 < NEAR {
+            p1 = p1.lerp(p0, (NEAR - w1) / (w0 - w1));
+        }
+        let mid = (p0 + p1) * 0.5;
+        let w = (p1 - p0).cross(mid - eye).normalize_or_zero()
+            * (0.012 * (mid - eye).length().max(1.0)).min(0.08);
+        for p in [p0 - w, p1 - w, p1 + w, p1 + w, p0 + w, p0 - w] {
+            let q = vp * p.extend(1.0);
+            out.push(minelib_render::VmVertex {
+                clip: [q.x, q.y, q.z, q.w.max(1e-3)],
+                uv: [0.0, 0.0],
+                layer: minelib_render::NO_TEXTURE,
+                _pad: 0,
+                color: c,
+            });
+        }
+    }
+}
+
+/// Les 12 arêtes de la boîte de coins `lo` et `hi` (voir `push_line`).
+fn push_box(
+    out: &mut Vec<minelib_render::VmVertex>,
+    vp: Mat4,
+    eye: Vec3,
+    lo: Vec3,
+    hi: Vec3,
+    c: [f32; 4],
+) {
+    let v = |x: bool, y: bool, z: bool| {
+        Vec3::new(
+            if x { hi.x } else { lo.x },
+            if y { hi.y } else { lo.y },
+            if z { hi.z } else { lo.z },
+        )
+    };
+    for a in [false, true] {
+        for b in [false, true] {
+            push_line(out, vp, eye, v(false, a, b), v(true, a, b), c);
+            push_line(out, vp, eye, v(a, false, b), v(a, true, b), c);
+            push_line(out, vp, eye, v(a, b, false), v(a, b, true), c);
+        }
+    }
+}
+
+/// (v255) Couleurs de `/fps showelements` (au-delà de 1 : elles brillent, comme la sélection
+/// de la baguette) : porte simple vert clair, double porte vert foncé, sites rouges, départ
+/// CT bleu, départ T jaune.
+const ELEMENT_DOOR: [f32; 4] = [0.45, 1.7, 0.45, 1.0];
+const ELEMENT_DOUBLE_DOOR: [f32; 4] = [0.0, 0.28, 0.03, 1.0];
+const ELEMENT_SITE: [f32; 4] = [1.7, 0.08, 0.08, 1.0];
+const ELEMENT_CT: [f32; 4] = [0.15, 0.4, 1.9, 1.0];
+const ELEMENT_T: [f32; 4] = [1.7, 1.45, 0.05, 1.0];
+
+/// (v255) Une porte vue par `/fps showelements` : sa boîte (coins inclus, deux blocs de haut ;
+/// les deux battants pour une double porte).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DoorBox {
+    pub min: [i32; 3],
+    pub max: [i32; 3],
+    pub double: bool,
+}
+
+/// (v255) Portes du chunk `pos` : le bas de chaque porte, une boîte par porte simple et une
+/// pour les deux battants d'une double porte (rangée avec le battant le plus à l'ouest, puis
+/// au nord). Seulement les couches où le chunk a des blocs.
+pub(crate) fn chunk_doors(world: &World, pos: ChunkPos) -> Vec<DoorBox> {
+    let Some(chunk) = world.chunk(pos) else {
+        return Vec::new();
+    };
+    let get = |c: [i32; 3]| world.get(c[0], c[1], c[2]);
+    let none = HashMap::new();
+    let (x0, z0) = (pos.x * CHUNK_SIZE as i32, pos.z * CHUNK_SIZE as i32);
+    let mut out = Vec::new();
+    for y in chunk.bottom()..chunk.top() {
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let id = chunk.get(x, y, z);
+                if !matches!(hinged(id), Some(Hinged::Door { upper: false, .. })) {
+                    continue;
+                }
+                let c = [x0 + x as i32, y as i32, z0 + z as i32];
+                match door_partner(&get, &none, c) {
+                    // L'autre battant la range (une seule boîte pour les deux).
+                    Some(q) if (q[0], q[2]) < (c[0], c[2]) => {}
+                    Some(q) => out.push(DoorBox {
+                        min: [c[0].min(q[0]), c[1], c[2].min(q[2])],
+                        max: [c[0].max(q[0]), c[1] + 1, c[2].max(q[2])],
+                        double: true,
+                    }),
+                    None => out.push(DoorBox {
+                        min: c,
+                        max: [c[0], c[1] + 1, c[2]],
+                        double: false,
+                    }),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// (v255) Ce que montre `/fps showelements` : les zones de la carte FPS (relues toutes les
+/// secondes : un `/fps set` se voit tout de suite) et les portes des chunks chargés, cherchées
+/// quelques chunks par image (les plus proches d'abord), puis de nouveau en boucle (une porte
+/// posée ou cassée se voit au tour suivant).
+#[derive(Default)]
+pub(crate) struct FpsElements {
+    pub map: minelib_net::game::FpsMap,
+    pub map_age: f32,
+    pub doors: HashMap<ChunkPos, Vec<DoorBox>>,
+    pub queue: Vec<ChunkPos>,
+}
+
+/// (v255) Chunks fouillés par image pour les portes de `/fps showelements`.
+const ELEMENT_CHUNKS_PER_FRAME: usize = 3;
+
+/// (v255) Zones posées de la carte FPS, avec leur nom et leur couleur.
+fn element_zones(
+    map: &minelib_net::game::FpsMap,
+) -> Vec<(minelib_net::game::Zone, String, [f32; 4])> {
+    let mut out = Vec::new();
+    if let Some(z) = map.ct {
+        out.push((z, "Départ CT".to_string(), ELEMENT_CT));
+    }
+    if let Some(z) = map.t {
+        out.push((z, "Départ T".to_string(), ELEMENT_T));
+    }
+    for (k, z) in map.sites.iter().enumerate() {
+        if let Some(z) = z {
+            out.push((
+                *z,
+                format!("Site {}", crate::fpsmap::SITE_NAMES[k]),
+                ELEMENT_SITE,
+            ));
+        }
+    }
+    out
+}
+
+/// (v255) Traits de `/fps showelements` (voir `push_box`) : la boîte de chaque zone de la
+/// carte, et de chaque porte trouvée (à 192 blocs au plus).
+fn element_lines(e: &FpsElements, vp: Mat4, eye: Vec3) -> Vec<minelib_render::VmVertex> {
+    let mut out = Vec::new();
+    let f = |p: [i32; 3]| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
+    for (z, _, c) in element_zones(&e.map) {
+        push_box(
+            &mut out,
+            vp,
+            eye,
+            f(z.min) - Vec3::splat(0.015),
+            f(z.max) + Vec3::splat(1.015),
+            c,
+        );
+    }
+    for d in e.doors.values().flatten() {
+        let (lo, hi) = (f(d.min), f(d.max) + Vec3::ONE);
+        if ((lo + hi) * 0.5 - eye).length() > 192.0 {
+            continue;
+        }
+        let c = if d.double {
+            ELEMENT_DOUBLE_DOOR
+        } else {
+            ELEMENT_DOOR
+        };
+        push_box(
+            &mut out,
+            vp,
+            eye,
+            lo - Vec3::splat(0.03),
+            hi + Vec3::splat(0.03),
+            c,
         );
     }
     out
@@ -12410,6 +12699,37 @@ mod slab_tests {
             w.set(p[0], p[1], p[2], b);
         }
         assert_eq!(key(w.get(6, 10, 6)), "trapdoor:3:1");
+    }
+
+    #[test]
+    fn showelements_finds_single_and_double_doors() {
+        let reg = minelib_world::registry::registry();
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        let lower = reg.by_key("door_wood:lower:1").unwrap();
+        let upper = reg.by_key("door_wood:upper:1").unwrap();
+        // Double porte le long de Z (z = 2 et 3), porte simple plus loin (z = 9).
+        for z in [2, 3, 9] {
+            w.set(3, 10, z, lower);
+            w.set(3, 11, z, upper);
+        }
+        let mut doors = chunk_doors(&w, ChunkPos { x: 0, z: 0 });
+        doors.sort_by_key(|d| d.min);
+        assert_eq!(
+            doors,
+            vec![
+                DoorBox {
+                    min: [3, 10, 2],
+                    max: [3, 11, 3],
+                    double: true
+                },
+                DoorBox {
+                    min: [3, 10, 9],
+                    max: [3, 11, 9],
+                    double: false
+                },
+            ]
+        );
     }
 
     #[test]

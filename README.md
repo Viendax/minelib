@@ -125,6 +125,7 @@ Dans ton monde en créatif, sélectionne une zone avec la baguette (`//wand`), p
 | `/fps set maxplayer <n>` | Nombre de joueurs, toujours pair (2 à 20 ; 10 = classé) |
 | `/fps set door on\|off` | Portes et trappes utilisables en partie (touche *Utiliser*, avec leur bruit) |
 | `/fps set doorsync on\|off` | Double porte : ouvrir un battant ouvre aussi l'autre |
+| `/fps showelements on\|off` | Hors partie, voir à travers les murs les portes (vert clair, doubles portes vert foncé), les sites (rouge, avec leur nom) et les départs CT (bleu) et T (jaune), comme une sélection de la baguette |
 | `/fps info` · `/fps clear …` | Voir ou effacer les réglages |
 
 Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aussi). Ta carte est partagée avec tout le monde dès que tu lances une partie dessus.

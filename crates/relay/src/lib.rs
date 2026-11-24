@@ -13486,22 +13486,16 @@ mod tests {
                 }
                 r => panic!("{r:?}"),
             }
-            // Un ami invité par le créateur y entre.
-            let friend = crowd.conn(st, "Ami", false);
-            for (by, to) in [(owner, "Ami"), (friend, "Proprio")] {
-                crowd.ask(
-                    st,
-                    by,
-                    Request::Friend {
-                        pseudo: to.into(),
-                        add: true,
-                    },
-                );
+            // Un ami invité par le créateur y entre (amis dans les deux sens ; les connexions
+            // d'essai n'ont pas de compte : posés dans les statistiques).
+            let _friend = crowd.conn(st, "Ami", false);
+            for (a, b) in [("Proprio", "Ami"), ("Ami", "Proprio")] {
+                st.stats.get_mut(a).friends.push(b.to_string());
             }
-            assert!(matches!(
-                crowd.ask(st, owner, Request::Invite { pseudo: "Ami".into() }),
-                Some(Response::Done)
-            ));
+            match crowd.ask(st, owner, Request::Invite { pseudo: "Ami".into() }) {
+                Some(Response::Done) => {}
+                r => panic!("{r:?}"),
+            }
             assert!(!st.servers.whitelisted_out(&server, "Proprio", "Ami"));
             assert!(st.servers.whitelisted_out(&server, "Proprio", "Passant"));
             // Rouvert à tous.
