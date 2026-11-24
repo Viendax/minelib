@@ -189,7 +189,7 @@ Les touches sont **physiques** (même place en AZERTY et en QWERTY) et se règle
 | Maj gauche | S'accroupir / descendre | | Clic molette | Copier le bloc visé (lampe torche en main : l'allumer ou l'éteindre) |
 | Ctrl gauche | Courir | | 1 à 0, molette | Barre d'objets |
 | E | Inventaire | | T / `/` | Tchat / commande |
-| C (maintenu) | Zoom | | F5 | Vue 1re / 3e personne (de dos, puis de face ; la caméra ne descend jamais à plus de 65° sous tes yeux, ni donc dans ton personnage) |
+| C (maintenu) | Zoom | | F5 | Vue 1re / 3e personne (de dos, puis de face ; la caméra ne descend jamais à plus de 55° sous tes yeux, ni donc dans ton personnage) |
 | F2 | Capture d'écran (Ctrl+C : copiée ; dans les menus et le tchat ouvert à tout moment, en jeu dans la minute) | | F3 | Écran de debug (dont la carte qui dessine, et l'écran : branché sur elle ou sur une autre) |
 | L | Éditeur de lumières | | F (éditeur ouvert) | Caméra libre |
 | V (maintenu) | Parler (micro, en ligne) | | F1 | Masquer l'interface (il reste le jeu et les pseudos) |

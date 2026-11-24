@@ -13143,8 +13143,11 @@ fn sun_reaches(world: &World, b: &ShadowBox, sun: [f32; 3]) -> bool {
 /// Recul de la caméra à la 3e personne (F5), en blocs, comme dans Minecraft.
 const THIRD_PERSON_DIST: f32 = 4.0;
 
-/// (v295) La caméra F5 ne descend pas plus bas que ça (degrés sous l'horizontale des yeux).
-const THIRD_PERSON_MAX_BELOW: f32 = 65.0;
+/// (v295) La caméra F5 ne descend pas plus bas que ça (degrés sous l'horizontale des yeux) :
+/// sur un sol plat, elle reste alors à un bloc derrière (ou devant) les pieds, hors de portée
+/// des jambes qui balancent en marchant (65° ne suffisait pas : le pied de derrière la
+/// touchait).
+const THIRD_PERSON_MAX_BELOW: f32 = 55.0;
 
 /// (v295) Direction des yeux vers la caméra F5 (`third` : 1 de dos, 2 de face) : à l'opposé du
 /// regard de dos, dans son sens de face, mais jamais plus de `THIRD_PERSON_MAX_BELOW` degrés
@@ -14076,7 +14079,7 @@ mod f5_camera_tests {
     /// (v295) « Corrige ce point de vue » : sa capture était prise de l'intérieur de ses
     /// jambes (F5 de face, regard vers le bas ; de même de dos, regard vers le haut). Debout ou
     /// accroupi, immobile ou en marchant, sur un sol plat : la caméra F5 n'est jamais dans le
-    /// corps du joueur, de dos comme de face, quel que soit le regard ; et plus haut que 65°
+    /// corps du joueur, de dos comme de face, quel que soit le regard ; et plus haut que 55°
     /// sous l'horizontale, elle est là où elle était.
     #[test]
     fn the_third_person_camera_never_ends_inside_the_player() {
@@ -14087,7 +14090,15 @@ mod f5_camera_tests {
                 for k in -22..=22 {
                     let pitch = (k as f32 * 4.0).clamp(-89.0, 89.0).to_radians();
                     let yaw = yaw_deg.to_radians();
-                    for (crouch, walk, swing) in [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.5, 1.0)] {
+                    for (crouch, walk, swing) in [
+                        (0.0, 0.0, 0.0),
+                        (1.0, 0.0, 0.0),
+                        (0.0, 1.5, 1.0),
+                        (0.0, -1.5, 1.0),
+                        (0.0, 0.7, 1.0),
+                        (1.0, 1.5, 1.0),
+                        (1.0, -1.5, 1.0),
+                    ] {
                         let eye = feet + Vec3::Y * (crate::player::EYE - crate::player::CROUCH_DROP * crouch);
                         let dir = third_person_dir(yaw, pitch, third);
                         // Le sol (herbe sous les pieds) ramène la caméra comme `raycast`.
@@ -14117,7 +14128,7 @@ mod f5_camera_tests {
                                 pitch.to_degrees()
                             );
                         }
-                        // Au-dessus de 65° sous l'horizontale : comme avant (à l'opposé du
+                        // Au-dessus de 55° sous l'horizontale : comme avant (à l'opposé du
                         // regard de dos, dans son sens de face).
                         let (sy, cy) = yaw.sin_cos();
                         let (sp, cp) = pitch.sin_cos();
@@ -14126,7 +14137,7 @@ mod f5_camera_tests {
                         if before.y >= -(THIRD_PERSON_MAX_BELOW.to_radians().sin()) + 1e-4 {
                             assert!((dir - before).length() < 1e-4, "{dir} contre {before}");
                         } else {
-                            // Plus bas : 65° sous l'horizontale, du même côté qu'avant.
+                            // Plus bas : 55° sous l'horizontale, du même côté qu'avant.
                             assert!((dir.y + THIRD_PERSON_MAX_BELOW.to_radians().sin()).abs() < 1e-4);
                             let side = Vec3::new(dir.x, 0.0, dir.z).normalize();
                             let want = if third == 1 { -Vec3::new(sy, 0.0, -cy) } else { Vec3::new(sy, 0.0, -cy) };
