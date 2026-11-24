@@ -106,6 +106,11 @@ fn on_route(r: &fast::TunnelRoute) {
 struct Inner {
     sock: tokio::net::UdpSocket,
     routes: Mutex<HashMap<u64, Route>>,
+    /// Adresses annoncées à iroh : aucune, jamais. iroh publie les adresses d'un nœud
+    /// (dans le DNS de son éditeur, pour qu'on le trouve par sa clé) : les numéros de
+    /// route n'ont rien à y faire, ils ne servent qu'aux deux bouts, à qui le relais du
+    /// monde les donne ; et un hôte en a une par joueur, de quoi faire déborder
+    /// l'annonce et la faire échouer.
     addrs: n0_watcher::Watchable<Vec<CustomAddr>>,
 }
 
@@ -222,16 +227,13 @@ impl PasseurTransport {
                     seq,
                 },
             );
-            let _ = self.0.addrs.set(routes.keys().map(|r| addr(*r)).collect());
         }
         // Tout de suite : le passeur ne peut rien nous remettre avant de nous connaître.
         self.0.keep();
     }
 
     pub fn drop_route(&self, route: u64) {
-        let mut routes = self.0.routes.lock().unwrap();
-        routes.remove(&route);
-        let _ = self.0.addrs.set(routes.keys().map(|r| addr(*r)).collect());
+        self.0.routes.lock().unwrap().remove(&route);
     }
 
     pub fn routes(&self) -> usize {

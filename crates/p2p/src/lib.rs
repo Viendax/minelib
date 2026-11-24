@@ -648,6 +648,16 @@ mod tests {
         }
         assert!(p.carried() > 20, "le passeur a porté {} paquets", p.carried());
         assert_eq!(node_direct(host.id()), Some(true));
+        // Les numéros de route ne sont pas des adresses du nœud : iroh, qui publie les
+        // adresses d'un nœud, n'en sait rien.
+        for n in [&host, &guest] {
+            assert_eq!(n.passeurs().routes(), 1);
+            let known = n.ep.addr();
+            assert!(known
+                .addrs
+                .iter()
+                .all(|a| !matches!(a, iroh::TransportAddr::Custom(_))));
+        }
         // Le tunnel fermé, le joueur rend sa route.
         drop(c);
         drop(guest);
