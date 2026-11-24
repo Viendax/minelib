@@ -163,6 +163,11 @@ pub struct Bolts {
     post: wgpu::RenderPipeline,
     /// À la première personne, par-dessus la main.
     over: wgpu::RenderPipeline,
+    /// (v268) Boules de lumière dans l'image du monde, avant l'anticrénelage (cachées par sa
+    /// profondeur, avec le même décalage sous-pixel : voir `vs_ball` de bolt.wgsl).
+    balls_pipe: wgpu::RenderPipeline,
+    /// (v268) Boules de lumière parmi les segments du monde de l'image.
+    balls: u32,
 }
 
 impl Bolts {
@@ -246,6 +251,44 @@ impl Bolts {
                 cache: None,
             })
         };
+        let balls_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("boules de lumière (avant l'anticrénelage)"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_ball"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<BoltSeg>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &attrs,
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_ball"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: crate::taa::COLOR_FORMAT,
+                    blend: Some(add),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
         Self {
             world: Batch::new(device, "éclairs (monde)"),
             hand: Batch::new(device, "éclairs (main)"),
@@ -253,6 +296,8 @@ impl Bolts {
             plain: pipeline(false, true),
             post: pipeline(true, false),
             over: pipeline(false, false),
+            balls_pipe,
+            balls: 0,
         }
     }
 
@@ -266,6 +311,10 @@ impl Bolts {
         ui: &[BoltSeg],
     ) {
         self.world.set(device, queue, "éclairs (monde)", world);
+        self.balls = world[..world.len().min(MAX_SEGS)]
+            .iter()
+            .filter(|s| s.screen <= 0.5 && s.a[3] > 2.5)
+            .count() as u32;
         self.hand.set(device, queue, "éclairs (main)", hand);
         self.ui.set(device, queue, "éclairs (interface)", ui);
     }
@@ -315,6 +364,23 @@ impl Bolts {
         pass.set_bind_group(1, depth, &[]);
         pass.set_vertex_buffer(0, self.world.buffer.slice(..));
         pass.draw(0..6, 0..self.world.count);
+    }
+
+    /// (v268) Boules de lumière, dans l'image du monde avant l'anticrénelage (la passe a pour
+    /// cibles sa couleur et sa profondeur, en lecture seule) : voir `vs_ball` de bolt.wgsl.
+    pub fn draw_balls<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, world: &'a wgpu::BindGroup) {
+        if self.balls == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.balls_pipe);
+        pass.set_bind_group(0, world, &[]);
+        pass.set_vertex_buffer(0, self.world.buffer.slice(..));
+        pass.draw(0..6, 0..self.world.count);
+    }
+
+    /// (v268) Des boules de lumière dans le monde à cette image ?
+    pub fn any_balls(&self) -> bool {
+        self.balls > 0
     }
 
     /// Y a-t-il des éclairs à dessiner dans le monde ?

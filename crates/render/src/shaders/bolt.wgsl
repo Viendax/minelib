@@ -75,10 +75,46 @@ fn vs_main(@builtin(vertex_index) vi: u32, s: Seg) -> VOut {
     return place(vi, s, g.view_proj);
 }
 
-// Après l'anticrénelage : sans son tremblement.
+// Après l'anticrénelage : sans son tremblement. (v268) Sans les boules de lumière (dessinées
+// avant lui, voir `vs_ball`).
 @vertex
 fn vs_post(@builtin(vertex_index) vi: u32, s: Seg) -> VOut {
+    if is_ball(s) {
+        return hidden();
+    }
     return place(vi, s, g.cur_view_proj);
+}
+
+/// (v268) « Le bloc vibre » : la boule de lumière d'une lumière dans un bloc de feuillage était
+/// dessinée après l'anticrénelage, cachée par la profondeur du monde de cette image, prise avec
+/// son décalage sous-pixel ; le bord du bloc devant elle et chaque trou du feuillage sautaient
+/// d'un pixel d'une image à l'autre (aucune moyenne au fil des images pour eux). Les boules
+/// sont maintenant ajoutées à l'image du monde avant l'anticrénelage, avec le même décalage,
+/// cachées par la profondeur elle-même : leurs bords sont lissés et immobiles comme ceux des
+/// blocs. Les autres segments (éclairs) restent après lui (nets dès la première image).
+@vertex
+fn vs_ball(@builtin(vertex_index) vi: u32, s: Seg) -> VOut {
+    if !is_ball(s) {
+        return hidden();
+    }
+    return place(vi, s, g.view_proj);
+}
+
+/// (v268) Une boule de lumière (`BOLT_BALL`, dans le monde) ?
+fn is_ball(s: Seg) -> bool {
+    return s.misc.w <= 0.5 && s.a.w > 2.5;
+}
+
+/// (v268) Rien à dessiner : hors de l'écran.
+fn hidden() -> VOut {
+    var o: VOut;
+    o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    o.at = vec2<f32>(0.0);
+    o.color = vec3<f32>(0.0);
+    o.seg = vec3<f32>(0.0);
+    o.ndc = vec2<f32>(0.0);
+    o.cloud = vec3<f32>(0.0);
+    return o;
 }
 
 fn place(vi: u32, s: Seg, view_proj: mat4x4<f32>) -> VOut {
@@ -267,6 +303,12 @@ fn bolt_light(i: VOut, m: mat4x4<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(bolt_light(i, g.view_proj), 0.0);
+}
+
+/// (v268) Boules de lumière dans l'image du monde, avant l'anticrénelage (voir `vs_ball`).
+@fragment
+fn fs_ball(i: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(ball(i), 0.0);
 }
 
 /// Ce pixel de l'éclair est-il derrière le monde ? (Profondeur inversée : plus grand =

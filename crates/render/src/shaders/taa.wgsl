@@ -20,7 +20,9 @@ struct TaaParams {
     // quand ça bouge
     size: vec4<f32>,
     // x = part de l'image courante pour un pixel immobile (baisse tant que la caméra
-    // reste immobile : moyenne de plus en plus longue, image stable)
+    // reste immobile : moyenne de plus en plus longue, image stable) ; y = 1 : la scène vient
+    // de changer ; (v268) z = pas de la caméra depuis l'image d'avant, rapporté au plan proche,
+    // w = angle dont elle a tourné (rad)
     still: vec4<f32>,
     // Échelle de rendu : xy = taille de l'image du monde, z = échelle (1 = pleine taille)
     internal: vec4<f32>,
@@ -134,7 +136,9 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     var m2 = vec3<f32>(0.0);
     var cmin = vec3<f32>(1e9);
     var cmax = vec3<f32>(-1e9);
-    var best_depth = -1.0;
+    // (v268) Le pixel lui-même à profondeur égale (avant : le premier des neuf, celui d'en haut
+    // à gauche, dont le mouvement passait à tout un ciel ou un mur plat).
+    var best_depth = d_cur;
     var best = p;
     var center = vec3<f32>(0.0);
     for (var k = 0; k < 9; k++) {
@@ -173,8 +177,14 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     let near_motion = mmax > 6.25e-6;
     let mv_here = textureLoad(cur_motion, p, 0).xy;
     var motion = mv_here;
-    if any(best != p) {
+    // (v268) Le mouvement du voisin le plus proche de la caméra, seulement s'il est à peu près
+    // sur la même surface que ce pixel : un pixel nettement derrière lui (le ciel par un trou
+    // du feuillage, un mur derrière le bord d'un objet) garde le sien. Avec celui du voisin,
+    // il allait chercher l'image d'avant là où était le feuillage, et l'y prenait.
+    var d_ref = d_cur;
+    if any(best != p) && d_cur >= best_depth * 0.8 {
         motion = textureLoad(cur_motion, best, 0).xy;
+        d_ref = best_depth;
     }
     let mean = m1 / 9.0;
     let sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3<f32>(0.0)));
@@ -183,6 +193,45 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     let offscreen = any(prev_uv < vec2<f32>(0.0)) || any(prev_uv > vec2<f32>(1.0));
     if params.size.z > 0.5 || offscreen {
         return vec4<f32>(cur, select(0.0, 1.0, near_motion));
+    }
+
+    // (v268) « De la rémanence quand on se déplace autour » (un grand amas de feuillage de la
+    // carte Nuke, de nuit : des copies de ses blocs, étalées autour de lui) : là où les voisins
+    // mêlent des feuilles sombres et le ciel par leurs trous, les bornes de couleur couvrent
+    // les deux, et rien n'empêchait l'image d'avant de garder des feuilles là où il n'y avait
+    // plus que du ciel (ou l'inverse), image après image. La caméra bougeant, l'image d'avant
+    // n'est reprise que là où elle montrait la même surface : la profondeur de l'image d'avant,
+    // là où on la lit (quatre pixels, mêlés selon la distance), comparée à celle de ce pixel,
+    // à la marge près de ce que la caméra a parcouru (`still.z` : son pas rapporté au plan
+    // proche ; `still.w` : l'angle dont elle a tourné). Une autre surface (un trou découvert,
+    // le bord qui a glissé) : l'image courante seule. Caméra immobile : rien ne change (les
+    // objets qui bougent ont leur traitement plus bas).
+    var conf = 1.0;
+    if params.still.z > 0.0 || params.still.w > 0.0 {
+        let gp = textureGather(prev_depth, lin_sampler, prev_uv);
+        let pf = fract(prev_uv * isize - 0.5);
+        // Et la pente de la surface ici (d'un pixel au voisin, sur la même surface : écart de
+        // moins de moitié) : un sol vu de loin, presque à plat, change de profondeur de plus
+        // de 5 % d'un pixel à l'autre ; sans elle, il aurait perdu son lissage en bougeant.
+        var slope = 0.0;
+        for (var k = 0; k < 9; k++) {
+            let r = abs(depths[k] - d_cur) / max(max(depths[k], d_cur), 1e-7);
+            if r < 0.5 {
+                slope = max(slope, r);
+            }
+        }
+        let tol = 0.05 + slope + params.still.z * d_ref + 1.2 * params.still.w;
+        // Ordre de `textureGather` : (x0, y1), (x1, y1), (x1, y0), (x0, y0).
+        let w4 = vec4<f32>((1.0 - pf.x) * pf.y, pf.x * pf.y, pf.x * (1.0 - pf.y), (1.0 - pf.x) * (1.0 - pf.y));
+        let s4 = vec4<f32>(
+            same_surface(gp.x, d_ref, tol),
+            same_surface(gp.y, d_ref, tol),
+            same_surface(gp.z, d_ref, tol),
+            same_surface(gp.w, d_ref, tol),
+        );
+        // Un quart des pixels lus sur la même surface suffit (un bord d'objet, que le décalage
+        // sous-pixel fait passer d'un pixel à l'autre, garde son lissage).
+        conf = smoothstep(0.0, 0.25, dot(w4, s4));
     }
 
     // Pixel immobile (caméra arrêtée) : l'historique est exact, seul le décalage sous-pixel
@@ -242,7 +291,14 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     let rejected = abs(hist_raw.x - hist.x) / max(mean.x, 0.05);
     let base = mix(params.still.x, params.size.w, tight);
     let alpha = clamp(base + speed * 0.01 + rejected * mix(0.5, 2.0, tight), base, 0.8);
-    let out = mix(hist, to_ycocg(cur), alpha);
+    // (v268) Image d'avant d'une autre surface (voir `conf`) : l'image courante.
+    let out = mix(hist, to_ycocg(cur), mix(1.0, alpha, conf));
     return vec4<f32>(from_ycocg(out), flag);
+}
+
+/// (v268) La profondeur `dp` de l'image d'avant est-elle celle de la même surface que `d` (Z
+/// inversé, 0 : le ciel), à `tol` près (part de la plus proche) ? 1 ou 0.
+fn same_surface(dp: f32, d: f32, tol: f32) -> f32 {
+    return select(0.0, 1.0, abs(dp - d) <= tol * max(dp, d) + 1e-7);
 }
 

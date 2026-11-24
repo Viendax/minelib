@@ -780,9 +780,11 @@ fn pack_light(
         },
         rect: [rect[0], rect[1], rect[2], l.gobo_rotation.sin()],
         box_sphere: box_cone(Vec3::from(l.pos), box_sphere).0,
+        // (v268) y = 1 : la lumière est dans un bloc lumineux (sa case ne la filtre pas, comme
+        // pour sa carte d'ombre) : pour le suivi exact du verre (`dl_glass_exact`).
         tint: [
             if tinted && tile.is_some() { 1.0 } else { 0.0 },
-            0.0,
+            if l.inside_block { 1.0 } else { 0.0 },
             0.0,
             0.0,
         ],
@@ -1714,12 +1716,26 @@ fn tex_entry(
     }
 }
 
-/// Source WGSL complète d'un shader qui utilise les lumières dynamiques.
+/// Source WGSL complète d'un shader qui utilise les lumières dynamiques. (v268) La teinte du
+/// verre sur les surfaces vient de la carte de teinte seule (dynlights_glass_off.wgsl).
 pub(crate) fn with_dynlights(src: &str) -> String {
     format!(
-        "{src}\n{}\n{}",
+        "{src}\n{}\n{}\n{}",
         include_str!("shaders/gbuffer.wgsl"),
-        include_str!("shaders/dynlights.wgsl")
+        include_str!("shaders/dynlights.wgsl"),
+        include_str!("shaders/dynlights_glass_off.wgsl")
+    )
+}
+
+/// (v268) La même chose pour l'éclairage différé (dyn_deferred.wgsl, qui lit la grille de
+/// blocs) : la teinte du verre sur les surfaces suivie exactement, case par case
+/// (dynlights_glass.wgsl).
+pub(crate) fn with_dynlights_glass(src: &str) -> String {
+    format!(
+        "{src}\n{}\n{}\n{}",
+        include_str!("shaders/gbuffer.wgsl"),
+        include_str!("shaders/dynlights.wgsl"),
+        include_str!("shaders/dynlights_glass.wgsl")
     )
 }
 
@@ -1787,7 +1803,7 @@ pub(crate) fn light_pipes(
     });
     // Éclairage différé : lit le monde (groupe 0, lumières comprises) et ce que les
     // opaques ont laissé (groupe 1).
-    let def_src = with_dynlights(include_str!("shaders/dyn_deferred.wgsl"));
+    let def_src = with_dynlights_glass(include_str!("shaders/dyn_deferred.wgsl"));
     let def_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("éclairage différé"),
         source: wgpu::ShaderSource::Wgsl(def_src.into()),

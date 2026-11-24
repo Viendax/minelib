@@ -81,6 +81,11 @@ pub struct Taa {
     pub still_frames: u32,
     /// La scène vient de changer : traiter les pixels comme en mouvement.
     pub scene_changed: bool,
+    /// (v268) Pas de la caméra depuis l'image d'avant, rapporté au plan proche (blocs / 0,05),
+    /// et angle dont elle a tourné (rad) : marge de la comparaison des profondeurs (taa.wgsl,
+    /// `conf`). Zéro : immobile.
+    pub cam_step: f32,
+    pub cam_turn: f32,
     /// Historique écrit à la dernière résolution.
     written: usize,
     /// Vue-projection sans décalage de l'image précédente.
@@ -312,9 +317,11 @@ pub(crate) fn build_heavy(
     })
 }
 
-/// Translucides (eau, glace, verre teinté) : couleur mélangée, on garde le mouvement de ce
-/// qui est derrière. (v199) Ils laissent aussi leur face (profondeur, albédo, normale,
-/// poids) : les lumières dynamiques y sont ajoutées après coup, comme sur l'opaque.
+/// Translucides (eau, glace, verre teinté) : couleur mélangée. (v268) Leur mouvement remplace
+/// celui de ce qui est derrière (`translucent_out` de world.wgsl : avant, il était gardé, et un
+/// amas de verre devant le ciel s'étalait en se déplaçant). (v199) Ils laissent aussi leur face
+/// (profondeur, albédo, normale, poids) : les lumières dynamiques y sont ajoutées après coup,
+/// comme sur l'opaque.
 fn translucent_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -331,7 +338,7 @@ fn translucent_pipeline(
         None,
         false,
         Some(wgpu::BlendState::ALPHA_BLENDING),
-        wgpu::ColorWrites::empty(),
+        wgpu::ColorWrites::ALL,
         Some(Extra::Water(wgpu::ColorWrites::ALL)),
     )
 }
@@ -504,6 +511,8 @@ impl Taa {
             written: 0,
             still_frames: 0,
             scene_changed: false,
+            cam_step: 0.0,
+            cam_turn: 0.0,
             prev_view_proj: None,
             prev_eye: None,
             reset: true,
@@ -673,7 +682,12 @@ impl Taa {
                 if reset { 1.0 } else { 0.0 },
                 BLEND,
             ],
-            still: [still, if self.scene_changed { 1.0 } else { 0.0 }, 0.0, 0.0],
+            still: [
+                still,
+                if self.scene_changed { 1.0 } else { 0.0 },
+                self.cam_step,
+                self.cam_turn,
+            ],
             internal: [t.internal.0 as f32, t.internal.1 as f32, scale, 0.0],
             jitter: [jx, jy, 0.0, 0.0],
         };

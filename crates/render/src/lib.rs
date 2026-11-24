@@ -329,6 +329,17 @@ pub fn relative_to(m: Mat4, eye: Vec3, cam: Vec3) -> Mat4 {
     shifted(eye_relative(m), eye, cam)
 }
 
+/// (v268) Ce que la caméra a fait d'une image à l'autre (vue-projection du jeu `prev` depuis
+/// `prev_eye`, puis `cur` depuis `eye`) : son pas rapporté au plan proche (0,05 : la
+/// profondeur relative d'un point immobile change au plus de pas / distance) et l'angle dont
+/// son regard a tourné (rad ; la ligne w de la vue-projection est la direction du regard).
+pub fn camera_motion(prev: Mat4, prev_eye: Vec3, cur: Mat4, eye: Vec3) -> (f32, f32) {
+    let forward = |m: Mat4| Vec3::new(m.x_axis.w, m.y_axis.w, m.z_axis.w).normalize_or_zero();
+    let step = (eye - prev_eye).length() / 0.05;
+    let turn = forward(prev).dot(forward(cur)).clamp(-1.0, 1.0).acos();
+    (step, turn)
+}
+
 /// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre. (v236) 64 au lieu de
 /// 48 (onze ou douze joueurs au lieu de huit ou neuf) : dans une foule, les plus proches de
 /// la caméra et de l'axe de vue ont leur ombre exacte (les autres, celle de l'atlas des
@@ -3578,6 +3589,13 @@ impl Renderer {
         } else {
             0
         };
+        // (v268) Ce que la caméra a parcouru et tourné depuis l'image d'avant : marge de la
+        // comparaison des profondeurs de l'anticrénelage (l'image d'avant n'est reprise que là où
+        // elle montrait la même surface, voir `conf` dans taa.wgsl).
+        (taa.cam_step, taa.cam_turn) = match (taa.prev_view_proj, taa.prev_eye) {
+            (Some(m), Some(e)) if !still => camera_motion(m, e, view_proj, p.eye),
+            _ => (0.0, 0.0),
+        };
         // Chunk chargé ou bloc modifié : quelques images « en mouvement » (pas de fantômes).
         taa.scene_changed = self.mesh_changes > 0;
         if taa.scene_changed {
@@ -3987,6 +4005,31 @@ impl Renderer {
                     timer,
                 );
             }
+        }
+        // (v268) « Le bloc vibre » : les boules de lumière, ajoutées à l'image du monde avant
+        // l'anticrénelage, cachées par sa profondeur (même décalage sous-pixel) : le bord d'un
+        // bloc devant elles est lissé et immobile comme les autres (voir `vs_ball`, bolt.wgsl).
+        if let Some(t) = taa.targets.as_ref().filter(|_| self.bolts.any_balls()) {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("boules de lumière"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                // Profondeur en lecture seule : celle du monde, relue ensuite par le TAA.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &t.depth_views[taa.depth_index()],
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.bolts.draw_balls(&mut pass, self.world_group());
         }
         // (v203) Profondeur de cette image, lue avant `resolve` qui passe à l'image suivante
         // (après, c'était celle de l'image d'avant : une image de retard sous l'eau).
@@ -4558,6 +4601,31 @@ fn aabb_visible(planes: &[Vec4; 4], min: Vec3, max: Vec3) -> bool {
 mod tests {
     use super::*;
 
+    /// (v268) Ce que la caméra a fait d'une image à l'autre, pour l'anticrénelage (marge de la
+    /// comparaison des profondeurs) : rien à l'arrêt ; un pas d'un bloc, 20 (rapporté au plan
+    /// proche à 0,05) ; un quart de tour de la tête, l'angle, même en levant les yeux.
+    #[test]
+    fn the_camera_step_and_turn_are_measured_between_frames() {
+        let proj = Mat4::perspective_infinite_reverse_rh(1.2, 16.0 / 9.0, 0.05);
+        let eye = Vec3::new(40_000.5, 70.0, -12.25);
+        let vp = |dir: Vec3, at: Vec3| proj * Mat4::look_to_rh(at, dir, Vec3::Y);
+        let ahead = Vec3::new(0.0, 0.0, -1.0);
+        let (step, turn) = camera_motion(vp(ahead, eye), eye, vp(ahead, eye), eye);
+        assert_eq!(step, 0.0);
+        assert!(turn < 1e-3, "{turn}");
+        let moved = eye + Vec3::new(0.6, 0.0, 0.8);
+        let (step, turn) = camera_motion(vp(ahead, eye), eye, vp(ahead, moved), moved);
+        // (À 40 000 blocs, une position en f32 est au demi-centième près : un millième de pas.)
+        assert!((step - 20.0).abs() < 0.1, "{step}");
+        assert!(turn < 1e-3, "{turn}");
+        let up = Vec3::new(0.0, 1.0, -1.0).normalize();
+        let side = Vec3::new(1.0, 0.0, 0.0);
+        let (_, turn) = camera_motion(vp(ahead, eye), eye, vp(side, eye), eye);
+        assert!((turn - std::f32::consts::FRAC_PI_2).abs() < 1e-3, "{turn}");
+        let (_, turn) = camera_motion(vp(ahead, eye), eye, vp(up, eye), eye);
+        assert!((turn - std::f32::consts::FRAC_PI_4).abs() < 1e-3, "{turn}");
+    }
+
     /// (v254) « En 40 000 40 000 je suis déjà dans les farlands » : les matrices comptées depuis
     /// la caméra donnent le même point de l'écran que les matrices du monde, et loin du centre
     /// du monde, le bon (comparé à un calcul en f64) quand celles du monde se trompent.
@@ -4871,7 +4939,7 @@ mod tests {
         let cases: [Variant; 13] = [
             (
                 "éclairage différé",
-                lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
+                lights::with_dynlights_glass(include_str!("shaders/dyn_deferred.wgsl")),
                 &[],
             ),
             (
@@ -4881,7 +4949,7 @@ mod tests {
             ),
             (
                 "éclairage différé (ombres nettes)",
-                lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
+                lights::with_dynlights_glass(include_str!("shaders/dyn_deferred.wgsl")),
                 &[("DL_SOFT_SHADOWS", 0.0)],
             ),
             (
@@ -4986,7 +5054,7 @@ mod tests {
             ),
             (
                 "dyn_deferred",
-                lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
+                lights::with_dynlights_glass(include_str!("shaders/dyn_deferred.wgsl")),
             ),
             (
                 "viewmodel",

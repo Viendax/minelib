@@ -885,7 +885,12 @@ fn translucent_out(i: VOut, s: Shaded) -> TrOut {
     let a = max(c.a, 0.25);
     var o: TrOut;
     o.color = vec4<f32>(c.rgb, a);
-    o.motion = vec2<f32>(0.0);
+    // (v268) Le mouvement de la face translucide elle-même (il remplace celui de ce qui est
+    // derrière) : un grand amas de verre teinté devant le ciel se reprenait avec le mouvement
+    // du ciel, nul en se déplaçant, et s'étalait d'image en image (« de la rémanence quand on se
+    // déplace autour »). Ce qu'on voit au travers, s'il est loin derrière, est écarté par
+    // l'anticrénelage (profondeurs comparées, voir `conf` dans taa.wgsl).
+    o.motion = motion_of(vec4<f32>(i.world, 1.0));
     // Comme `gb_out`, poids multipliés par l'opacité de la face (mélange : face × a).
     // Albédo en racine carrée (8 bits, plus de nuances dans le sombre).
     o.water = vec4<u32>(

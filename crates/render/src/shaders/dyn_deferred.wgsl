@@ -30,9 +30,20 @@ struct Globals {
     cur_view_proj: mat4x4<f32>,
     prev_view_proj: mat4x4<f32>,
     screen: vec4<f32>,
+    clip: vec4<f32>,
+    held_pos: vec4<f32>,
+    held_color: vec4<f32>,
+    // (v268) yzw = coin bas de la grille de blocs (teinte exacte du verre, dynlights_glass.wgsl).
+    rt: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
+// (v268) Textures des blocs et grille de blocs du monde : la lumière est suivie case par case à
+// travers le verre (`dl_glass_exact`, dynlights_glass.wgsl).
+@group(0) @binding(1) var blocks: texture_2d_array<f32>;
+@group(0) @binding(2) var block_sampler: sampler;
+@group(0) @binding(3) var voxels: texture_3d<u32>;
+@group(0) @binding(4) var palette: texture_1d<u32>;
 @group(1) @binding(0) var scene_depth: texture_depth_2d;
 @group(1) @binding(1) var gb_albedo: texture_2d<f32>;
 @group(1) @binding(2) var gb_surf: texture_2d<f32>;

@@ -348,6 +348,51 @@ fn dl_tint(L: DynLight, fr: DlFrame, d: vec3<f32>, dist: f32, range: f32, surfac
     return acc;
 }
 
+/// (v268) « Fais le même travail que pour les ombres, que ça rende bien la forme d'un bloc et
+/// que le rendu soit lisse » (pour le verre) : couleur que prend la lumière `L` en arrivant sur
+/// une surface éclairée en `q` (direction `d` de la lumière vers elle, distance `dist`). La
+/// carte de teinte, sur les 3 × 3 texels autour de cette direction, dit seulement s'il y a du
+/// verre sur le chemin, et à partir d'où ; le chemin est alors suivi case par case dans la
+/// grille de blocs (`dl_glass_exact` de dynlights_glass.wgsl, éclairage différé) : la tache
+/// colorée a la forme exacte des blocs de verre et le motif de leur texture, ses bords sont
+/// lissés par l'anticrénelage comme ceux des blocs. Hors de la grille, et dans les autres
+/// shaders (dynlights_glass_off.wgsl) : la carte de teinte, comme avant (`dl_tint`).
+fn dl_surface_tint(L: DynLight, fr: DlFrame, d: vec3<f32>, dist: f32, range: f32, q: vec3<f32>) -> vec3<f32> {
+    if L.tint.x < 0.5 {
+        return vec3<f32>(1.0);
+    }
+    let su = dl_shadow_uv(L, fr, d);
+    if su.z < 0.5 {
+        return vec3<f32>(1.0);
+    }
+    let dims = vec2<f32>(textureDimensions(tint_atlas));
+    let rect = dl_light_rect(L, fr, d);
+    // Texels de la case seulement (pas ceux d'une lumière voisine).
+    let lo = vec2<i32>(ceil(rect.xy * dims - 0.001));
+    let hi = max(vec2<i32>(floor((rect.xy + rect.z) * dims + 0.001)) - 1, lo);
+    let c = vec2<i32>(floor(su.xy * dims));
+    let t = dist / max(range, 1e-3);
+    // Distance (rapportée à la portée) du premier verre vu autour de cette direction.
+    var first = 2.0;
+    for (var k = 0; k < 9; k++) {
+        let o = vec2<i32>(k % 3 - 1, k / 3 - 1);
+        let tq = textureLoad(tint_atlas, clamp(c + o, lo, hi), 0);
+        if any(tq != vec4<u32>(0u)) {
+            first = min(first, unpack2x16float(tq.y).y);
+        }
+    }
+    // Pas de verre avant ce point, ni à côté : la lumière arrive de sa couleur.
+    if first > t + 0.004 {
+        return vec3<f32>(1.0);
+    }
+    // Suivie depuis un bloc avant le premier verre vu (la marge d'un texel de la carte).
+    let exact = dl_glass_exact(L.pos_range.xyz, q, first * range - 1.0, L.tint.y > 0.5);
+    if exact.w > 0.5 {
+        return exact.rgb;
+    }
+    return dl_tint(L, fr, d, dist, range, true);
+}
+
 /// Rotation du disque de Vogel d'un échantillon au suivant (angle d'or).
 const DL_GOLDEN = vec2<f32>(-0.73736887, 0.67549029);
 
@@ -634,8 +679,8 @@ fn dl_one(
             if toon {
                 diff = dl_toon(diff, dh.surf.z, dh.surf.w);
             }
-            // (v251) Passée par du verre : de sa couleur.
-            let col = L.color.rgb * dl_tint(L, fr, -l, d, r, true);
+            // (v251) Passée par du verre : de sa couleur. (v268) Exacte, à la forme des blocs.
+            let col = L.color.rgb * dl_surface_tint(L, fr, -l, d, r, p + n * 0.02);
             o.diffuse = col * diff;
             if spec_k > 0.0 {
                 // Blinn-Phong normalisé : tache nette sur un miroir, large et faible

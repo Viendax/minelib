@@ -5424,8 +5424,13 @@ impl Session {
         let fps_mode = self.game.mode == GameMode::Fps;
         let third = if fps_mode { 0 } else { self.perspective };
         if third == 0 {
+            // (v268) Avec la marche montée ou descendue en douceur (`smooth_steps`), comme la
+            // vue : depuis la v254, l'image est dessinée depuis cette position (matrices
+            // comptées depuis la caméra, sans la translation de la vue) ; sans elle, la caméra
+            // sautait d'un coup sur une dalle, et la vue (tri des chunks, lumières) ne tombait
+            // plus juste avec l'image.
             (
-                self.player.eye(),
+                self.player.eye() + Vec3::Y * self.step_offset,
                 self.view_with_punch(),
                 self.player.look_dir(),
             )
