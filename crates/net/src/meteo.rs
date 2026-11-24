@@ -2,10 +2,11 @@
 //!
 //! La météo d'un monde est une fonction de sa graine et d'une horloge (voir
 //! `app::weather`) : tout le monde y lit le même temps au même moment, sans rien s'échanger.
-//! Le relais y lit aussi les éclairs qui courent dans les nuages au-dessus des zones : ce
-//! sont eux qui chargent la Foudre de Zeus de celui qui la porte en dessous, et c'est le
-//! relais qui accorde ces charges en ligne (principe du projet : il valide tout). Le jeu et
-//! le relais tirent donc ces éclairs avec ce même code.
+//! Les éclairs qui courent dans les nuages au-dessus des zones en sont tirés aussi, les mêmes
+//! pour tous. (v282) Pendant l'orage, la Foudre de Zeus de celui qui la porte gagne une
+//! charge toutes les `CHARGE_EVERY_S` secondes de cette horloge (avant : quand un de ces
+//! éclairs passait au-dessus de lui) ; en ligne, c'est le relais qui accorde ces charges
+//! (principe du projet : il valide tout), aux mêmes instants (`charge_marks`).
 
 /// Durées de Minecraft, en secondes (tics / 20) : averse, temps sec, tonnerre, sans
 /// tonnerre.
@@ -29,8 +30,23 @@ pub const CLOUD_P: f64 = 1.0 / 8.0;
 /// Autour de celui qui porte la Foudre de Zeus (à moins de `CHARGE_REACH` blocs de lui) :
 /// trois fois plus souvent.
 pub const CLOUD_BOOST: f64 = 3.0;
-/// Un éclair des nuages charge celui qui le porte à moins de tant de blocs (à plat).
+/// Autour de celui qui porte la Foudre de Zeus (à moins de tant de blocs, à plat), les
+/// éclairs des nuages sont plus fréquents (`CLOUD_BOOST`). (Avant la v282, ils la
+/// chargeaient.)
 pub const CHARGE_REACH: f32 = 160.0;
+/// (v282) « Quand il y a la foudre, au lieu que les éclairs dans le ciel chargent l'éclair,
+/// charge-le d'autant qu'un éclair naturel toutes les 10 secondes » : pendant l'orage, celui
+/// qui porte la Foudre de Zeus gagne une charge à chaque multiple de tant de secondes de
+/// l'horloge de la météo (les mêmes instants pour son jeu et pour le relais).
+pub const CHARGE_EVERY_S: f64 = 10.0;
+
+/// (v282) Instants de charge (multiples de `CHARGE_EVERY_S`) entre `from` (exclu) et `to`
+/// (inclus) de l'horloge de la météo.
+pub fn charge_marks(from: f64, to: f64) -> impl Iterator<Item = f64> {
+    let first = (from / CHARGE_EVERY_S).floor() as i64 + 1;
+    let last = (to / CHARGE_EVERY_S).floor() as i64;
+    (first..=last).map(|k| k as f64 * CHARGE_EVERY_S)
+}
 
 pub fn mix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -162,7 +178,7 @@ pub fn cloud_spot(
 }
 
 /// Les éclairs des nuages du créneau `slot` qui passent à moins de `CHARGE_REACH` blocs du
-/// porteur en (`x`, `z`) : ceux qui le chargent.
+/// porteur en (`x`, `z`) (ceux qui le chargeaient avant la v282).
 pub fn charging_spots(seed: u64, slot: i64, x: f32, z: f32) -> Vec<CloudSpot> {
     let reach = CHARGE_REACH;
     let mut out = Vec::new();
@@ -211,6 +227,24 @@ mod tests {
         assert!(charging >= near, "{charging} {near}");
         // Une autre graine, d'autres éclairs.
         assert!((0..200i64).any(|s| cloud_spot(7, s, 0, 0, None) != cloud_spot(8, s, 0, 0, None)));
+    }
+
+    /// (v282) Une charge toutes les 10 secondes, aux multiples de 10 de l'horloge : comptée
+    /// une fois, même découpée en morceaux.
+    #[test]
+    fn charges_come_every_ten_seconds_of_the_clock() {
+        assert_eq!(charge_marks(0.0, 60.0).collect::<Vec<_>>(), [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        assert_eq!(charge_marks(10.0, 19.9).count(), 0);
+        assert_eq!(charge_marks(9.99, 10.0).count(), 1);
+        assert_eq!(charge_marks(100.0, 3700.0).count(), 360);
+        let mut n = 0;
+        let mut t = 1234.5;
+        while t < 4834.5 {
+            n += charge_marks(t, t + 0.37).count();
+            t += 0.37;
+        }
+        assert_eq!(n, charge_marks(1234.5, t).count());
+        assert!((359..=361).contains(&n), "{n}");
     }
 
     /// Les horloges : la même météo pour la même graine et le même instant, d'où qu'on la

@@ -239,9 +239,10 @@ impl Item {
                             WHITE,
                         ));
                         // (v247) « N'écris pas que les éclairs chargent notre foudre, indique-le
-                        // sur l'objet : en tapant le ciel et quand la foudre vient. »
+                        // sur l'objet : en tapant le ciel et quand la foudre vient. » (v282) Pendant
+                        // l'orage, une charge toutes les 10 secondes.
                         lines.push((
-                            "Se charge en tapant le ciel, et quand la foudre vient".into(),
+                            "Se charge en tapant le ciel, et toutes les 10 s pendant l'orage".into(),
                             GREY,
                         ));
                     }

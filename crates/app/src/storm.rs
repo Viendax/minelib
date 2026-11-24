@@ -207,8 +207,9 @@ pub struct Storm {
     /// (v241) Éclairs des nuages à venir dans ce créneau (`Weather::cloud_bolts`) : temps
     /// qu'il reste, et lequel.
     cloud_due: Vec<(f32, weather::Spot)>,
-    /// (v241) Charges que les éclairs des nuages viennent de donner à la Foudre de Zeus de
-    /// celui qui était dessous (à cette image) : la partie les lui verse.
+    /// (v241) Charges que la Foudre de Zeus de celui qui la porte vient de gagner (à cette
+    /// image) : la partie les lui verse. (v282) Une toutes les 10 secondes d'orage
+    /// (`meteo::charge_marks`) ; avant, une par éclair des nuages passé au-dessus de lui.
     pub charged: u8,
 }
 
@@ -252,6 +253,7 @@ impl Storm {
         self.cooldown = (self.cooldown - dt).max(0.0);
         self.clock += dt;
         self.eye = f.eye;
+        let before = self.weather.clock;
         if f.active {
             self.weather.update(dt, f.online.then(weather::unix_now));
             // La foudre du ciel : elle vise une colonne, le relief l'attire.
@@ -265,10 +267,18 @@ impl Storm {
                 }
             }
         }
+        // (v282) « Quand il y a la foudre, au lieu que les éclairs dans le ciel chargent
+        // l'éclair, charge-le d'autant qu'un éclair naturel toutes les 10 secondes » : pendant
+        // l'orage (la foudre tombe), celui qui porte la Foudre de Zeus gagne une charge à
+        // chaque multiple de 10 s de l'horloge de la météo (en ligne, le relais l'accorde aux
+        // mêmes instants).
+        self.charged = 0;
+        if f.active && f.holder.is_some() && self.weather.thundering() {
+            let n = minelib_net::meteo::charge_marks(before, self.weather.clock).count();
+            self.charged = n.min(usize::from(crate::zeus::MAX_CHARGES)) as u8;
+        }
         // (v241) Les éclairs qui courent dans les nuages au-dessus des zones alentour : les
         // mêmes pour tous, plus fréquents au-dessus de celui qui porte la Foudre de Zeus.
-        // Celui qui passe au-dessus de lui la charge.
-        self.charged = 0;
         if f.active {
             let due = self.weather.cloud_bolts(f.eye, f.holder);
             self.cloud_due.extend(due.into_iter().map(|s| (s.delay, s)));
@@ -285,10 +295,6 @@ impl Storm {
         });
         for spot in now {
             self.zone_bolt(f.eye, spot);
-            let under = f
-                .holder
-                .is_some_and(|h| (h.x - spot.x).hypot(h.z - spot.z) <= crate::zeus::CHARGE_REACH);
-            self.charged += u8::from(under);
         }
         let mut hurt = 0u8;
         self.landed.clear();
@@ -898,11 +904,11 @@ mod tests {
     }
 
     /// (v241) Orage : des éclairs courent dans les nuages au-dessus des zones, les mêmes pour
-    /// tous ; celui qui passe au-dessus du porteur de la Foudre de Zeus la charge, et il y en
-    /// a davantage au-dessus de lui. Sans orage : aucun. L'arc court (éclair sans charge) va
-    /// droit de la pointe à la cible, ne blesse pas comme la foudre et s'éteint.
+    /// tous. (v282) Celui qui porte la Foudre de Zeus gagne une charge toutes les 10 secondes
+    /// d'orage. Sans orage : ni éclair ni charge. L'arc court (éclair sans charge) va droit de
+    /// la pointe à la cible, ne blesse pas comme la foudre et s'éteint.
     #[test]
-    fn cloud_bolts_charge_the_holder_and_the_short_arc_goes_straight() {
+    fn storms_charge_the_holder_every_ten_seconds_and_the_short_arc_goes_straight() {
         let world = flat(64);
         let feet = Vec3::new(8.5, 65.0, 8.5);
         let run = |holder: Option<Vec3>, storm: bool| {
@@ -925,9 +931,9 @@ mod tests {
         let (none, seen) = run(None, true);
         assert!(none == 0 && seen > 0, "{none} {seen}");
         let (with, _) = run(Some(feet), true);
-        // Environ un toutes les 33 s sous l'orage : entre 15 et 70 en vingt minutes.
-        assert!((15..=70).contains(&with), "{with} charges en vingt minutes d'orage");
-        assert_eq!(run(Some(feet), false).0, 0, "pas d'orage, pas d'éclair");
+        // Une toutes les 10 s : 120 en vingt minutes d'orage.
+        assert_eq!(with, 120, "{with} charges en vingt minutes d'orage");
+        assert_eq!(run(Some(feet), false).0, 0, "pas d'orage, pas de charge");
         // L'arc court.
         let mut s = Storm::new(5);
         let (tip, to) = (Vec3::new(8.0, 66.5, 8.0), Vec3::new(13.0, 65.9, 9.0));

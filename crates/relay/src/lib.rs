@@ -1311,8 +1311,8 @@ struct Room {
     /// Relais de province : cette salle sert une province du monde de même numéro d'un
     /// autre relais (le relais du monde).
     province: Option<provinces::ProvinceRoom>,
-    /// (v244) Horloge de la météo en ligne jusqu'où les éclairs des nuages qui chargent la
-    /// Foudre de Zeus ont été comptés (relais du monde ; 0 : pas encore).
+    /// (v244) Horloge de la météo en ligne jusqu'où les charges que l'orage donne à la Foudre
+    /// de Zeus ont été comptées (relais du monde ; 0 : pas encore).
     zeus_clock: f64,
 }
 
@@ -3441,7 +3441,7 @@ fn zeus_request(
         });
     let why = match act {
         ZEUS_SYNC => {
-            // (Le créateur du monde dit sa graine : les éclairs des nuages en viennent.)
+            // (Le créateur du monde dit sa graine : la météo en vient, et l'orage qui charge.)
             if is_creator && seed != 0 {
                 l.seed = Some(seed);
             }
@@ -3632,43 +3632,31 @@ pub(crate) fn zeus_zone_request(
     }
 }
 
-/// (v244) Charges que donnent à la Foudre de Zeus les éclairs des nuages qui passent au-dessus
-/// de celui qui la porte, en (`x`, `z`), entre les instants `from` (exclu) et `to` (inclus) de
-/// l'horloge de la météo en ligne, dans un monde de graine `seed` : ceux de
-/// `meteo::charging_spots`, pendant un orage. `imposed` : la météo imposée par un OP
-/// (`proto::WEATHER_…`), sinon `WEATHER_NATURAL` : celle des horloges du monde.
-pub(crate) fn cloud_charges(seed: u32, x: f32, z: f32, imposed: u8, from: f64, to: f64) -> u32 {
+/// (v244) Charges que gagne la Foudre de Zeus entre les instants `from` (exclu) et `to`
+/// (inclus) de l'horloge de la météo en ligne, dans un monde de graine `seed`. (v282) Une
+/// toutes les `meteo::CHARGE_EVERY_S` secondes pendant un orage (« charge-le d'autant qu'un
+/// éclair naturel toutes les 10 secondes ») ; avant, une par éclair des nuages passé au-dessus
+/// de celui qui la porte. `imposed` : la météo imposée par un OP (`proto::WEATHER_…`),
+/// sinon `WEATHER_NATURAL` : celle des horloges du monde.
+pub(crate) fn storm_charges(seed: u32, imposed: u8, from: f64, to: f64) -> u32 {
     use minelib_net::meteo;
     if to <= from {
         return 0;
     }
     let (mut rain, mut thunder) = meteo::clocks(u64::from(seed));
-    let slot_s = meteo::CLOUD_SLOT_S;
-    let mut n = 0;
-    let first = (from / slot_s).floor() as i64;
-    let last = (to / slot_s).floor() as i64;
-    for slot in first..=last {
-        for s in meteo::charging_spots(u64::from(seed), slot, x, z) {
-            let t = slot as f64 * slot_s + f64::from(s.delay);
-            if t <= from || t > to {
-                continue;
+    meteo::charge_marks(from, to)
+        .filter(|&t| match imposed {
+            proto::WEATHER_NATURAL => {
+                meteo::natural_at(&mut rain, &mut thunder, t).0 == proto::WEATHER_STORM
             }
-            let storm = match imposed {
-                proto::WEATHER_NATURAL => {
-                    meteo::natural_at(&mut rain, &mut thunder, t).0 == proto::WEATHER_STORM
-                }
-                k => k == proto::WEATHER_STORM,
-            };
-            n += u32::from(storm);
-        }
-    }
-    n
+            k => k == proto::WEATHER_STORM,
+        })
+        .count() as u32
 }
 
-/// (v244) Relais du monde, toutes les deux secondes : les éclairs des nuages passés depuis la
-/// dernière fois au-dessus de celui qui porte la Foudre de Zeus de chaque serveur (s'il est
-/// là, d'après sa dernière position connue ici) la chargent ; il l'apprend
-/// (`Response::Zeus`, `ZEUS_CLOUD`).
+/// (v244) Relais du monde, toutes les deux secondes : la Foudre de Zeus de chaque serveur
+/// gagne les charges de l'orage depuis la dernière fois (`storm_charges`) si celui qui la
+/// porte est là (sa position connue ici) ; il l'apprend (`Response::Zeus`, `ZEUS_CLOUD`).
 fn upkeep_zeus(st: &mut State) {
     use minelib_net::meteo;
     let clock = meteo::online_clock(
@@ -3701,8 +3689,9 @@ fn upkeep_zeus(st: &mut State) {
             continue;
         }
         let (imposed, _, _) = st.servers.weather(&server);
-        let (x, z) = (at[0] as f32 * 16.0 + 8.0, at[1] as f32 * 16.0 + 8.0);
-        let n = cloud_charges(seed, x, z, imposed, since, clock);
+        // (v282) Où qu'il soit sur le serveur : il suffit qu'il y soit.
+        let _ = at;
+        let n = storm_charges(seed, imposed, since, clock);
         if n == 0 {
             continue;
         }
@@ -12961,50 +12950,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (v244) Les éclairs des nuages chargent la Foudre de Zeus pendant un orage seulement, au
-    /// plus près de celui qui la porte ; les mêmes que ceux que son jeu voit tomber.
+    /// (v282) Pendant un orage seulement, la Foudre de Zeus gagne une charge toutes les 10
+    /// secondes de l'horloge de la météo, aux mêmes instants que dans le jeu de celui qui la
+    /// porte ; comptées une fois, même découpées.
     #[test]
-    fn cloud_bolts_charge_the_legendary_bolt_during_storms_only() {
+    fn storms_charge_the_legendary_bolt_every_ten_seconds() {
         use minelib_net::meteo;
-        let (x, z) = (40.0, -24.0);
         let hour = 3600.0;
         let t0 = 10_000.0;
-        let storm = cloud_charges(4242, x, z, proto::WEATHER_STORM, t0, t0 + hour);
-        let clear = cloud_charges(4242, x, z, proto::WEATHER_CLEAR, t0, t0 + hour);
-        assert!(storm > 0, "{storm}");
-        assert_eq!(clear, 0);
-        // Ceux des créneaux de l'heure, un à un.
-        let mut n = 0;
-        let s = meteo::CLOUD_SLOT_S;
-        for slot in (t0 / s).floor() as i64..=((t0 + hour) / s).floor() as i64 {
-            for c in meteo::charging_spots(4242, slot, x, z) {
-                let t = slot as f64 * s + f64::from(c.delay);
-                n += u32::from(t > t0 && t <= t0 + hour);
-                assert!(((c.x - x).powi(2) + (c.z - z).powi(2)).sqrt() <= meteo::CHARGE_REACH);
-            }
-        }
-        assert_eq!(storm, n);
-        // Comptés une fois : deux moitiés font le tout.
-        let half = cloud_charges(4242, x, z, proto::WEATHER_STORM, t0, t0 + hour / 2.0)
-            + cloud_charges(4242, x, z, proto::WEATHER_STORM, t0 + hour / 2.0, t0 + hour);
+        let storm = storm_charges(4242, proto::WEATHER_STORM, t0, t0 + hour);
+        let clear = storm_charges(4242, proto::WEATHER_CLEAR, t0, t0 + hour);
+        let rain = storm_charges(4242, proto::WEATHER_RAIN, t0, t0 + hour);
+        assert_eq!(storm, 360);
+        assert_eq!((clear, rain), (0, 0));
+        assert_eq!(storm_charges(4242, proto::WEATHER_STORM, t0, t0 + 9.0), 0);
+        assert_eq!(storm_charges(4242, proto::WEATHER_STORM, t0 + 5.0, t0 + 10.0), 1);
+        // Comptées une fois : deux moitiés font le tout.
+        let half = storm_charges(4242, proto::WEATHER_STORM, t0, t0 + hour / 2.0)
+            + storm_charges(4242, proto::WEATHER_STORM, t0 + hour / 2.0, t0 + hour);
         assert_eq!(half, storm);
         // Météo naturelle : seulement pendant les orages des horloges du monde.
-        let (mut rain, mut thunder) = meteo::clocks(4242);
+        let (mut r, mut th) = meteo::clocks(4242);
         let day = 86_400.0;
-        let natural = cloud_charges(4242, x, z, proto::WEATHER_NATURAL, t0, t0 + day);
-        let mut m = 0;
-        for slot in (t0 / s).floor() as i64..=((t0 + day) / s).floor() as i64 {
-            for c in meteo::charging_spots(4242, slot, x, z) {
-                let t = slot as f64 * s + f64::from(c.delay);
-                if t > t0 && t <= t0 + day {
-                    m += u32::from(
-                        meteo::natural_at(&mut rain, &mut thunder, t).0 == proto::WEATHER_STORM,
-                    );
-                }
-            }
-        }
+        let natural = storm_charges(4242, proto::WEATHER_NATURAL, t0, t0 + day);
+        let m = meteo::charge_marks(t0, t0 + day)
+            .filter(|&t| meteo::natural_at(&mut r, &mut th, t).0 == proto::WEATHER_STORM)
+            .count() as u32;
         assert_eq!(natural, m);
-        assert!(natural < cloud_charges(4242, x, z, proto::WEATHER_STORM, t0, t0 + day));
+        assert!(natural > 0 && natural < storm_charges(4242, proto::WEATHER_STORM, t0, t0 + day));
     }
 
     #[test]

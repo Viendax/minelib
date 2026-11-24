@@ -107,7 +107,7 @@ fn unit(seed: u64, a: u64, b: u64) -> f64 {
 }
 
 // (v244) Les deux horloges (pluie, tonnerre) sont celles de `minelib_net::meteo`, que le
-// relais du monde lit aussi (les éclairs des nuages chargent la Foudre de Zeus en ligne).
+// relais du monde lit aussi (l'orage charge la Foudre de Zeus en ligne).
 use minelib_net::meteo::Cycle;
 
 /// Bruit lisse à une dimension (0 … 1).
@@ -537,8 +537,9 @@ mod tests {
     use super::*;
 
     /// (v244) Le relais du monde lit le même temps que le jeu (`minelib_net::meteo`), et les
-    /// mêmes éclairs des nuages : c'est lui qui accorde en ligne les charges qu'ils donnent
-    /// à la Foudre de Zeus.
+    /// mêmes éclairs des nuages : c'est lui qui accorde en ligne les charges de la Foudre de
+    /// Zeus ((v282) celles de l'orage, toutes les 10 secondes ; avant, celles de ces
+    /// éclairs).
     #[test]
     fn the_relay_reads_the_same_weather_and_cloud_bolts() {
         use minelib_net::meteo;

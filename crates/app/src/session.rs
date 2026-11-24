@@ -4637,7 +4637,7 @@ impl Session {
 
     /// (v244) Une demande au relais du monde pour l'éclair du serveur (`Request::Zeus`) :
     /// son état, le prendre, dire qu'on l'a déjà. La graine du monde l'accompagne (le relais
-    /// ne la retient que de son créateur : il en tire les éclairs des nuages).
+    /// ne la retient que de son créateur : il en tire la météo, dont l'orage qui la charge).
     fn zeus_cmd(&mut self, act: u8, charges: u8) {
         self.thor_seq = self.thor_seq.wrapping_add(1);
         let p = self.player.pos;
@@ -4718,8 +4718,8 @@ impl Session {
         if !mine {
             (self.legend.charges, self.legend.sky_hits) = (0, 0);
         } else if seq != 0 || act == ZEUS_CLOUD {
-            // (Une charge donnée par un éclair des nuages se lit sur l'objet, pas dans le
-            // tchat : règle 17 de `claude/foudre-de-zeus.md`.)
+            // (Une charge donnée par l'orage se lit sur l'objet, pas dans le tchat : règle 17
+            // de `claude/foudre-de-zeus.md`.)
             self.legend.charges = charges.min(crate::zeus::MAX_CHARGES);
             self.legend.sky_hits = sky_hits.min(crate::zeus::SKY_HITS - 1);
         }
@@ -5092,7 +5092,8 @@ impl Session {
                 self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, g));
             }
         }
-        // (v241) Un éclair a couru dans les nuages au-dessus de lui : une charge de plus.
+        // (v241) Une charge de plus : (v282) toutes les 10 secondes d'orage (avant : un éclair
+        // qui courait dans les nuages au-dessus de lui).
         // (v244) Sur un serveur, c'est le relais du monde qui l'accorde (`on_zeus`). (v247)
         // Sans le dire dans le tchat (« n'écris pas que les éclairs chargent notre foudre ») :
         // l'objet le dit, et son icône montre ses charges.

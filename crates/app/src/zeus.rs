@@ -5,7 +5,9 @@
 //!   `/give`), et qu'aucun moyen ne supprime : ni la poubelle du créatif, ni le vide, ni le
 //!   trop-plein d'objets au sol ;
 //! - il garde **jusqu'à 10 charges**. Une charge vient de deux coups donnés vers le ciel, ou
-//!   d'un éclair qui court dans les nuages au-dessus de celui qui le porte ;
+//!   (v282) de chaque dizaine de secondes d'orage pour celui qui le porte (« au lieu que les
+//!   éclairs dans le ciel chargent l'éclair, charge-le d'autant qu'un éclair naturel toutes
+//!   les 10 secondes » ; avant, d'un éclair qui courait dans les nuages au-dessus de lui) ;
 //! - **chargé**, un coup fait tomber la foudre du ciel sur ce qu'on vise et prend une
 //!   charge ; (v244) sans distance maximale : « c'est comme le /thor » (128 blocs avant) ;
 //! - **sans charge**, un arc part de sa pointe jusqu'à 8 blocs, sans passer par le ciel, et
@@ -34,7 +36,8 @@ pub const SKY_HITS: u8 = minelib_net::proto::ZEUS_SKY_HITS;
 pub const ARC_REACH: f32 = 8.0;
 /// Dégâts de l'arc sans charge : 2,5 fois moins que la foudre du ciel (5).
 pub const ARC_DAMAGE: u8 = 2;
-/// Un éclair des nuages charge celui qui le porte à moins de tant de blocs (à plat).
+/// Autour de celui qui le porte (à moins de tant de blocs, à plat), les éclairs des nuages
+/// sont plus fréquents.
 pub const CHARGE_REACH: f32 = minelib_net::meteo::CHARGE_REACH;
 
 /// (v244) Où finit le petit éclair qui ne vise rien à portée : sur le rayon du regard (parti
@@ -157,8 +160,8 @@ impl Legend {
         true
     }
 
-    /// Un éclair a couru dans les nuages au-dessus de celui qui le porte. Vrai : une charge
-    /// de plus.
+    /// (v282) Dix secondes d'orage (avant : un éclair a couru dans les nuages au-dessus de celui
+    /// qui le porte). Vrai : une charge de plus.
     pub fn charge(&mut self) -> bool {
         if self.charges >= MAX_CHARGES {
             return false;
@@ -207,8 +210,8 @@ impl Legend {
 mod tests {
     use super::*;
 
-    /// Deux coups vers le ciel pour une charge, dix charges au plus ; un éclair des nuages
-    /// en donne une d'un coup ; la foudre du ciel en prend une.
+    /// Deux coups vers le ciel pour une charge, dix charges au plus ; (v282) dix secondes
+    /// d'orage en donnent une d'un coup ; la foudre du ciel en prend une.
     #[test]
     fn two_sky_hits_make_a_charge_up_to_ten() {
         let mut l = Legend {

@@ -916,7 +916,8 @@ pub const ZEUS_STRIKE: u8 = 3;
 pub const ZEUS_ARC: u8 = 4;
 /// Le créateur du monde l'a déjà, de son monde en solo (le serveur n'en a pas encore).
 pub const ZEUS_HOLD: u8 = 5;
-/// (Poussé par le relais seulement) un éclair des nuages vient de la charger.
+/// (Poussé par le relais seulement) l'orage vient de la charger ((v282) une charge toutes les
+/// 10 secondes ; avant, un éclair des nuages passé au-dessus de celui qui la porte).
 pub const ZEUS_CLOUD: u8 = 6;
 /// (v247) La rendre au menu créatif (supprimée en créatif : « la supprimer depuis le créatif la
 /// remet dans l'inventaire créatif ») : personne ne l'a plus, ses charges restent avec elle.
@@ -1759,8 +1760,8 @@ pub enum Response {
     },
     /// (v244) Poussé : la Foudre de Zeus du serveur. En réponse à la demande `seq` d'un
     /// `Request::Zeus` (`act`, `why` : `ZEUS_OK` ou la raison du refus), à son arrivée, quand
-    /// quelqu'un la prend (`seq` 0, à tous), ou quand un éclair des nuages la charge
-    /// (`ZEUS_CLOUD`, à celui qui l'a). `holder` : celui qui l'a (vide : personne). Pour un
+    /// quelqu'un la prend (`seq` 0, à tous), ou quand l'orage la charge (`ZEUS_CLOUD`, à
+    /// celui qui l'a). `holder` : celui qui l'a (vide : personne). Pour un
     /// coup accepté, `permit` (signé par le relais du monde, jusqu'à `expires`, secondes
     /// Unix) le fait passer chez l'arbitre du chunk visé (`BuildMsg::ZeusAsk`).
     Zeus {
