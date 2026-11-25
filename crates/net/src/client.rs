@@ -22,6 +22,17 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE: Duration = Duration::from_secs(20);
 /// Mesure de l'aller-retour jusqu'au relais (envoyée au relais).
 const RTT_EVERY: Duration = Duration::from_secs(2);
+/// (v314) Un relais dont plus rien n'arrive depuis ce temps est tenu pour perdu : ni
+/// message, ni sonde (il en envoie une toutes les 4 s), ni réponse à nos pings (toutes les
+/// 2 s, toutes les 5 s quand ils restent sans réponse). Avant, un relais disparu sans
+/// fermer sa connexion (PC éteint, réseau coupé) n'était remarqué qu'au bout des 30 s que
+/// le tunnel iroh laisse à une connexion muette ; le jeu ne cherchait rien d'autre pendant
+/// ce temps.
+const SILENCE_MAX: Duration = Duration::from_secs(10);
+/// (v314) … et il faut qu'un ping parti après le dernier message reçu soit resté sans
+/// réponse ce temps-là : un jeu qui sort de veille (ou d'un long calcul) laisse au relais
+/// le temps de répondre avant de le croire perdu.
+const SILENCE_PING: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub enum Cmd {
@@ -743,6 +754,39 @@ pub fn peer_servers(addr: &str, key: [u8; 32], kind: u8) -> Result<Vec<proto::Se
     }
 }
 
+/// (v314) Le relais est-il muet ? `quiet` : temps depuis son dernier message ; `pinged` : un
+/// ping est parti depuis ; `ping_age` : il y a combien de temps.
+fn silent(quiet: Duration, pinged: bool, ping_age: Duration) -> bool {
+    quiet > SILENCE_MAX && pinged && ping_age > SILENCE_PING
+}
+
+/// (v314) Sonde un relais : sa clé, et s'il parle le même protocole que ce jeu (il répond
+/// à son bonjour). Le jeu s'en sert pour choisir son relais : après une mise à jour qui
+/// change le protocole, un relais resté dans l'ancienne version (ou déjà passé à la
+/// nouvelle) est écarté au lieu de laisser le joueur devant « version incompatible ».
+pub fn probe(addr: &str, wait: Duration) -> Result<([u8; 32], bool)> {
+    probe_as(addr, wait, proto::PROTOCOL)
+}
+
+/// (Essais : le bonjour d'un jeu d'un autre protocole.)
+#[doc(hidden)]
+pub fn probe_as(addr: &str, wait: Duration, protocol: u32) -> Result<([u8; 32], bool)> {
+    let (mut chan, key) = Channel::connect(addr, wait)?;
+    chan.send(&Request::Hello {
+        protocol,
+        client: format!(
+            "minelib-sonde {} v{}",
+            env!("CARGO_PKG_VERSION"),
+            GAME_VERSION.load(std::sync::atomic::Ordering::Relaxed)
+        ),
+    })?;
+    let same = matches!(
+        chan.recv_timeout::<Response>(wait)?,
+        Some(Response::Hello { .. })
+    );
+    Ok((key, same))
+}
+
 pub fn error_text(code: ErrorCode, message: &str) -> String {
     let base = match code {
         ErrorCode::Protocol => "Version du jeu incompatible avec le relais.",
@@ -1076,6 +1120,8 @@ impl Worker {
         let mut last_ping = Instant::now();
         // Ping en cours de mesure (envoyé à cet instant).
         let mut ping_sent: Option<Instant> = None;
+        // (v314) Dernier message reçu du relais (voir `SILENCE_MAX`).
+        let mut heard = Instant::now();
         loop {
             // Commandes du jeu (sans attendre si une connexion est ouverte).
             let cmd = if self.chan.is_some() {
@@ -1101,12 +1147,15 @@ impl Worker {
                         self.emit(Event::Error(format!("{e:#}")));
                     }
                 }
+                // (Une commande peut attendre une réponse, ou calculer longtemps.)
+                heard = Instant::now();
                 continue;
             }
             // Sans connexion au relais : plus de voie rapide, plus de routes à porter.
             if self.chan.is_none() {
                 self.close_fast();
                 self.passeur = None;
+                heard = Instant::now();
             }
             self.tend_passeur();
             self.tend_tunnels();
@@ -1115,8 +1164,15 @@ impl Worker {
                 continue;
             };
             let got = match chan.recv_any::<Response>(Duration::from_millis(4)) {
-                Ok(Some(Incoming::Msg(r))) => Ok(Some(r)),
+                Ok(Some(Incoming::Msg(r))) => {
+                    heard = Instant::now();
+                    Ok(Some(r))
+                }
                 Ok(Some(Incoming::Push(b))) => chan.send_raw(&b).map(|_| None),
+                // (v314) Relais muet : perdu (voir `SILENCE_MAX`).
+                Ok(None) if silent(heard.elapsed(), last_ping > heard, last_ping.elapsed()) => {
+                    Err(anyhow!("le relais ne répond plus"))
+                }
                 Ok(None) => Ok(None),
                 Err(e) => Err(e),
             };
@@ -1551,7 +1607,16 @@ impl Worker {
         });
         match chan.recv::<Response>()? {
             Response::Hello { pow_bits, .. } => self.pow_bits = pow_bits,
-            Response::Error { code, message } => return Err(anyhow!(error_text(code, &message))),
+            Response::Error { code, message } => {
+                // (v314) Relais d'une autre version du jeu, trouvé automatiquement : on
+                // en cherchera un autre au prochain essai (la recherche écarte ceux qui ne
+                // parlent pas le même protocole). Avant, le jeu y revenait sans fin.
+                if matches!(code, ErrorCode::Protocol) && self.resolve.is_some() {
+                    self.addr.clear();
+                    self.pinned = None;
+                }
+                return Err(anyhow!(error_text(code, &message)));
+            }
             r => return Err(anyhow!("réponse inattendue : {r:?}")),
         }
         self.chan = Some(chan);
@@ -2487,5 +2552,23 @@ impl Worker {
             }
             r => self.unexpected(r),
         }
+    }
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+
+    /// (v314) Un relais est tenu pour perdu après dix secondes sans rien recevoir, pourvu
+    /// qu'un ping parti depuis soit resté trois secondes sans réponse : ni un relais
+    /// simplement calme, ni un jeu qui sort de veille ne le perdent.
+    #[test]
+    fn a_relay_is_lost_after_ten_silent_seconds_and_an_unanswered_ping() {
+        let s = Duration::from_secs;
+        assert!(!silent(s(9), true, s(4)), "pas encore dix secondes");
+        assert!(silent(s(11), true, s(4)));
+        assert!(!silent(s(11), false, s(4)), "aucun ping depuis : sortie de veille");
+        assert!(!silent(s(40), true, s(1)), "le ping vient de partir");
+        assert!(silent(s(40), true, s(4)));
     }
 }

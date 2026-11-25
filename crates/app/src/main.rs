@@ -303,6 +303,8 @@ struct Game {
     /// frappe, et s'il en faut un (le relais l'a dit).
     delete_code: String,
     delete_code_needed: bool,
+    /// (v314) Version dont la sortie a déjà été dite dans le tchat du monde où l'on est.
+    update_told: u32,
     /// Garant indépendant (au menu : sert ou vérifie la partie d'autres joueurs).
     garant: Option<garant::Garant>,
     /// Garant pendant qu'on joue sa propre partie FPS (deuxième connexion, son propre fil),
@@ -514,6 +516,7 @@ impl Game {
             world_search: Default::default(),
             delete_code: String::new(),
             delete_code_needed: false,
+            update_told: 0,
             garant: None,
             garant_worker: None,
             garant_worker_tried: false,
@@ -4642,6 +4645,24 @@ impl GameLoop for Game {
         self.skin_upkeep();
         self.maps_upkeep();
         self.updater.poll(!self.played);
+        // (v314) Une version est sortie pendant qu'on joue : dit une fois dans le tchat.
+        // Le joueur dont le PC sert de relais ne passe pas par l'accueil, où est le bouton ;
+        // or les joueurs déjà à jour ne peuvent plus le rejoindre si le protocole a changé.
+        if let Some(v) = self.updater.available.as_ref().map(|r| r.version) {
+            if self.update_told != v {
+                if let Some(s) = &mut self.session {
+                    self.update_told = v;
+                    s.chat.say(
+                        format!(
+                            "Version {v} du jeu disponible : relance le jeu quand tu peux. Si \
+                             elle change le réseau, les joueurs à jour ne rejoignent plus \
+                             ceux qui ne le sont pas."
+                        ),
+                        chat::YELLOW,
+                    );
+                }
+            }
+        }
         // Partie FPS en ligne commencée : notée (pas de mise à jour, ni par le jeu ni par
         // le lanceur, avant sa fin) ; finie : oubliée.
         let net = self.session.as_ref().and_then(|s| s.net.as_ref());

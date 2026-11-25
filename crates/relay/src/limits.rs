@@ -164,6 +164,122 @@ mod tests {
         assert!(l.register_wait("iroh:meme").is_some());
     }
 
+    /// Le tunnel iroh, en court : une porte locale qui dit au relais qui arrive (`who`),
+    /// puis laisse tout passer dans les deux sens ; `frozen` : elle ne laisse plus rien
+    /// passer, sans rien fermer (le relais a disparu sans dire au revoir).
+    fn door(
+        relay: std::net::SocketAddr,
+        who: &'static str,
+        frozen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        fn pass(
+            mut from: std::net::TcpStream,
+            mut to: std::net::TcpStream,
+            frozen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            let _ = from.set_read_timeout(Some(Duration::from_millis(50)));
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                if frozen.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                match from.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        if frozen.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        if to.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+        }
+        let door = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = door.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in door.incoming().flatten() {
+                let Ok(mut up) = std::net::TcpStream::connect(relay) else {
+                    continue;
+                };
+                up.write_all(&minelib_p2p::preamble(who)).unwrap();
+                let (c2, up2) = (c.try_clone().unwrap(), up.try_clone().unwrap());
+                let (f1, f2) = (frozen.clone(), frozen.clone());
+                std::thread::spawn(move || pass(c2, up2, f1));
+                std::thread::spawn(move || pass(up, c, f2));
+            }
+        });
+        addr
+    }
+
+    /// (v314) Un relais qui disparaît sans fermer sa connexion (PC éteint, réseau coupé) :
+    /// le jeu le tient pour perdu au bout d'une dizaine de secondes de silence, au lieu
+    /// d'attendre les 30 s du tunnel. Tant que le relais répond, il n'est pas perdu.
+    #[test]
+    fn a_relay_gone_silent_is_given_up_after_about_ten_seconds() {
+        use crate::{start, Config};
+        use minelib_net::client::{Client, Cmd, Event};
+        let dir = std::env::temp_dir().join(format!("minelib-muet-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir,
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let frozen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let door_addr = door(h.addr, "iroh:muet", frozen.clone());
+        let c = Client::spawn(door_addr.to_string(), Some(h.public));
+        c.send(Cmd::Register {
+            pseudo: "Muet".into(),
+            password: "motdepasse".into(),
+        });
+        let t = Instant::now();
+        loop {
+            match c.poll() {
+                Some(Event::LoggedIn { .. }) => break,
+                Some(Event::Error(m)) => panic!("inscription refusée : {m}"),
+                _ => {}
+            }
+            assert!(t.elapsed() < Duration::from_secs(60), "délai dépassé");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Relais calme mais vivant : douze secondes sans le perdre.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(12) {
+            assert!(
+                !matches!(c.poll(), Some(Event::Lost)),
+                "perdu alors qu'il répond"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+        let t = Instant::now();
+        loop {
+            if matches!(c.poll(), Some(Event::Lost)) {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(25), "jamais tenu pour perdu");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let took = t.elapsed();
+        println!("RELAIS MUET : tenu pour perdu après {:.1} s", took.as_secs_f32());
+        assert!(
+            took > Duration::from_secs(6) && took < Duration::from_secs(18),
+            "{took:?}"
+        );
+    }
+
     /// (v313) Un joueur sans adresse connue (tous, depuis que le jeu ne montre plus son IP
     /// au relais) arrive sur un relais où vingt autres viennent de s'inscrire : il n'est
     /// pas refusé, le relais lui annonce un bit de preuve de travail de plus, son jeu le
@@ -189,26 +305,8 @@ mod tests {
         }
         // Le tunnel iroh, en court : une porte locale qui dit au relais « iroh:neuf »,
         // puis laisse tout passer dans les deux sens.
-        let relay = h.addr;
-        let door = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let door_addr = door.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for c in door.incoming().flatten() {
-                use std::io::Write;
-                let Ok(mut up) = std::net::TcpStream::connect(relay) else {
-                    continue;
-                };
-                up.write_all(&minelib_p2p::preamble("iroh:neuf")).unwrap();
-                let (mut c2, mut up2) = (c.try_clone().unwrap(), up.try_clone().unwrap());
-                std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut c2, &mut up2);
-                });
-                std::thread::spawn(move || {
-                    let mut c = c;
-                    let _ = std::io::copy(&mut up, &mut c);
-                });
-            }
-        });
+        let frozen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let door_addr = door(h.addr, "iroh:neuf", frozen);
         let c = Client::spawn(door_addr.to_string(), Some(h.public));
         c.send(Cmd::Register {
             pseudo: "Neuf".into(),
@@ -264,5 +362,32 @@ mod tests {
             ),
             "{r:?}"
         );
+    }
+
+    /// (v314) La sonde qui sert au jeu à choisir son relais : un relais du même protocole
+    /// répond au bonjour, un jeu d'un autre protocole est reconnu comme tel (et non comme
+    /// un relais injoignable). Dans les deux cas la clé du relais est bien la sienne.
+    #[test]
+    fn a_probe_tells_a_relay_of_another_game_version_from_a_dead_one() {
+        use crate::{start, Config};
+        use minelib_net::client::{probe, probe_as};
+        let dir = std::env::temp_dir().join(format!("minelib-sonde-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir,
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let wait = Duration::from_secs(5);
+        assert_eq!(probe(&addr, wait).unwrap(), (h.public, true));
+        let other = minelib_net::proto::PROTOCOL + 1;
+        assert_eq!(probe_as(&addr, wait, other).unwrap(), (h.public, false));
+        // Personne à cette adresse : une erreur, pas « autre version ».
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = free.local_addr().unwrap().to_string();
+        drop(free);
+        assert!(probe(&dead, Duration::from_millis(500)).is_err());
     }
 }

@@ -169,11 +169,25 @@ fn reachable_relay(
     for ad in ads {
         let tx = tx.clone();
         std::thread::spawn(move || {
+            // (v314) Il doit aussi parler le protocole de ce jeu : un relais resté dans une
+            // autre version est écarté ici, pas découvert après coup.
+            let mut other_version = false;
             let found = node.tunnel_checked(ad.node, WAIT).ok().filter(|addr| {
-                minelib_net::transport::Channel::connect(&addr.to_string(), WAIT)
-                    .is_ok_and(|(_, key)| key == ad.noise)
+                match minelib_net::client::probe(&addr.to_string(), WAIT) {
+                    Ok((key, same)) if key == ad.noise => {
+                        other_version = !same;
+                        same
+                    }
+                    _ => false,
+                }
             });
-            if found.is_none() {
+            if other_version {
+                log::info!(
+                    "relais « {} » (nœud {}) d'une autre version du jeu : écarté",
+                    ad.name,
+                    crypto::hex(&ad.node[..8])
+                );
+            } else if found.is_none() {
                 log::info!(
                     "relais « {} » du DHT injoignable (nœud {}) : écarté",
                     ad.name,
@@ -252,8 +266,18 @@ fn auto_relay(
         let _ = pin_tx.send(hit);
     });
     if let Ok(Some((lan, key))) = lan_rx.recv() {
-        log::info!("relais trouvé sur le réseau local : {lan}");
-        return Ok((lan.to_string(), Some(key)));
+        // (v314) Sauf s'il est d'une autre version du jeu (il répond, mais pas à notre
+        // bonjour) : on cherche plus loin.
+        let other = matches!(
+            minelib_net::client::probe(&lan.to_string(), Duration::from_secs(2)),
+            Ok((_, false))
+        );
+        if other {
+            log::info!("relais du réseau local ({lan}) d'une autre version du jeu : écarté");
+        } else {
+            log::info!("relais trouvé sur le réseau local : {lan}");
+            return Ok((lan.to_string(), Some(key)));
+        }
     }
     // Un relais officiel ou déjà utilisé a 2,5 s pour répondre (le temps que met le DHT) :
     // s'il répond, la liste du DHT ne sert pas.
