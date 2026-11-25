@@ -7017,16 +7017,23 @@ mod tests {
             .unwrap_or(3.0);
         for dir in maps.split(';').filter(|d| !d.is_empty()) {
             let dir = std::path::PathBuf::from(dir);
-            let map = crate::fpsmap::load(&dir);
+            // (v322) Comptée depuis l'origine de ses parties.
+            let (map, origin) = crate::fpsmap::load_for_match(&dir);
             let t = Instant::now();
             let (data, _) = crate::save::load_world(&dir).expect("monde");
+            let (ox, oz) = origin.origin();
             let spawn = data
                 .player
-                // (v309) Place enregistrée en double précision (une carte FPS est au centre
-                // du monde : rien n'y est perdu).
-                .map(|p| Vec3::new(p.pos[0] as f32, p.pos[1] as f32, p.pos[2] as f32))
+                // (v309) Place enregistrée en double précision.
+                .map(|p| {
+                    Vec3::new(
+                        (p.pos[0] - ox as f64) as f32,
+                        p.pos[1] as f32,
+                        (p.pos[2] - oz as f64) as f32,
+                    )
+                })
                 .unwrap_or(Vec3::new(0.5, 80.0, 0.5));
-            let world = crate::radar::load_map_world(&dir, &map).expect("monde");
+            let world = crate::radar::load_map_world(&dir, &map, origin).expect("monde");
             let loaded = t.elapsed().as_secs_f32();
             let t = Instant::now();
             let nav = crate::bots::Nav::build(&world, &map, &[spawn]);
@@ -7208,5 +7215,45 @@ mod tests {
         assert!(shots > 20, "{shots} tirs");
         assert!(kills >= 4, "{kills} éliminations");
         assert!(rounds >= 2, "{rounds} manches finies");
+    }
+
+    /// (v322) Carte sans site, départs hauts (une colonne de 30 blocs : leur milieu est en
+    /// l'air) et un mur entre eux : les bots vont quand même chercher l'adversaire à son
+    /// départ. Avant, ils restaient sur place (le milieu du départ adverse n'était pas une case
+    /// où se tenir).
+    #[test]
+    fn bots_hunt_without_sites_even_when_the_starts_are_tall() {
+        let mut w = World::new(0);
+        for cx in -2..=1 {
+            for cz in -2..=1 {
+                w.insert_empty(ChunkPos { x: cx, z: cz });
+            }
+        }
+        for z in -24..=24 {
+            for x in -24..=24 {
+                w.set(x, 10, z, BlockId::STONE);
+            }
+        }
+        // Un mur d'un bord presque à l'autre : on ne se voit pas d'un départ à l'autre.
+        for x in -24..=18 {
+            for y in 11..=15 {
+                w.set(x, y, 0, BlockId::STONE);
+            }
+        }
+        let map = FpsMap {
+            ct: Some(game::Zone::new([-2, 11, -22], [2, 40, -19])),
+            t: Some(game::Zone::new([-2, 11, 19], [2, 40, 22])),
+            sites: [None, None, None],
+            max_players: 4,
+            door_list: Vec::new(),
+        };
+        let spawn = Vec3::new(0.5, 11.0, -20.5);
+        let mut g = bots_only(&w, map, spawn, false);
+        let mut kills = 0;
+        run_bots(&mut g, &w, 120.0, |_, out| {
+            kills += out.iter().filter(|l| matches!(l, Local::Kill(_))).count();
+            kills >= 1
+        });
+        assert!(kills >= 1, "les bots se sont trouvés ({kills} éliminations)");
     }
 }

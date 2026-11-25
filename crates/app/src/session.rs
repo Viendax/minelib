@@ -437,13 +437,15 @@ fn zeus_click(selected: Option<Item>, pressed: bool, held: bool) -> bool {
 pub struct SessionConfig {
     pub view_distance: i32,
     /// (v309) Partie solo : loin du centre du monde, elle compte depuis une origine proche du
-    /// joueur (`World::origin`, voir `origin_near`). Faux en partie FPS : tout y est compté
-    /// depuis le centre, comme chez les autres joueurs. (v318) Vrai aussi en construction en
-    /// ligne : ce qui part au réseau est en places absolues (`BuildNet`).
+    /// joueur (`World::origin`, voir `origin_near`). Faux en partie FPS en ligne : tout y est
+    /// compté depuis l'origine de sa carte (`fpsmap::match_origin`, v322), comme chez les
+    /// autres joueurs. (v318) Vrai aussi en construction en ligne : ce qui part au réseau est
+    /// en places absolues (`BuildNet`).
     pub far_origin: bool,
-    /// (v318) Monde de construction en ligne (le mode de jeu vient du serveur : la copie d'un
-    /// invité dit « fps », ce n'en est pas une partie).
-    pub online_build: bool,
+    /// (v322) Origine imposée à l'ouverture : celle d'une partie FPS (de la carte, ou de la
+    /// partie FPS du serveur de construction), quand le passage en mode FPS rouvre la partie
+    /// depuis elle (`Session::wants_rebase`, `Game::rebase_world`).
+    pub origin: Option<ChunkPos>,
 }
 
 /// (v309) « Aucun problème jusqu'à 16,7 millions » : à moins de tant de blocs du centre du
@@ -566,6 +568,7 @@ struct Online {
     room_started: Option<bool>,
     room_paused: Option<bool>,
     build_match: Option<String>,
+    build_match_origin: ChunkPos,
     weather_synced: bool,
     game: GameState,
     saved_mode: Option<GameMode>,
@@ -618,6 +621,10 @@ pub struct Session {
     /// (v243) Serveur de construction : partie FPS ouverte par un OP (son pseudo), et ouverture
     /// demandée par ce joueur (`/start`, `/bot` : le relais vérifie qu'il est OP).
     build_match: Option<String>,
+    /// (v322) L'origine (en chunks) de cette partie FPS : celle du jeu de son hôte, que le
+    /// relais dit avec elle (`Response::BuildMatch`). On y entre compté depuis elle : les
+    /// places de la partie sont les mêmes chez tous.
+    build_match_origin: ChunkPos,
     match_opening: bool,
     /// Résultat de la partie à envoyer au relais (classement).
     pub match_result: Option<minelib_net::game::MatchSummary>,
@@ -854,6 +861,11 @@ pub struct Session {
     /// (v309) Téléporté loin de l'origine : sa place absolue exacte, enregistrée telle quelle
     /// (la partie est rouverte depuis une origine proche d'elle à la fin de l'image).
     teleport_to: Option<[f64; 3]>,
+    /// (v322) Une partie FPS qui se jouera loin de l'origine de la partie (la partie contre les
+    /// bots autour des départs d'une carte lointaine), ou depuis une autre origine (la partie
+    /// FPS d'un serveur de construction) : l'origine depuis laquelle rouvrir la partie d'abord
+    /// (`wants_rebase`, `Game::rebase_world` : `SessionConfig::origin`).
+    rebase_origin: Option<ChunkPos>,
     /// (v309) Tours de la carte bouclée de l'origine de la partie (`World::origin`, sur la
     /// carte) : ceux du joueur, moins la limite qu'il a passée depuis elle (`laps_at`).
     lap_base: crate::laps::Laps,
@@ -1048,14 +1060,29 @@ pub fn ram_view_limit() -> i32 {
     r.clamp(2, MAX_VIEW_DISTANCE)
 }
 
-/// (v309) La partie peut-elle compter depuis une origine loin du centre du monde ? Pas en
-/// partie FPS (`far_origin` faux), ni en solo dans une carte FPS (réglages FPS `fps_map`, ou le
-/// mode FPS). (v318) En construction en ligne, toujours, même dans la copie du monde d'un
-/// serveur chez un invité : elle a toujours des réglages FPS et le mode FPS
-/// (`fpsmap::unpack`), mais le mode FPS y est refusé loin du centre (`set_mode`,
-/// `wants_rebase`).
-fn far_allowed_for(cfg: &SessionConfig, mode: GameMode, fps_map: bool) -> bool {
-    cfg.far_origin && (cfg.online_build || (mode != GameMode::Fps && !fps_map))
+/// (v322) Réglages FPS du monde `dir` comptés depuis l'origine de la partie `world`
+/// (`Session::fps_map`, pris champ par champ là où la partie FPS est empruntée).
+fn fps_map_of(dir: &std::path::Path, world: &World) -> minelib_net::game::FpsMap {
+    crate::fpsmap::local(&crate::fpsmap::load(dir), world.origin_blocks())
+}
+
+/// (v322) Origine des coordonnées locales d'une partie qui s'ouvre (en chunks) : celle qui est
+/// imposée (`SessionConfig::origin` : celle d'une partie FPS, quand le passage en mode FPS
+/// rouvre la partie) ; dans une partie FPS en ligne (`far_origin` faux), celle de sa carte
+/// (`fps` : `fpsmap::origin`, la même chez tous les joueurs de la partie, le garant et le
+/// vérificateur ; sans zones, le centre du monde) ; sinon près du joueur en `abs`
+/// (`origin_near`, v309), en solo (mode FPS compris : la partie contre les bots se place
+/// d'elle-même, `Session::solo_fps_far`) comme en construction en ligne (v318). Avant la v322,
+/// le mode FPS et les cartes FPS comptaient toujours depuis le centre du monde (refusés loin
+/// de lui).
+fn opening_origin(cfg: &SessionConfig, fps: Option<ChunkPos>, abs: [f64; 3]) -> ChunkPos {
+    if let Some(o) = cfg.origin {
+        return o;
+    }
+    if !cfg.far_origin {
+        return fps.unwrap_or(ChunkPos { x: 0, z: 0 });
+    }
+    origin_near(abs)
 }
 
 impl Session {
@@ -1099,11 +1126,12 @@ impl Session {
                 player.pitch = (v[4] as f32).to_radians();
             }
         }
-        // (v309) Origine des coordonnées locales : près du joueur, loin du centre du monde,
-        // en solo (pas en ligne ni dans une carte FPS : `origin_near`, `World`). Tout ce que
-        // la partie compte (joueur, chunks chargés, objets, lumières…) l'est depuis elle ; ce
-        // qui est enregistré reste absolu.
-        let far = far_allowed_for(&cfg, data.game.mode, crate::fpsmap::exists(&dir));
+        // (v309) Origine des coordonnées locales : près du joueur, loin du centre du monde
+        // (`origin_near`, `World`). Tout ce que la partie compte (joueur, chunks chargés,
+        // objets, lumières…) l'est depuis elle ; ce qui est enregistré reste absolu. (v322)
+        // Partout sauf dans une partie FPS en ligne (comptée depuis l'origine de sa carte) :
+        // en solo, en mode FPS aussi, et en construction en ligne (v318).
+        let far = cfg.far_origin;
         // (v309) Sur la carte bouclée (`laps`) : une place enregistrée ou donnée hors de la
         // carte (`MINELIB_START`, une partie d'avant) y est ramenée, ses tours comptés.
         let mut laps = if far { data.laps } else { [0, 0] };
@@ -1116,7 +1144,11 @@ impl Session {
                 }
             }
         }
-        let origin = if far { origin_near(abs) } else { ChunkPos { x: 0, z: 0 } };
+        let origin = opening_origin(
+            &cfg,
+            crate::fpsmap::origin(&crate::fpsmap::load(&dir)),
+            abs,
+        );
         world.set_origin(origin);
         if origin != (ChunkPos { x: 0, z: 0 }) {
             let o = world.origin_blocks();
@@ -1247,6 +1279,7 @@ impl Session {
             room_started: None,
             room_paused: None,
             build_match: None,
+            build_match_origin: ChunkPos { x: 0, z: 0 },
             match_opening: false,
             dir,
             workers: Workers::new(data.meta.seed, world.generator, world.origin()),
@@ -1389,6 +1422,7 @@ impl Session {
             items_origin: data.objects_origin,
             far_allowed: far,
             teleport_to: None,
+            rebase_origin: None,
             lap_base,
             laps_seen: laps,
             teleport_laps: None,
@@ -1665,7 +1699,7 @@ impl Session {
             // (Le choix d'une partie, pas un réglage : `Game::play_with` le donne à chaque
             // ouverture.)
             far_origin: true,
-            online_build: false,
+            origin: None,
         }
     }
 
@@ -1680,6 +1714,73 @@ impl Session {
             v.y as f64,
             wrap(v.z as f64 + o[2] as f64),
         ]
+    }
+
+    /// (v322) L'origine depuis laquelle la partie doit être rouverte (une partie FPS la demande),
+    /// prise par `Game::rebase_world` (`SessionConfig::origin`).
+    pub fn take_rebase_origin(&mut self) -> Option<ChunkPos> {
+        self.rebase_origin.take()
+    }
+
+    /// (v322) Rouverte depuis l'origine de la partie FPS du serveur de construction (en mode
+    /// FPS, `join_build_match`) : on y entre maintenant. (La partie contre les bots repart
+    /// d'elle-même, `bots_auto`.)
+    pub fn after_rebase(&mut self) {
+        if self.game.mode != GameMode::Fps || self.build.is_none() || self.in_build_match() {
+            return;
+        }
+        if let Some(host) = self
+            .build_match
+            .clone()
+            .filter(|h| !h.eq_ignore_ascii_case(&self.pseudo))
+        {
+            self.join_build_match(&host);
+        }
+    }
+
+    /// (v322) Réglages FPS du monde comptés depuis l'origine de la partie (`fpsmap::local`) :
+    /// ce que prennent la partie, ses bots, son radar et `/fps showelements`. (`fps.txt` les
+    /// garde en places absolues.)
+    pub fn fps_map(&self) -> minelib_net::game::FpsMap {
+        fps_map_of(&self.dir, &self.world)
+    }
+
+    /// (v322) Enregistre les réglages FPS `m` (comptés depuis l'origine de la partie) en places
+    /// absolues.
+    fn save_fps_map(&self, m: &minelib_net::game::FpsMap) -> anyhow::Result<()> {
+        crate::fpsmap::save(
+            &self.dir,
+            &crate::fpsmap::absolute(m, self.world.origin_blocks()),
+        )
+    }
+
+    /// (v322) La partie contre les bots se joue autour des départs de la carte (sans zones :
+    /// du point de départ du monde, où elle place les joueurs). Loin de l'origine de la partie
+    /// (au-delà de `REBASE_AT` : un monde ouvert ailleurs, une carte construite au loin), elle
+    /// doit d'abord repartir d'une origine proche d'eux : laquelle (celle de la carte,
+    /// `fpsmap::origin`), et la place absolue où mettre le joueur (au-dessus du départ CT, la
+    /// partie l'y placera de toute façon).
+    fn solo_fps_far(&self) -> Option<(ChunkPos, [f64; 3])> {
+        let abs = crate::fpsmap::load(&self.dir);
+        let start = [&abs.ct, &abs.t]
+            .into_iter()
+            .chain(abs.sites.iter())
+            .flatten()
+            .next();
+        let at = match start {
+            Some(z) => [
+                (z.min[0] as f64 + z.max[0] as f64 + 1.0) / 2.0,
+                z.max[1] as f64 + 1.0,
+                (z.min[2] as f64 + z.max[2] as f64 + 1.0) / 2.0,
+            ],
+            None => self.abs_of(self.spawn),
+        };
+        let local = self.local_of(at);
+        if local.x.abs() <= REBASE_AT && local.z.abs() <= REBASE_AT {
+            return None;
+        }
+        let origin = crate::fpsmap::origin(&abs).unwrap_or_else(|| origin_near(at));
+        Some((origin, at))
     }
 
     /// (v318) Place absolue exacte du joueur : celle d'un `/tp` lointain pas encore fait
@@ -1728,24 +1829,6 @@ impl Session {
         }
     }
 
-    /// (v309) La partie compte-t-elle depuis une autre origine que le centre du monde (joueur
-    /// à plus de `ORIGIN_FREE` blocs de lui à l'ouverture, voir `origin_near`) ?
-    pub fn far_from_center(&self) -> bool {
-        self.world.origin() != ChunkPos { x: 0, z: 0 }
-    }
-
-    /// (v309) Ce qui n'est pas permis loin du centre du monde : dit au tchat.
-    fn say_far_from_center(&mut self, what: &str) {
-        let p = self.abs_of(self.player.pos);
-        self.chat.say(
-            format!(
-                "{what} se joue à moins de {} blocs du centre du monde (tu es en {:.0} / {:.0}).",
-                ORIGIN_FREE as i64, p[0], p[2]
-            ),
-            chat::RED,
-        );
-    }
-
     /// (v318) Ce que la partie garde quand elle repart d'une origine plus proche
     /// (`Game::rebase_world`) : ce qui ne s'enregistre pas avec le monde. En ligne, la
     /// connexion au serveur et ce qu'on en sait (relais, joueurs proches, voix, skins, objets
@@ -1792,6 +1875,7 @@ impl Session {
                 room_started: self.room_started,
                 room_paused: self.room_paused,
                 build_match: self.build_match.take(),
+                build_match_origin: self.build_match_origin,
                 weather_synced: self.weather_synced,
                 game: self.game,
                 saved_mode: self.saved_mode,
@@ -1831,6 +1915,7 @@ impl Session {
             room_started,
             room_paused,
             build_match,
+            build_match_origin,
             weather_synced,
             game,
             saved_mode,
@@ -1874,6 +1959,7 @@ impl Session {
         self.room_started = room_started;
         self.room_paused = room_paused;
         self.build_match = build_match;
+        self.build_match_origin = build_match_origin;
         self.weather_synced = weather_synced;
         self.game = game;
         self.saved_mode = saved_mode;
@@ -1889,9 +1975,15 @@ impl Session {
     pub fn wants_rebase(&self) -> bool {
         // (Même pendant un chargement : un `/tp` au loin repart tout de suite de la bonne
         // origine, au lieu de charger d'abord autour d'une place arrondie.)
-        // (v318) En construction en ligne aussi (sans quitter le serveur : `take_carry`) ; pas en
-        // mode FPS ni dans une partie FPS (leurs places sont celles de la partie partagée).
-        if !self.far_allowed || self.net.is_some() || self.game.mode == GameMode::Fps {
+        // (v322) Une partie FPS demande une autre origine (`rebase_origin`) : tout de suite.
+        if self.rebase_origin.is_some() {
+            return true;
+        }
+        // (v318) En construction en ligne aussi (sans quitter le serveur : `take_carry`) ; pas
+        // dans une partie FPS (leurs places sont celles de la partie, partagée). (v322) En mode
+        // FPS hors d'une partie, oui (avant : jamais en mode FPS, qui ne se jouait qu'au centre
+        // du monde ; un joueur en mode FPS téléporté au loin restait dans les terres lointaines).
+        if !self.far_allowed || self.net.is_some() {
             return false;
         }
         let p = self.player.pos;
@@ -1987,8 +2079,8 @@ impl Session {
         // Minimap : grille autour du joueur, sites de la carte.
         if self.net.is_some() {
             if !self.radar_map {
-                self.radar.set_map(&crate::fpsmap::load(&self.dir));
-                self.radar.set_dir(&self.dir);
+                self.radar.set_map(&fps_map_of(&self.dir, &self.world));
+                self.radar.set_dir(&self.dir, self.world.origin_blocks());
                 self.radar_map = true;
             }
             self.radar.update(&self.world, self.player.pos);
@@ -7276,12 +7368,10 @@ impl Session {
 
     /// Change le mode de jeu du joueur.
     pub fn set_mode(&mut self, mode: GameMode) {
-        // (v309) Le mode FPS (ses cartes, ses bots, la simulation partagée) compte tout depuis
-        // le centre du monde : loin de lui (partie comptée depuis une autre origine), refusé.
-        if mode == GameMode::Fps && self.far_from_center() {
-            self.say_far_from_center("Le mode FPS");
-            return;
-        }
+        // (v322) Le mode FPS se joue partout, loin du centre du monde aussi (v309 : refusé
+        // au-delà de 32 768 blocs) : la partie contre les bots repart d'abord d'une origine
+        // proche de ses départs s'il le faut (`solo_fps_far`), la partie FPS d'un serveur se
+        // joue comptée depuis l'origine du jeu de son hôte (`join_build_match`).
         // (v232) Un mode choisi en jeu (autre que FPS) est celui que le monde garde.
         if mode != GameMode::Fps && mode != GameMode::Spectator {
             self.saved_mode = None;
@@ -7371,10 +7461,16 @@ impl Session {
     /// (v243) La partie FPS du serveur de construction s'ouvre (menée par `host`) ou se ferme :
     /// celle qu'on a demandée démarre chez soi (on en est l'hôte) ; celle d'un autre, on y entre
     /// si l'on est en mode FPS ; fermée, on en sort.
-    fn build_match_event(&mut self, host: &str, open: bool) {
+    /// (v322) `origin` : l'origine (en chunks) du jeu de son hôte, depuis laquelle la partie
+    /// compte (on y entre compté depuis elle).
+    fn build_match_event(&mut self, host: &str, open: bool, origin: [i32; 2]) {
         if open {
             let mine = !self.pseudo.is_empty() && host.eq_ignore_ascii_case(&self.pseudo);
             self.build_match = Some(host.to_string());
+            self.build_match_origin = ChunkPos {
+                x: origin[0],
+                z: origin[1],
+            };
             if mine {
                 if !self.in_build_match() {
                     if self.match_opening && self.game.mode == GameMode::Fps {
@@ -7431,7 +7527,7 @@ impl Session {
             return;
         }
         let players = crate::bots::saved_players()
-            .unwrap_or_else(|| crate::fpsmap::load(&self.dir).players() as usize);
+            .unwrap_or_else(|| fps_map_of(&self.dir, &self.world).players() as usize);
         let before = n.bot_count();
         let now = n.set_bot_count(players.saturating_sub(1));
         let t = if now == before {
@@ -7538,7 +7634,7 @@ impl Session {
                 if let Some(n) = &mut self.net {
                     n.loaded();
                     // (v258) Les portes posées pour la partie de la carte (copies de la partie).
-                    n.set_map_doors(crate::fpsmap::load(&self.dir).door_list);
+                    n.set_map_doors(fps_map_of(&self.dir, &self.world).door_list);
                 }
             }
         }
@@ -7591,7 +7687,7 @@ impl Session {
         let Some(link) = self.build.as_ref().map(|b| b.world_link()) else {
             return;
         };
-        let map = crate::fpsmap::load(&self.dir);
+        let map = fps_map_of(&self.dir, &self.world);
         let spawn = self.player.pos;
         let mut starts = vec![spawn, spawn - Vec3::X * 10.0, spawn + Vec3::X * 10.0];
         for z in [&map.ct, &map.t].into_iter().chain(map.sites.iter()).flatten() {
@@ -7653,6 +7749,19 @@ impl Session {
         let Some(link) = self.build.as_ref().map(|b| b.world_link()) else {
             return;
         };
+        // (v322) La partie compte depuis l'origine du jeu de son hôte : la partie est d'abord
+        // rouverte depuis elle, sans quitter le serveur (`wants_rebase`), puis on y entre
+        // (`after_rebase`). Les places de la partie sont alors les mêmes chez tous.
+        if self.world.origin() != self.build_match_origin {
+            log::info!(
+                "partie FPS du serveur : rouverte depuis l'origine de son hôte ({} / {}) avant d'y \
+                 entrer",
+                self.build_match_origin.x * 16,
+                self.build_match_origin.z * 16
+            );
+            self.rebase_origin = Some(self.build_match_origin);
+            return;
+        }
         self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
             action: minelib_net::proto::SERVER_MATCH,
             pseudo: String::new(),
@@ -7660,7 +7769,7 @@ impl Session {
         });
         let mut n = crate::netgame::NetGame::guest_loading(link, [0; 32]);
         n.loaded();
-        n.set_map_doors(crate::fpsmap::load(&self.dir).door_list);
+        n.set_map_doors(fps_map_of(&self.dir, &self.world).door_list);
         self.net = Some(n);
         self.net_dead = false;
         self.player.flying = false;
@@ -7705,6 +7814,9 @@ impl Session {
             pseudo: String::new(),
             reason: what.into(),
         };
+        // (v322) L'ouverture dit l'origine (en chunks) depuis laquelle ce jeu compte : ses
+        // joueurs y entreront comptés depuis elle (`Response::BuildMatch`).
+        let open = format!("open {} {}", self.world.origin().x, self.world.origin().z);
         let host_me = self
             .net
             .as_ref()
@@ -7780,7 +7892,7 @@ impl Session {
                 // Fermée puis rouverte : ses joueurs la rejoignent de nouveau.
                 self.relay_cmds.push(ask("close"));
                 self.end_build_match();
-                self.relay_cmds.push(ask("open"));
+                self.relay_cmds.push(ask(&open));
                 self.match_opening = true;
                 self.chat.say("La partie recommence.", chat::YELLOW);
             } else {
@@ -7799,7 +7911,7 @@ impl Session {
                 }
             } else {
                 let players = crate::bots::saved_players()
-                    .unwrap_or_else(|| crate::fpsmap::load(&self.dir).players() as usize);
+                    .unwrap_or_else(|| fps_map_of(&self.dir, &self.world).players() as usize);
                 let before = n.bot_count();
                 let now = n.set_bot_count(players.saturating_sub(n.human_count()));
                 if now == before {
@@ -7813,14 +7925,28 @@ impl Session {
         }
         // Pas encore de partie : le relais vérifie qu'on est OP, puis l'ouvre (voir
         // `Event::BuildMatch`).
-        self.relay_cmds.push(ask("open"));
+        self.relay_cmds.push(ask(&open));
         self.match_opening = true;
     }
 
     /// (v172) Partie contre des bots (mode FPS dans un monde solo) : la carte se remplit de
     /// bots, la partie démarre, chacun est placé à son départ.
     fn start_bots(&mut self) {
-        let map = crate::fpsmap::load(&self.dir);
+        // (v322) Ses départs loin de l'origine de la partie : elle repart d'abord d'une origine
+        // proche d'eux, le joueur au départ (puis les bots démarrent : `bots_auto`).
+        if let Some((origin, at)) = self.solo_fps_far() {
+            log::info!(
+                "partie contre les bots loin de l'origine de la partie : rouverte depuis la \
+                 carte (départ en {:.1} / {:.1} / {:.1})",
+                at[0],
+                at[1],
+                at[2]
+            );
+            self.rebase_origin = Some(origin);
+            self.teleport_to = Some(at);
+            return;
+        }
+        let map = fps_map_of(&self.dir, &self.world);
         let pseudo = if self.pseudo.is_empty() {
             "Joueur".to_string()
         } else {
@@ -7831,7 +7957,12 @@ impl Session {
         if let Err(e) = self.save() {
             log::warn!("bots : sauvegarde avant le relevé de la carte impossible : {e:#}");
         }
-        let nav = crate::bots::nav_in_background(self.dir.clone(), map.clone(), vec![spawn]);
+        let nav = crate::bots::nav_in_background(
+            self.dir.clone(),
+            map.clone(),
+            vec![spawn],
+            self.world.origin(),
+        );
         let level = crate::bots::saved_level();
         self.net = Some(crate::netgame::NetGame::solo(
             pseudo,
@@ -7893,7 +8024,7 @@ impl Session {
         }
         // Hors ligne (essai de sa carte) : selon le réglage de la carte ; sur un serveur de
         // construction, toujours (les blocs changés partent comme les autres).
-        let map = crate::fpsmap::load(&self.dir);
+        let map = fps_map_of(&self.dir, &self.world);
         if self.build.is_none() && !map.door_usable(h.block) {
             return;
         }
@@ -8404,10 +8535,44 @@ impl Session {
     /// partie repart d'une origine proche sans quitter le serveur (`Game::rebase_world`).
     fn teleport_abs(&mut self, a: [f64; 3], look: Option<(f32, f32)>) {
         let local = self.local_of(a);
-        self.teleport_to = (self.far_allowed
-            && (local.x.abs() > REBASE_AT || local.z.abs() > REBASE_AT))
-            .then_some(a);
+        let far = self.far_allowed && (local.x.abs() > REBASE_AT || local.z.abs() > REBASE_AT);
+        // (v322) Loin de la partie FPS en cours (contre les bots, ou celle du serveur) : on la
+        // quitte, en restant en mode FPS, et la partie repart d'une origine proche du point
+        // d'arrivée (avant : la partie FPS empêchait ce départ, le joueur restait dans les
+        // terres lointaines).
+        if far && self.net.is_some() {
+            self.leave_match_far();
+        }
+        self.teleport_to = far.then_some(a);
         self.teleport(local, look);
+    }
+
+    /// (v322) Téléporté loin de la partie FPS en cours : on la quitte (en restant en mode FPS).
+    fn leave_match_far(&mut self) {
+        if self.net.as_ref().is_some_and(|n| n.is_solo()) {
+            self.stop_bots();
+            self.bots_auto = false;
+            self.chat.say(
+                "Partie contre les bots arrêtée : tu es parti loin d'elle (/bot : en relancer une).",
+                chat::YELLOW,
+            );
+        } else if self.in_build_match() {
+            let host = self.net.as_ref().is_some_and(|n| n.is_host());
+            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                action: minelib_net::proto::SERVER_MATCH,
+                pseudo: String::new(),
+                reason: if host { "close" } else { "leave" }.into(),
+            });
+            self.end_build_match();
+            self.chat.say(
+                if host {
+                    "Partie FPS du serveur fermée : tu es parti loin d'elle."
+                } else {
+                    "Tu as quitté la partie FPS du serveur : tu es parti loin d'elle."
+                },
+                chat::YELLOW,
+            );
+        }
     }
 
     /// (v223) Placé ailleurs (`/tp`, arrivée sur un serveur) : sans vitesse ni chute en cours.
@@ -8480,8 +8645,8 @@ impl Session {
         // hôte), ses messages.
         if self.build.is_some() {
             match e {
-                Event::BuildMatch { host, open } => {
-                    self.build_match_event(host, *open);
+                Event::BuildMatch { host, open, origin } => {
+                    self.build_match_event(host, *open, *origin);
                     return;
                 }
                 Event::MatchPeer {
@@ -8661,7 +8826,7 @@ impl Session {
                     .into_iter()
                     .find(|r| r.id == me)
                     .map_or_else(String::new, |r| r.pseudo);
-                let map = crate::fpsmap::load(&self.dir);
+                let map = fps_map_of(&self.dir, &self.world);
                 let resumed = n.promote(pseudo, members, &self.player, map, *old_host);
                 if let Some((guns, nades)) = n.my_guns() {
                     self.fps.set_guns(guns, nades);
@@ -9451,11 +9616,14 @@ impl Session {
             (0..3).all(|k| z.min[k] <= d.max[k] && z.max[k] >= d.min[k])
         };
         let mut full = 0;
+        let origin = self.world.origin_blocks();
         for d in &doors {
             map.door_list.retain(|z| !overlaps(z, d));
-            if on {
+            let zone = minelib_net::game::Zone::new(d.min, d.max);
+            // (v322) Pas à cheval sur la limite du monde (`fps.txt` la garde par ses coins).
+            if on && !crate::fpsmap::straddles(&zone, origin) {
                 if map.door_list.len() < crate::fpsmap::MAX_DOORS {
-                    map.door_list.push(minelib_net::game::Zone::new(d.min, d.max));
+                    map.door_list.push(zone);
                 } else {
                     full += 1;
                 }
@@ -9482,7 +9650,7 @@ impl Session {
             (false, 1) => "Porte retirée de la partie : elle reste fixe.".to_string(),
             (false, n) => format!("{n} portes retirées de la partie."),
         };
-        match crate::fpsmap::save(&self.dir, map) {
+        match self.save_fps_map(map) {
             Ok(()) => {
                 self.chat.say(
                     format!("{text} Nouvelle signature : c'est une nouvelle carte."),
@@ -9789,7 +9957,7 @@ impl Session {
         let on = |b: bool| if b { "oui" } else { "non" };
         match name {
             "fps" => {
-                let map = crate::fpsmap::load(&self.dir);
+                let map = fps_map_of(&self.dir, &self.world);
                 let zone = |z: &Option<minelib_net::game::Zone>| if z.is_some() { "posé" } else { "—" };
                 let sites: Vec<String> = map
                     .sites
@@ -9867,12 +10035,9 @@ impl Session {
     /// `/fps clear …`, `/fps info`.
     fn fps_command(&mut self, args: &[&str]) {
         use minelib_net::game::Zone;
-        // (v309) Les réglages d'une carte FPS (départs, sites, portes) sont des places comptées
-        // depuis le centre du monde : pas loin de lui.
-        if self.far_from_center() {
-            self.say_far_from_center("Une carte FPS");
-            return;
-        }
+        // (v322) Partout, loin du centre du monde aussi (v309 : refusé au-delà de 32 768
+        // blocs) : `fps.txt` garde les zones en places absolues (`save_fps_map`), la partie
+        // les compte depuis son origine (`fps_map`).
         const USAGE: &str = "Usage : /fps set spawn ct | spawn t | site a | site b | site c \
                              (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door on|off, /fps set doorsync on|off, /fps clear …, \
                              /fps showelements on|off, /fps info";
@@ -9896,7 +10061,7 @@ impl Session {
             };
             if on {
                 self.fps_elements = Some(FpsElements {
-                    map: crate::fpsmap::load(&self.dir),
+                    map: fps_map_of(&self.dir, &self.world),
                     ..Default::default()
                 });
                 self.chat.say(
@@ -9922,7 +10087,7 @@ impl Session {
             self.chat.say(msg, chat::RED);
             return;
         }
-        let mut map = crate::fpsmap::load(&self.dir);
+        let mut map = fps_map_of(&self.dir, &self.world);
         let lower: Vec<String> = args.iter().map(|a| a.to_lowercase()).collect();
         let what = |l: &[String]| -> Option<usize> {
             // Dans les deux ordres : « spawn ct » ou « ct spawn », « site a » ou « a site ».
@@ -9964,7 +10129,7 @@ impl Session {
             match n {
                 Some(n) if (2..=proto_max()).contains(&n) && n % 2 == 0 => {
                     map.set_players(n);
-                    match crate::fpsmap::save(&self.dir, &map) {
+                    match self.save_fps_map(&map) {
                         Ok(()) => self.chat.say(
                             format!(
                                 "Carte pour {n} joueurs ({} contre {}){}. Nouvelle signature : \
@@ -10049,7 +10214,7 @@ impl Session {
                 return;
             };
             map.set_door_sync(on);
-            match crate::fpsmap::save(&self.dir, &map) {
+            match self.save_fps_map(&map) {
                 Ok(()) => self.chat.say(
                     if on {
                         "Doubles portes : ouvrir un battant ouvre aussi l'autre en partie. \
@@ -10089,7 +10254,7 @@ impl Session {
                 return;
             };
             map.set_doors(on);
-            match crate::fpsmap::save(&self.dir, &map) {
+            match self.save_fps_map(&map) {
                 Ok(()) => self.chat.say(
                     if on {
                         "Toutes les portes et trappes s'ouvrent et se ferment en partie (touche \
@@ -10117,7 +10282,18 @@ impl Session {
                     );
                     return;
                 };
-                *slot(&mut map, k) = Some(Zone::new(a, b));
+                let zone = Zone::new(a, b);
+                // (v322) D'un seul côté de la limite du monde (carte bouclée) : `fps.txt` la
+                // garde par ses deux coins absolus.
+                if crate::fpsmap::straddles(&zone, self.world.origin_blocks()) {
+                    self.chat.say(
+                        "Une zone de la carte FPS ne peut pas être à cheval sur la limite du \
+                         monde : choisis-la d'un côté ou de l'autre.",
+                        chat::RED,
+                    );
+                    return;
+                }
+                *slot(&mut map, k) = Some(zone);
             }
             Some("clear")
                 if matches!(
@@ -10128,7 +10304,7 @@ impl Session {
                 if matches!(lower.get(2).map(String::as_str), Some("all" | "tout" | "toutes")) {
                     let n = map.door_list.len();
                     map.door_list.clear();
-                    match crate::fpsmap::save(&self.dir, &map) {
+                    match self.save_fps_map(&map) {
                         Ok(()) => self.chat.say(
                             format!("{n} porte(s) retirée(s) de la partie."),
                             chat::LIGHT_PURPLE,
@@ -10169,8 +10345,10 @@ impl Session {
                     ),
                     chat::LIGHT_PURPLE,
                 );
+                // (v322) Les zones en places absolues (celles des blocs, de F3).
+                let mut shown = crate::fpsmap::absolute(&map, self.world.origin_blocks());
                 for k in 0..5 {
-                    let z = *slot(&mut map, k);
+                    let z = *slot(&mut shown, k);
                     let t = match z {
                         Some(z) => format!("{} : {:?} → {:?}", name(k), z.min, z.max),
                         None => format!("{} : pas défini", name(k)),
@@ -10184,7 +10362,7 @@ impl Session {
                 return;
             }
         }
-        match crate::fpsmap::save(&self.dir, &map) {
+        match self.save_fps_map(&map) {
             Ok(()) => {
                 // (v258) Les éléments affichés le voient tout de suite (la sélection passe à
                 // sa couleur).
@@ -11789,7 +11967,7 @@ impl Session {
         e.map_age += dt;
         if e.map_age >= 1.0 {
             e.map_age = 0.0;
-            e.map = crate::fpsmap::load(&self.dir);
+            e.map = fps_map_of(&self.dir, &self.world);
         }
         if e.queue.is_empty() {
             let me = ChunkPos::containing(
@@ -15139,27 +15317,35 @@ mod loading_tests {
 mod far_origin_tests {
     use super::*;
 
-    /// (v318) Qui compte depuis une origine loin du centre du monde : une partie solo (pas une
-    /// carte FPS), un serveur de construction (son hôte, et chacun de ses invités dans sa copie
-    /// du monde, qui a toujours des réglages FPS et le mode FPS : sans quoi un invité téléporté
-    /// loin restait compté depuis le centre, dans les terres lointaines) ; jamais une partie FPS.
+    /// (v322) L'origine d'une partie qui s'ouvre : imposée (le passage en mode FPS la rouvre
+    /// depuis l'origine de la partie FPS) ; celle de la carte dans une partie FPS en ligne (le
+    /// centre du monde pour une carte sans zones, et toutes les cartes d'avant) ; près du joueur
+    /// ailleurs : en solo (mode FPS compris) et en construction en ligne (la copie du monde d'un
+    /// serveur chez un invité dit « fps » : v318).
     #[test]
-    fn online_build_guests_count_from_a_far_origin_too() {
-        let cfg = |far_origin, online_build| SessionConfig {
+    fn a_game_opens_from_the_right_origin() {
+        let cfg = |far_origin, origin| SessionConfig {
             view_distance: 4,
             far_origin,
-            online_build,
+            origin,
         };
-        // Solo : un monde ordinaire, oui ; une carte FPS, ou le mode FPS, non.
-        assert!(far_allowed_for(&cfg(true, false), GameMode::Creative, false));
-        assert!(!far_allowed_for(&cfg(true, false), GameMode::Creative, true));
-        assert!(!far_allowed_for(&cfg(true, false), GameMode::Fps, false));
-        // Construction en ligne : l'hôte, et l'invité dans sa copie (réglages FPS, mode FPS).
-        assert!(far_allowed_for(&cfg(true, true), GameMode::Creative, false));
-        assert!(far_allowed_for(&cfg(true, true), GameMode::Fps, true));
-        // Partie FPS (en ligne, ou contre des bots) : jamais.
-        assert!(!far_allowed_for(&cfg(false, false), GameMode::Creative, false));
-        assert!(!far_allowed_for(&cfg(false, false), GameMode::Fps, true));
+        let player = [1.0e9, 70.0, -5.0e8];
+        let near_player = origin_near(player);
+        assert_ne!(near_player, ChunkPos { x: 0, z: 0 });
+        let map_origin = ChunkPos { x: 62_500, z: 4 };
+        let map = Some(map_origin);
+        let forced = ChunkPos { x: 7, z: -3 };
+        assert_eq!(opening_origin(&cfg(true, Some(forced)), map, player), forced);
+        assert_eq!(opening_origin(&cfg(true, Some(forced)), None, player), forced);
+        // Partie FPS en ligne : la carte, sinon le centre du monde.
+        assert_eq!(opening_origin(&cfg(false, None), map, player), map_origin);
+        assert_eq!(
+            opening_origin(&cfg(false, None), None, player),
+            ChunkPos { x: 0, z: 0 }
+        );
+        // Solo (mode FPS compris) et construction en ligne : près du joueur, carte FPS ou pas.
+        assert_eq!(opening_origin(&cfg(true, None), map, player), near_player);
+        assert_eq!(opening_origin(&cfg(true, None), None, player), near_player);
     }
 
     /// (v309) L'origine des coordonnées d'une partie solo : le centre du monde à moins de

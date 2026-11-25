@@ -552,18 +552,21 @@ impl Search {
     }
 }
 
-/// Relève la carte d'un monde enregistré (`dir`) en tâche de fond, pour les bots.
+/// Relève la carte d'un monde enregistré (`dir`) en tâche de fond, pour les bots. (v322)
+/// Comptée depuis l'origine `origin` de la partie (`map` et `starts` aussi) : les cases du
+/// relevé sont celles de la partie, loin du centre du monde comme près de lui.
 pub fn nav_in_background(
     dir: std::path::PathBuf,
     map: FpsMap,
     starts: Vec<Vec3>,
+    origin: minelib_world::ChunkPos,
 ) -> Receiver<Arc<Nav>> {
     let (tx, rx) = std::sync::mpsc::channel();
     // (v209) Un seul relevé par carte : déjà fait, il est repris ; en cours, on l'attend.
     // Avant, chaque passage en mode FPS en relançait un (12 à 34 s sur tous les cœurs pour
     // une grande carte), et cinq tournaient en même temps quand on y passait plusieurs fois
     // de suite : le processeur à fond chauffait aussi la carte graphique.
-    let key = survey_key(&dir, &map, &starts);
+    let key = survey_key(&dir, &map, &starts, origin);
     {
         let Ok(mut guard) = SURVEYS.lock() else {
             return rx;
@@ -589,7 +592,7 @@ pub fn nav_in_background(
         .name("releve-bots".into())
         .spawn(move || {
             let t = std::time::Instant::now();
-            let nav = crate::radar::load_map_world(&dir, &map).map(|world| {
+            let nav = crate::radar::load_map_world(&dir, &map, origin).map(|world| {
                 let nav = Nav::build(&world, &map, &starts);
                 if nav.is_empty() {
                     log::warn!(
@@ -663,7 +666,12 @@ static SURVEYS: std::sync::Mutex<Option<HashMap<String, Survey>>> = std::sync::M
 /// ses réglages FPS et les départs. `chunks.bin` n'est plus réécrit à chaque sauvegarde :
 /// sa taille et sa date suffisent ; les blocs changés (petit fichier, réécrit à chaque
 /// sauvegarde) comptent par leur contenu.
-fn survey_key(dir: &std::path::Path, map: &FpsMap, starts: &[Vec3]) -> String {
+fn survey_key(
+    dir: &std::path::Path,
+    map: &FpsMap,
+    starts: &[Vec3],
+    origin: minelib_world::ChunkPos,
+) -> String {
     use std::hash::{Hash, Hasher};
     let meta = |name: &str| {
         std::fs::metadata(dir.join(name)).map_or(String::from("-"), |m| {
@@ -687,7 +695,7 @@ fn survey_key(dir: &std::path::Path, map: &FpsMap, starts: &[Vec3]) -> String {
         .map(|v| v.to_array().map(f32::to_bits))
         .collect();
     format!(
-        "{}|{map:?}|{starts:?}|{}|{}",
+        "{}|{map:?}|{starts:?}|{}|{}|{origin:?}",
         dir.display(),
         meta("chunks.bin"),
         content("edits.bin")
@@ -2087,7 +2095,28 @@ impl Brain {
             z.map(|z| Vec3::from(z.center()))
                 .or_else(|| m.fallback_spawns.map(|f| f[team_index(me.team) ^ 1]))
         });
-        to.and_then(|p| nav.near(p)).map_or(Goal::Wait, Goal::Go)
+        if let Some(n) = to.and_then(|p| nav.near(p)) {
+            return Goal::Go(n);
+        }
+        // (v322) Le milieu du départ adverse n'est pas une case où se tenir (une zone haute :
+        // son milieu est en l'air) : la case de ce départ où mène le plus court chemin depuis
+        // ici. Avant, le bot restait sur place tant qu'il ne voyait personne.
+        let field = if me.team == T {
+            &nav.from_ct
+        } else {
+            &nav.from_t
+        };
+        match nav.near(me.feet) {
+            Some(here) if field.any && field.reaches(here) => {
+                let n = nav.back(field, here, usize::MAX);
+                if n == here {
+                    Goal::Wait
+                } else {
+                    Goal::Go(n)
+                }
+            }
+            _ => Goal::Wait,
+        }
     }
 
     /// Où regarder depuis la case `n` : vers l'arrivée des T (`ct` vrai), sinon des CT.

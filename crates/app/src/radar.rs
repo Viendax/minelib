@@ -47,6 +47,10 @@ pub struct Radar {
     poll: f32,
     /// Case des pieds du joueur (hauteur) : les teintes du relevé en dépendent.
     feet: i32,
+    /// (v322) Écart (en blocs, x et z) entre l'origine de la partie et celle du relevé (celle
+    /// des parties de la carte, `fpsmap::match_origin`) : une case de la partie est celle du
+    /// relevé décalée d'autant. Nul pour une partie en ligne, et pour toutes les cartes d'avant.
+    shift: [i32; 2],
 }
 
 impl Radar {
@@ -68,10 +72,17 @@ impl Radar {
             .collect();
     }
 
-    /// Carte jouée : son relevé est lu (ou lancé en tâche de fond s'il manque).
-    pub fn set_dir(&mut self, dir: &std::path::Path) {
+    /// Carte jouée : son relevé est lu (ou lancé en tâche de fond s'il manque). (v322) La
+    /// partie compte depuis l'origine `origin` (en blocs, `World::origin_blocks`).
+    pub fn set_dir(&mut self, dir: &std::path::Path, origin: [i32; 3]) {
         self.dir = Some(dir.to_path_buf());
         self.poll = 0.0;
+        let (sx, sz) = crate::fpsmap::match_origin(&crate::fpsmap::load(dir)).origin();
+        let w = minelib_world::lap::wrap_block;
+        self.shift = [
+            w(origin[0] as i64 - sx as i64),
+            w(origin[2] as i64 - sz as i64),
+        ];
     }
 
     /// Le relevé de la carte est-il arrivé ? (Regardé une fois par seconde.)
@@ -158,7 +169,7 @@ impl Radar {
         for dx in 0..SIDE {
             let x = c[0] - GRID + dx as i32;
             self.cells[row * SIDE + dx] = match &self.survey {
-                Some(s) => s.shade(x, c[1], z),
+                Some(s) => s.shade(x + self.shift[0], c[1], z + self.shift[1]),
                 None => shade(world, x, c[1], z),
             };
         }
@@ -168,7 +179,7 @@ impl Radar {
     /// d'après la grille des blocs autour du joueur.
     fn shade_at(&self, c: [i32; 3], wx: i32, wz: i32) -> u8 {
         if let Some(s) = &self.survey {
-            return s.shade(wx, self.feet, wz);
+            return s.shade(wx + self.shift[0], self.feet, wz + self.shift[1]);
         }
         let (col, row) = (wx - (c[0] - GRID), wz - (c[2] - GRID));
         if (0..SIDE as i32).contains(&col) && (0..SIDE as i32).contains(&row) {
@@ -714,11 +725,19 @@ fn up(c: Cell, d: i32) -> Cell {
 }
 
 /// Monde enregistré de la carte `dir` (pour un relevé) : tous ses chunks enregistrés, et
-/// ceux autour de ses zones (monde généré).
-pub fn load_map_world(dir: &std::path::Path, map: &FpsMap) -> Option<World> {
+/// ceux autour de ses zones (monde généré). (v322) Compté depuis l'origine `origin` d'une
+/// partie (`map` aussi) : celle de la carte pour le relevé de la minimap
+/// (`fpsmap::load_for_match`), celle de la partie pour les bots.
+pub fn load_map_world(
+    dir: &std::path::Path,
+    map: &FpsMap,
+    origin: minelib_world::ChunkPos,
+) -> Option<World> {
     let (_, mut world) = crate::save::load_world(dir).ok()?;
+    world.set_origin(origin);
+    let bases: Vec<minelib_world::ChunkPos> = world.bases().map(|b| b.0).collect();
     let mut need: std::collections::HashSet<minelib_world::ChunkPos> =
-        world.bases().map(|b| b.0).collect();
+        bases.into_iter().map(|b| world.local_chunk(b)).collect();
     for z in [&map.ct, &map.t]
         .into_iter()
         .chain(map.sites.iter())
@@ -754,8 +773,9 @@ pub fn survey_in_background(dir: &std::path::Path) {
             let dir = job;
             let t = std::time::Instant::now();
             let stamp = survey_stamp(&dir);
-            let map = crate::fpsmap::load(&dir);
-            if let Some(world) = load_map_world(&dir, &map) {
+            // (v322) Compté depuis l'origine des parties de la carte (`Radar::set_origin`).
+            let (map, origin) = crate::fpsmap::load_for_match(&dir);
+            if let Some(world) = load_map_world(&dir, &map, origin) {
                 let mut s = Survey::of(&world, &map);
                 s.stamp = stamp;
                 let cells: usize = s.floors.iter().map(Vec::len).sum();

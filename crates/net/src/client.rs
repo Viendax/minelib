@@ -422,9 +422,11 @@ pub enum Event {
         name: String,
     },
     /// (v243) Partie FPS du serveur de construction ouverte (menée par `host`) ou fermée.
+    /// (v322) `origin` : l'origine (en chunks) du jeu de son hôte.
     BuildMatch {
         host: String,
         open: bool,
+        origin: [i32; 2],
     },
     /// (v243) Hôte de la partie FPS d'un serveur de construction : `peer` (`pseudo`) y entre
     /// ou en sort.
@@ -1389,7 +1391,7 @@ impl Worker {
             Response::PartyInvite { from } => Event::PartyInvite(from),
             Response::Invited { from, room, name } => Event::Invited { from, room, name },
             Response::InviteDeclined { by, name } => Event::InviteDeclined { by, name },
-            Response::BuildMatch { host, open } => Event::BuildMatch { host, open },
+            Response::BuildMatch { host, open, origin } => Event::BuildMatch { host, open, origin },
             Response::MatchPeer {
                 peer,
                 pseudo,

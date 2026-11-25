@@ -124,8 +124,11 @@ impl Garant {
             log::warn!("arbitre : carte illisible");
             return Vec::new();
         };
-        // (v258) Les portes posées pour la partie (`fps.txt` de la carte).
-        let doors = crate::fpsmap::load(dir).door_list;
+        // (v322) La partie compte depuis l'origine de sa carte (comme chez ses joueurs), ses
+        // réglages aussi. (v258) Les portes posées pour la partie (`fps.txt` de la carte).
+        let (map, origin) = crate::fpsmap::load_for_match(dir);
+        world.set_origin(origin);
+        let doors = map.door_list;
         let guilty = crate::netgame::arbitrate(items, &mut world, &doors, ensure_around);
         log::info!(
             "arbitre : affaire {case} : {}",
@@ -154,10 +157,13 @@ impl Garant {
             log::warn!("garant : carte illisible");
             return;
         };
+        // (v322) La partie compte depuis l'origine de sa carte (comme chez ses joueurs), ses
+        // réglages aussi.
+        let (map, origin) = crate::fpsmap::load_for_match(dir);
+        world.set_origin(origin);
         world.ensure_chunk(ChunkPos { x: 0, z: 0 });
         let top = world.top_solid(8, 8).unwrap_or(64);
         let spawn = Vec3::new(8.5, top as f32 + 1.0, 8.5);
-        let map = crate::fpsmap::load(dir);
         let mut net = if self.standby {
             // (v258) Les portes posées pour la partie, remises dans chaque copie vérifiée.
             let mut n = NetGame::standby(self.link.clone(), self.sig);
@@ -217,10 +223,11 @@ impl Garant {
                 net.receive(None, data, world)
             }
             Event::Promoted { members, old_host } => {
+                // (v322) Comptés depuis l'origine de la carte (celle de son monde ici).
                 let map = self
                     .dir
                     .as_ref()
-                    .map(|d| crate::fpsmap::load(d))
+                    .map(|d| crate::fpsmap::load_for_match(d).0)
                     .unwrap_or_default();
                 net.promote(self.pseudo.clone(), members, &self.phantom, map, *old_host);
                 self.standby = false;

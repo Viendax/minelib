@@ -14,6 +14,8 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use minelib_net::game::{self, FpsMap, MapPackage, Zone};
+use minelib_world::lap::wrap_block;
+use minelib_world::ChunkPos;
 
 const FILE: &str = "fps.txt";
 
@@ -29,10 +31,104 @@ fn parse_zone(v: &str) -> Option<Zone> {
     (n.len() == 6).then(|| Zone::new([n[0], n[1], n[2]], [n[3], n[4], n[5]]))
 }
 
-/// (v309) Le monde `dir` est-il une carte FPS (il a ses réglages FPS) ? Une carte se joue
-/// comptée depuis le centre du monde (voir `SessionConfig::far_origin`).
-pub fn exists(dir: &Path) -> bool {
-    dir.join(FILE).exists()
+/// (v322) Les zones d'une carte : départs, sites, portes.
+fn zones(m: &FpsMap) -> impl Iterator<Item = &Zone> {
+    [&m.ct, &m.t]
+        .into_iter()
+        .chain(m.sites.iter())
+        .flatten()
+        .chain(m.door_list.iter())
+}
+
+/// (v322) Origine des parties FPS sur la carte `m` (réglages en places absolues, comme dans
+/// `fps.txt` et dans le paquet de la carte) : le multiple de 4 096 blocs le plus proche du
+/// milieu de ses zones (`session::origin_near` : le centre du monde à moins de 32 768 blocs de
+/// lui, comme toutes les cartes d'avant la v322). La même chez tous ceux qui ont la carte :
+/// l'hôte, ses invités, le garant, le vérificateur, l'arbitre ; une partie FPS y compte tout
+/// depuis elle (places des joueurs, balles, grenades, bots : en simple précision, exactes près
+/// d'elle). Aucune : la carte n'a pas de zones.
+pub fn origin(m: &FpsMap) -> Option<ChunkPos> {
+    // Le milieu sur la carte bouclée : les écarts au premier coin, les plus courts.
+    let mut first: Option<[i64; 2]> = None;
+    let (mut sum, mut n) = ([0i64; 2], 0i64);
+    for z in zones(m) {
+        let mid = [
+            (z.min[0] as i64 + z.max[0] as i64) / 2,
+            (z.min[2] as i64 + z.max[2] as i64) / 2,
+        ];
+        let f = *first.get_or_insert(mid);
+        for k in 0..2 {
+            sum[k] += wrap_block(mid[k] - f[k]) as i64;
+        }
+        n += 1;
+    }
+    let f = first?;
+    let at = |k: usize| wrap_block(f[k] + sum[k] / n) as f64 + 0.5;
+    Some(crate::session::origin_near([at(0), 0.0, at(1)]))
+}
+
+/// (v322) Origine d'une partie FPS en ligne sur la carte `m` : celle de ses zones, sinon le
+/// centre du monde (sans zones, on y joue autour du point de départ (8, 8) du monde).
+pub fn match_origin(m: &FpsMap) -> ChunkPos {
+    origin(m).unwrap_or(ChunkPos { x: 0, z: 0 })
+}
+
+/// (v322) La zone `z` déplacée de `by` blocs (sur x et z) : son coin le plus bas ramené sur la
+/// carte bouclée, sa taille gardée (elle reste d'un seul tenant).
+fn shift_zone(z: &Zone, by: [i64; 3]) -> Zone {
+    let min = [
+        wrap_block(z.min[0] as i64 + by[0]),
+        z.min[1],
+        wrap_block(z.min[2] as i64 + by[2]),
+    ];
+    Zone {
+        min,
+        max: [
+            min[0] + (z.max[0] - z.min[0]),
+            z.max[1],
+            min[2] + (z.max[2] - z.min[2]),
+        ],
+    }
+}
+
+fn shift_map(m: &FpsMap, by: [i64; 3]) -> FpsMap {
+    let z = |z: &Option<Zone>| z.as_ref().map(|z| shift_zone(z, by));
+    FpsMap {
+        ct: z(&m.ct),
+        t: z(&m.t),
+        sites: [z(&m.sites[0]), z(&m.sites[1]), z(&m.sites[2])],
+        max_players: m.max_players,
+        door_list: m.door_list.iter().map(|d| shift_zone(d, by)).collect(),
+    }
+}
+
+/// (v322) Les réglages `m` (places absolues) comptés depuis l'origine `o` d'une partie (en
+/// blocs, `World::origin_blocks`) : ce que la partie, ses bots et son radar prennent.
+pub fn local(m: &FpsMap, o: [i32; 3]) -> FpsMap {
+    shift_map(m, [-(o[0] as i64), 0, -(o[2] as i64)])
+}
+
+/// (v322) Les réglages `m` comptés depuis l'origine `o` (en blocs), en places absolues : ce
+/// que garde `fps.txt`.
+pub fn absolute(m: &FpsMap, o: [i32; 3]) -> FpsMap {
+    shift_map(m, [o[0] as i64, 0, o[2] as i64])
+}
+
+/// (v322) Une zone comptée depuis `o` est-elle à cheval sur la limite du monde (une partie de
+/// chaque côté) ? Une zone de la carte doit être d'un seul côté (`fps.txt` la garde par ses
+/// deux coins absolus).
+pub fn straddles(z: &Zone, o: [i32; 3]) -> bool {
+    let a = shift_zone(z, [o[0] as i64, 0, o[2] as i64]);
+    (a.max[0] as i64) >= minelib_world::lap::HALF || (a.max[2] as i64) >= minelib_world::lap::HALF
+}
+
+/// (v322) Réglages d'une carte comptés depuis l'origine de ses parties en ligne, et cette
+/// origine : ce que prennent le garant, le vérificateur, l'arbitre et le relevé de la carte.
+pub fn load_for_match(dir: &Path) -> (FpsMap, ChunkPos) {
+    let m = load(dir);
+    let o = match_origin(&m);
+    let (x, z) = o.origin();
+    (local(&m, [x, 0, z]), o)
 }
 
 /// Réglages FPS d'un monde (vides si absents).
@@ -534,6 +630,105 @@ mod tests {
         assert!(level.contains("gamemode=fps"));
         assert_eq!(solo_copy(&saves, &sig), Some(copy));
         assert_eq!(solo_copies(&saves), vec![sig]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// (v322) Une carte FPS construite loin du centre du monde : ses parties comptent depuis une
+    /// origine proche de ses zones (`origin`), où elles sont petites (exactes en simple
+    /// précision) et d'où elles reviennent en places absolues à l'identique ; près du centre
+    /// (toutes les cartes d'avant), rien ne change ; le long de la limite du monde, le milieu
+    /// des zones est pris de leur côté (pas au centre), et une zone à cheval sur elle n'est pas
+    /// gardée.
+    #[test]
+    fn far_maps_count_from_an_origin_close_to_their_zones() {
+        let zero = ChunkPos { x: 0, z: 0 };
+        let near = FpsMap {
+            ct: Some(Zone::new([0, 64, 0], [5, 64, 5])),
+            t: Some(Zone::new([40, 64, 0], [45, 64, 5])),
+            ..Default::default()
+        };
+        assert_eq!(origin(&near), Some(zero));
+        assert_eq!(local(&near, [0, 0, 0]), near);
+        assert_eq!(origin(&FpsMap::default()), None);
+        assert_eq!(match_origin(&FpsMap::default()), zero);
+
+        let x = 1_000_000_000;
+        let far = FpsMap {
+            ct: Some(Zone::new([x, 64, 5000], [x + 5, 64, 5005])),
+            t: Some(Zone::new([x + 40, 64, 5000], [x + 45, 64, 5005])),
+            sites: [Some(Zone::new([x + 20, 64, 5020], [x + 24, 66, 5024])), None, None],
+            door_list: vec![Zone::new([x + 10, 64, 5002], [x + 10, 65, 5003])],
+            ..Default::default()
+        };
+        let o = origin(&far).unwrap();
+        assert_ne!(o, zero);
+        assert_eq!(match_origin(&far), o);
+        let (ox, oz) = o.origin();
+        assert!((ox as i64 - x as i64).abs() <= 2048 && oz == 0, "{ox} {oz}");
+        let l = local(&far, [ox, 0, oz]);
+        for z in [&l.ct, &l.t, &l.sites[0]]
+            .into_iter()
+            .flatten()
+            .chain(l.door_list.iter())
+        {
+            assert!(z.min[0].abs() < 8192 && z.max[0].abs() < 8192, "{z:?}");
+            assert!(z.min[2].abs() < 8192 && z.max[2].abs() < 8192, "{z:?}");
+        }
+        assert_eq!(l.t.unwrap().min[0] - l.ct.unwrap().min[0], 40);
+        assert_eq!(absolute(&l, [ox, 0, oz]), far);
+
+        let h = minelib_world::lap::HALF as i32;
+        let seam = FpsMap {
+            ct: Some(Zone::new([h - 50, 64, 0], [h - 45, 64, 5])),
+            t: Some(Zone::new([-h + 40, 64, 0], [-h + 45, 64, 5])),
+            ..Default::default()
+        };
+        let (sx, sz) = origin(&seam).unwrap().origin();
+        assert!((sx as i64).abs() > minelib_world::lap::HALF - 4096, "{sx}");
+        let l = local(&seam, [sx, 0, sz]);
+        let (ct, t) = (l.ct.unwrap(), l.t.unwrap());
+        assert!(ct.min[0].abs() < 4096 && t.min[0].abs() < 4096, "{ct:?} {t:?}");
+        assert_eq!(t.min[0] - ct.min[0], 90, "voisines de part et d'autre de la limite");
+        assert_eq!(absolute(&l, [sx, 0, sz]), seam);
+        let across = Zone::new([ct.min[0] + 40, 64, 0], [ct.min[0] + 60, 64, 5]);
+        assert!(straddles(&across, [sx, 0, sz]));
+        assert!(!straddles(&ct, [sx, 0, sz]) && !straddles(&t, [sx, 0, sz]));
+    }
+
+    /// (v322) Une carte FPS construite loin du centre, reçue ailleurs : ses parties y comptent
+    /// depuis la même origine, ses zones aux mêmes places (`load_for_match`, ce que prennent
+    /// l'hôte, le garant, le vérificateur et l'arbitre), et le monde relu pour un relevé
+    /// (`radar::load_map_world`) a ses blocs aux places de la partie.
+    #[test]
+    fn a_far_map_counts_from_the_same_origin_wherever_it_is_played() {
+        use minelib_world::BlockId;
+        let root = std::env::temp_dir().join(format!("minelib-carte-loin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = crate::save::create_world(&root, "Loin", 11).unwrap();
+        let x = 1_000_000_000;
+        let mut m = load(&dir);
+        m.ct = Some(Zone::new([x, 70, 0], [x + 4, 70, 4]));
+        m.t = Some(Zone::new([x + 60, 70, 0], [x + 64, 70, 4]));
+        save(&dir, &m).unwrap();
+        // Un bloc de la carte, posé depuis l'origine de ses parties.
+        let (data, mut world) = crate::save::load_world(&dir).unwrap();
+        let (map, o) = load_for_match(&dir);
+        world.set_origin(o);
+        let (ox, oz) = o.origin();
+        let at = [x + 30 - ox, 150, 2 - oz];
+        world.ensure_chunk(ChunkPos::containing(at[0], at[2]));
+        world.set(at[0], at[1], at[2], BlockId::PLANKS);
+        crate::save::save_world(&dir, &data, &world).unwrap();
+
+        let p = package(&dir).unwrap();
+        assert_eq!(p.fps.ct, m.ct, "la carte partagée garde ses places absolues");
+        let copy = unpack(&root.join("maps"), "Copie", &p.to_bytes()).unwrap();
+        let (theirs, o2) = load_for_match(&copy);
+        assert_eq!((o2, &theirs), (o, &map));
+        assert_eq!(theirs.ct.unwrap().min, [x - ox, 70, -oz]);
+        let w = crate::radar::load_map_world(&copy, &theirs, o2).unwrap();
+        assert_eq!(w.origin(), o);
+        assert_eq!(w.get(at[0], at[1], at[2]), BlockId::PLANKS);
         let _ = fs::remove_dir_all(&root);
     }
 

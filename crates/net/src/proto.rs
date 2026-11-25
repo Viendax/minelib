@@ -70,6 +70,10 @@ use serde::{Deserialize, Serialize};
 /// objets au sol, foudre, foule d'essai, Évidés) sont en double précision et sur la carte
 /// bouclée (`wrap_chunk`) : loin du centre du monde comme de part et d'autre de sa limite,
 /// chacun voit les autres et le monde à leur place exacte.
+/// (v322, toujours 75) Le mode FPS loin du centre du monde : une partie FPS compte depuis
+/// l'origine de sa carte (`fpsmap::match_origin`, chez l'hôte, ses invités, le garant, le
+/// vérificateur), la partie FPS d'un serveur de construction depuis celle du jeu de son hôte
+/// (`Response::BuildMatch::origin`).
 pub const PROTOCOL: u32 = 75;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
@@ -1807,10 +1811,13 @@ pub enum Response {
         name: String,
     },
     /// (v243) Poussé : la partie FPS du serveur de construction est ouverte, menée par `host`
-    /// (`open`), ou fermée.
+    /// (`open`), ou fermée. (v322) `origin` : l'origine (en chunks) depuis laquelle le jeu de
+    /// son hôte compte ; on y entre compté depuis elle (les places de la partie sont les mêmes
+    /// chez tous, loin du centre du monde aussi).
     BuildMatch {
         host: String,
         open: bool,
+        origin: [i32; 2],
     },
     /// (v243) Poussé à l'hôte de la partie FPS d'un serveur de construction : le joueur `peer`
     /// (`pseudo`) y entre (`joined`) ou en sort.

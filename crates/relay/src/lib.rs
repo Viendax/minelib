@@ -1199,6 +1199,9 @@ struct BuildMatch {
     host: u64,
     host_pseudo: String,
     members: Vec<u64>,
+    /// (v322) L'origine (en chunks) depuis laquelle le jeu de son hôte compte : ses joueurs y
+    /// entrent comptés depuis elle (dite avec l'ouverture, `open <x> <z>`).
+    origin: [i32; 2],
 }
 
 struct Room {
@@ -1950,6 +1953,7 @@ fn match_left(st: &mut State, room_id: u64, id: u64) {
         let close = Response::BuildMatch {
             host: String::new(),
             open: false,
+            origin: [0, 0],
         };
         let everyone: Vec<u64> = r.everyone().filter(|&m| m != id).collect();
         for m in everyone {
@@ -1995,11 +1999,23 @@ fn build_match(
     let Some(r) = st.rooms.get_mut(&rid) else {
         return Err("Monde introuvable.".into());
     };
-    let open_msg = |host: &str| Response::BuildMatch {
+    let open_msg = |host: &str, origin: [i32; 2]| Response::BuildMatch {
         host: host.to_string(),
         open: true,
+        origin,
     };
-    match what {
+    // (v322) `open <x> <z>` : l'origine (en chunks) du jeu de l'hôte (un jeu d'avant dit
+    // `open` seul : le centre du monde).
+    let mut words = what.split_whitespace();
+    let verb = words.next().unwrap_or("");
+    let origin = {
+        let mut n = words.map(|w| w.parse::<i32>().ok());
+        match (n.next().flatten(), n.next().flatten()) {
+            (Some(x), Some(z)) => [x, z],
+            _ => [0, 0],
+        }
+    };
+    match verb {
         "open" => {
             if !op {
                 return Err("Partie FPS : réservée aux OP de ce serveur.".into());
@@ -2014,12 +2030,15 @@ fn build_match(
                         host: id,
                         host_pseudo: pseudo.to_string(),
                         members: Vec::new(),
+                        origin,
                     });
                     log::info!("monde {rid} : partie FPS ouverte par « {pseudo} »");
                 }
             }
+            // (La partie déjà ouverte par lui : son origine reste celle de l'ouverture.)
+            let origin = r.fps_match.as_ref().map_or(origin, |m| m.origin);
             let everyone: Vec<u64> = r.everyone().collect();
-            let msg = open_msg(pseudo);
+            let msg = open_msg(pseudo, origin);
             for m in everyone {
                 if let Some(c) = st.conns.get(&m) {
                     transport::push(&c.tx, &msg);
@@ -2042,6 +2061,7 @@ fn build_match(
                     &Response::BuildMatch {
                         host: String::new(),
                         open: false,
+                        origin: [0, 0],
                     },
                 );
             }
@@ -2076,10 +2096,11 @@ fn build_match(
         _ => {
             // « query » : où en est-elle (poussé, comme à tous).
             let msg = match &r.fps_match {
-                Some(m) => open_msg(&m.host_pseudo),
+                Some(m) => open_msg(&m.host_pseudo, m.origin),
                 None => Response::BuildMatch {
                     host: String::new(),
                     open: false,
+                    origin: [0, 0],
                 },
             };
             if let Some(c) = st.conns.get(&id) {
@@ -7422,6 +7443,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             &Response::BuildMatch {
                                 host: m.host_pseudo.clone(),
                                 open: true,
+                                origin: m.origin,
                             },
                         );
                     }
@@ -13105,7 +13127,8 @@ mod tests {
     /// tous les joueurs du serveur le savent, ceux qui arrivent aussi ; un joueur qui y entre
     /// est annoncé à son hôte ; ses messages vont entre son hôte et ses joueurs seulement (pas à
     /// un joueur qui n'y est pas) ; un joueur qui en sort est annoncé ; son hôte parti, elle se
-    /// ferme pour tous.
+    /// ferme pour tous. (v322) L'origine du jeu de son hôte (dite à l'ouverture) va avec elle,
+    /// à tous, à ceux qui arrivent aussi.
     #[test]
     fn a_build_match_runs_between_its_host_and_its_players() {
         let dir = std::env::temp_dir().join(format!("minelib-partie-{}", rand::random::<u32>()));
@@ -13139,9 +13162,11 @@ mod tests {
             });
         };
         let state = |c: &Client| match wait(c, |e| matches!(e, Event::BuildMatch { .. })) {
-            Event::BuildMatch { host, open } => (host, open),
+            Event::BuildMatch { host, open, origin } => (host, open, origin),
             _ => unreachable!(),
         };
+        // (v322) L'origine (en chunks) du jeu de l'hôte, à un milliard de blocs.
+        let far = [62_500_000, -3];
         let peer = |c: &Client| match wait(c, |e| matches!(e, Event::MatchPeer { .. })) {
             Event::MatchPeer {
                 peer,
@@ -13173,10 +13198,10 @@ mod tests {
         assert!(wait_error(&eve).contains("OP"));
         act(&eve, "join");
         assert!(wait_error(&eve).contains("Aucune partie"));
-        // Le créateur l'ouvre : tous le savent.
-        act(&createur, "open");
+        // Le créateur l'ouvre : tous le savent, avec l'origine de son jeu.
+        act(&createur, "open 62500000 -3");
         for c in [&createur, &eve, &bob] {
-            assert_eq!(state(c), ("Createur".to_string(), true));
+            assert_eq!(state(c), ("Createur".to_string(), true, far));
         }
         // Eve y entre : son hôte le sait ; ses messages vont à l'hôte.
         act(&eve, "join");
@@ -13219,7 +13244,7 @@ mod tests {
             pseudo: String::new(),
             reason: String::new(),
         });
-        assert_eq!(state(&dan), ("Createur".to_string(), true));
+        assert_eq!(state(&dan), ("Createur".to_string(), true, far));
         // Eve en sort : son hôte le sait.
         act(&eve, "leave");
         assert_eq!(peer(&createur), (eve_id, "Eve".to_string(), false));
@@ -13228,7 +13253,7 @@ mod tests {
         peer(&createur);
         createur.send(Cmd::Leave);
         for c in [&eve, &bob, &dan] {
-            assert_eq!(state(c), (String::new(), false));
+            assert_eq!(state(c), (String::new(), false, [0, 0]));
         }
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);

@@ -443,6 +443,9 @@ struct Game {
     /// (v309) La partie doit repartir d'une origine plus proche du joueur (`Session::
     /// wants_rebase`) : faite en fin d'image (`rebase_world`).
     rebase: bool,
+    /// (v322) L'origine imposée à la prochaine ouverture (`SessionConfig::origin`) : celle
+    /// d'une partie FPS (`Session::take_rebase_origin`).
+    next_origin: Option<minelib_world::ChunkPos>,
     /// Vider tous les maillages GPU (changement de monde) en fin d'image.
     clear_meshes: bool,
     quit: bool,
@@ -569,7 +572,7 @@ impl Game {
             config: SessionConfig {
                 view_distance,
                 far_origin: true,
-                online_build: false,
+                origin: None,
             },
             ui: Ui::default(),
             sysmon: SysMonitor::start(),
@@ -605,6 +608,7 @@ impl Game {
             auto_join_asked: -10.0,
             pending_open: None,
             rebase: false,
+            next_origin: None,
             clear_meshes: false,
             quit: false,
             optimus: None,
@@ -777,13 +781,13 @@ impl Game {
     }
 
     fn play(&mut self, dir: PathBuf) {
-        self.play_with(dir, true, false);
+        self.play_with(dir, true);
     }
 
-    /// (v309) Ouvre le monde `dir` ; `far_origin` faux : en partie FPS, tout est compté depuis
-    /// le centre du monde (voir `SessionConfig::far_origin`). (v318) `online_build` : monde de
-    /// construction en ligne (`SessionConfig::online_build`).
-    fn play_with(&mut self, dir: PathBuf, far_origin: bool, online_build: bool) {
+    /// (v309) Ouvre le monde `dir` ; `far_origin` faux : partie FPS en ligne, tout est compté
+    /// depuis l'origine de sa carte (v322 ; avant, depuis le centre du monde : voir
+    /// `SessionConfig::far_origin`).
+    fn play_with(&mut self, dir: PathBuf, far_origin: bool) {
         // Nouveau monde : rien de l'ancien ne doit rester à l'écran.
         self.session = None;
         self.played = true;
@@ -796,7 +800,8 @@ impl Game {
         self.clear_meshes = true;
         let config = SessionConfig {
             far_origin,
-            online_build,
+            // (v322) Rouverte pour une partie FPS : depuis son origine (`rebase_world`).
+            origin: self.next_origin.take(),
             ..self.config
         };
         match Session::open(dir, config) {
@@ -986,6 +991,9 @@ impl Game {
         }
         let dir = s.dir.clone();
         let place = s.exact_place();
+        // (v322) Une partie FPS demande son origine (celle de sa carte, ou du jeu de l'hôte de
+        // la partie FPS du serveur) : la partie rouverte compte depuis elle.
+        self.next_origin = s.take_rebase_origin();
         // (v318) Le tchat, la vitesse, et en ligne la connexion au serveur et ce qu'on en
         // sait : la partie rouverte les reprend (on ne quitte pas le serveur).
         let carry = s.take_carry();
@@ -998,9 +1006,11 @@ impl Game {
             place[2],
             if online { ", sans quitter le serveur" } else { "" }
         );
-        self.play_with(dir, true, online);
+        self.play_with(dir, true);
         if let Some(n) = &mut self.session {
             n.put_carry(carry);
+            // (v322) Rouverte pour la partie FPS du serveur : on y entre.
+            n.after_rebase();
         }
     }
 
@@ -2270,7 +2280,9 @@ impl Game {
     /// en mode FPS garde le sien dans son fichier.
     fn play_vs_bots(&mut self, dir: PathBuf) {
         self.fps_status = None;
-        self.play_with(dir, false, false);
+        // (v322) En solo : compté depuis près du joueur, la partie contre les bots se place
+        // d'elle-même près des départs de la carte (`Session::solo_fps_far`).
+        self.play_with(dir, true);
         if let Some(s) = &mut self.session {
             if s.game.mode != save::GameMode::Fps {
                 s.saved_mode = Some(s.game.mode);
@@ -2654,10 +2666,11 @@ impl Game {
             self.notify("Connecte-toi d'abord à ton compte.".to_string());
             return;
         };
-        let map = fpsmap::load(&dir);
-        self.play_with(dir, false, false);
+        self.play_with(dir, false);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
+            // (v322) Comptée depuis l'origine de la carte (celle de la partie, chez tous).
+            let map = s.fps_map();
             s.game.mode = save::GameMode::Fps;
             // Pas de vol en partie en ligne.
             s.game.can_fly = false;
@@ -2680,7 +2693,7 @@ impl Game {
         let Some(link) = self.accounts.link.clone() else {
             return;
         };
-        self.play_with(dir, false, false);
+        self.play_with(dir, false);
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Fps;
             // Pas de vol en partie en ligne.
@@ -2716,7 +2729,7 @@ impl Game {
             .into_iter()
             .find(|w| w.dir == dir)
             .map_or_else(|| "Monde".into(), |w| w.meta.name);
-        self.play_with(dir, true, true);
+        self.play_with(dir, true);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             if s.game.mode == save::GameMode::Fps {
@@ -2776,7 +2789,7 @@ impl Game {
                 }
             }
         };
-        self.play_with(dir, true, true);
+        self.play_with(dir, true);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Creative;
