@@ -1107,8 +1107,12 @@ impl Renderer {
                     label: Some("minelib"),
                     // Plusieurs maillages en un seul appel de dessin, si la carte le permet.
                     // Temps GPU par passe (journal des performances), si disponible.
+                    // (v316) Et l'horodatage entre deux passes, pour mesurer aussi le travail
+                    // des passes sans chronomètre (`gpu_timer`).
                     required_features: adapter.features()
-                        & (wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::TIMESTAMP_QUERY),
+                        & (wgpu::Features::MULTI_DRAW_INDIRECT
+                            | wgpu::Features::TIMESTAMP_QUERY
+                            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
                     required_limits: wgpu::Limits {
                         // Une couche de texture par image de bloc (plus de 256 avec les mondes importés).
                         max_texture_array_layers: adapter.limits().max_texture_array_layers,
@@ -1175,9 +1179,8 @@ impl Renderer {
             present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            // 3 images d'avance : le processeur prépare la suivante pendant que la carte
-            // dessine, sans attendre (plus de FPS ; Reflex réduit la latence s'il est actif).
-            desired_maximum_frame_latency: 3,
+            // (v316) Jetons de la chaîne d'images de Windows : voir `swap_latency`.
+            desired_maximum_frame_latency: swap_latency(),
         };
         surface.configure(&device, &config);
         let depth = create_depth(&device, &config);
@@ -2338,17 +2341,23 @@ impl Renderer {
                 l.frame_begin();
             }
         }
-        let _s = perf::scope("rendu : attente de l'image (GPU)");
+        // (v316) Deux attentes, mesurées à part (jusqu'à la v315 : une seule ligne, « attente
+        // de l'image (GPU) », qui faisait croire que tout ce temps était du travail de la
+        // carte, alors que Windows en prenait une bonne part : voir `swap_latency`).
         let waited = std::time::Instant::now();
-        while self.in_flight.len() >= self.queue_depth.max(1) {
-            let Some(oldest) = self.in_flight.pop_front() else {
-                break;
-            };
-            let _ = self
-                .device
-                .poll(wgpu::PollType::WaitForSubmissionIndex(oldest));
+        {
+            let _s = perf::scope(WAIT_GPU);
+            while self.in_flight.len() >= self.queue_depth.max(1) {
+                let Some(oldest) = self.in_flight.pop_front() else {
+                    break;
+                };
+                let _ = self
+                    .device
+                    .poll(wgpu::PollType::WaitForSubmissionIndex(oldest));
+            }
         }
         if self.ahead.is_none() {
+            let _s = perf::scope(WAIT_WINDOW);
             // (Refusée — fenêtre réduite, chaîne d'images à refaire… : l'image suivante la
             // redemandera et s'en occupera, comme avant.)
             self.ahead = self.surface.get_current_texture().ok();
@@ -3848,7 +3857,7 @@ impl Renderer {
 
         // Image de la fenêtre : (v204) déjà prise à la fin de l'image d'avant, avant la
         // lecture des entrées (`next_frame`) ; demandée ici seulement s'il n'y en a pas.
-        let acquire = perf::scope("rendu : attente de l'image (GPU)");
+        let acquire = perf::scope(WAIT_WINDOW);
         let waited = std::time::Instant::now();
         let frame = match self.window_frame() {
             Ok(f) => f,
@@ -3871,6 +3880,9 @@ impl Renderer {
             t.begin();
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        if let Some(t) = &self.gpu_timer {
+            t.frame_start(&mut encoder);
+        }
         // (v216) Quelques rangées de la carte des nuages (voir `sky`).
         self.sky.encode(&mut encoder);
         if sun_map {
@@ -4235,7 +4247,8 @@ impl Renderer {
         self.note_stall("la présentation de l'image", presented);
         self.marker(Marker::PresentEnd);
         if let Some(t) = &mut self.gpu_timer {
-            if let Some(g) = t.after_submit(&self.device) {
+            // (v316) Toutes les images relues, pas seulement la dernière (`after_submit`).
+            for g in t.after_submit(&self.device).into_iter().flatten() {
                 if self.raytracing {
                     self.rt_quality.update(g.scene);
                     // (Au journal : la portée des reflets dit à quel point la qualité a
@@ -4638,6 +4651,39 @@ fn world_group(
             },
         ],
     })
+}
+
+/// (v316) Les deux attentes de la fin d'une image (`Renderer::next_frame`), au journal :
+/// la carte qui finit l'image d'avant (elle fait la cadence), et Windows qui donne l'image
+/// suivante de la fenêtre (ses jetons : `swap_latency`).
+const WAIT_GPU: &str = "rendu : attente de la carte (image d'avant)";
+const WAIT_WINDOW: &str = "rendu : attente de la fenêtre (image suivante, Windows)";
+
+/// (v316) Jetons de la chaîne d'images de Windows : combien d'images le jeu peut avoir
+/// prises sans que Windows les ait « affichées ». Sans jeton, la prise de l'image suivante
+/// (`get_current_texture`) attend.
+///
+/// Jusqu'à la v315 : 3. Or Windows ne rend pas un jeton quand la carte a fini l'image, mais
+/// au rythme de l'écran. Relevé dans les journaux du 24 novembre, écran à 144 Hz :
+/// - fenêtre pas au premier plan : un jeton par rafraîchissement, 146 à 154 images par
+///   seconde, le jeu attend 5,2 ms par image et la carte est inoccupée 4 ms ;
+/// - au premier plan, quand la carte fait la cadence : deux images par rafraîchissement,
+///   dessinées l'une derrière l'autre, puis la carte inoccupée jusqu'au suivant. 272 images
+///   par seconde dans une scène où elle en finit une en 2,9 ms (345 par seconde) : 0,75 ms
+///   perdue par image, ni dans le travail du processeur ni dans celui de la carte.
+///
+/// 8 jetons : il en reste toujours un, cette attente disparaît, et c'est la carte qui fait
+/// la cadence. La latence ne change pas : c'est `queue_depth` qui borne les images devant
+/// la carte (2), et sans synchro verticale une image présentée remplace la précédente au
+/// lieu de faire la queue. Coût : 9 images de fenêtre en mémoire vidéo au lieu de 4.
+/// `MINELIB_CHAINE_IMAGES=3` : comme avant, pour comparer.
+fn swap_latency() -> u32 {
+    let n = std::env::var("MINELIB_CHAINE_IMAGES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(8, |n| n.clamp(1, 15));
+    log::info!("chaîne d'images de Windows : {n} image(s) d'avance au plus");
+    n
 }
 
 /// (v204) Images que la carte peut avoir devant elle quand le jeu lit les entrées (voir

@@ -24,8 +24,12 @@ pub const WATER: u32 = 9;
 /// (v200) Image des joueurs et des objets reflétés dans l'eau.
 pub const WATER_MIRROR: u32 = 10;
 const PASSES: u32 = 11;
-/// Chaque passe × (début, fin).
-const QUERIES: u32 = PASSES * 2;
+/// (v316) Début et fin de toutes les commandes de l'image, passes sans mesure comprises
+/// (`frame_start`, `resolve`) : seulement si la carte sait horodater hors d'une passe.
+const WHOLE_BEGIN: u32 = PASSES * 2;
+const WHOLE_END: u32 = PASSES * 2 + 1;
+/// Chaque passe × (début, fin), puis les deux horodatages de l'image entière.
+const QUERIES: u32 = PASSES * 2 + 2;
 /// Tampons de relecture en rotation (le GPU a quelques images d'avance).
 const RING: usize = 4;
 
@@ -50,6 +54,8 @@ pub struct GpuTimer {
     frame: u64,
     slot_frame: Vec<u64>,
     prev_end: Option<(u64, u64)>,
+    /// (v316) La carte sait horodater entre deux passes (`WHOLE_BEGIN`, `WHOLE_END`).
+    inside: bool,
 }
 
 impl GpuTimer {
@@ -92,6 +98,9 @@ impl GpuTimer {
             frame: 0,
             slot_frame: vec![0; RING],
             prev_end: None,
+            inside: device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
         })
     }
 
@@ -118,15 +127,33 @@ impl GpuTimer {
         })
     }
 
+    /// (v316) Juste après la création des commandes de l'image, avant sa première passe :
+    /// l'horodatage du début de tout son travail sur la carte (passes sans mesure comprises).
+    pub fn frame_start(&self, encoder: &mut wgpu::CommandEncoder) {
+        if self.inside && self.slot.is_some() {
+            encoder.write_timestamp(&self.set, WHOLE_BEGIN);
+        }
+    }
+
     /// Après les passes, avant `submit`.
     pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
         let Some(i) = self.slot else { return };
+        if self.inside {
+            encoder.write_timestamp(&self.set, WHOLE_END);
+        }
         encoder.resolve_query_set(&self.set, 0..QUERIES, &self.resolve, 0);
         encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback[i].0, 0, QUERIES as u64 * 8);
     }
 
-    /// Après `submit` : demande la relecture, et récupère les mesures déjà prêtes.
-    pub fn after_submit(&mut self, device: &wgpu::Device) -> Option<GpuTimes> {
+    /// Après `submit` : demande la relecture, et récupère les mesures déjà prêtes, dans
+    /// l'ordre des images.
+    ///
+    /// (v316) **Toutes** les images prêtes, et plus seulement la dernière : quand la carte en
+    /// finissait deux entre deux relectures (elle les dessinait par paires, voir
+    /// `swap_latency`), la première était jetée avec son écart, toujours le plus long des
+    /// deux. « Entre deux images » ne montrait alors que l'écart court, et la somme « du
+    /// début à la fin + entre deux images » ne faisait plus la durée d'une image.
+    pub fn after_submit(&mut self, device: &wgpu::Device) -> [Option<GpuTimes>; RING] {
         if let Some(i) = self.slot.take() {
             self.slot_marks[i] = self.marks.swap(0, Ordering::Relaxed);
             let state = self.readback[i].1.clone();
@@ -139,7 +166,8 @@ impl GpuTimer {
                 });
         }
         let _ = device.poll(wgpu::PollType::Poll);
-        let mut out = None;
+        let mut out = [None; RING];
+        let mut n = 0;
         // Dans l'ordre des images (l'écart entre deux images se calcule de l'une à l'autre).
         let mut order: Vec<usize> = (0..RING).collect();
         order.sort_by_key(|&k| self.slot_frame[k]);
@@ -181,7 +209,11 @@ impl GpuTimer {
                 if last > first && first != 0 {
                     self.prev_end = Some((frame, last));
                 }
-                out = Some(GpuTimes {
+                // (v316) Toutes les commandes de l'image, passes sans mesure comprises.
+                let (wb, we) = (t[WHOLE_BEGIN as usize], t[WHOLE_END as usize]);
+                let whole = (self.inside && wb != 0 && we > wb)
+                    .then(|| (we - wb) as f32 * self.period_ns / 1e6);
+                out[n] = Some(GpuTimes {
                     scene: ms(SCENE),
                     taa: ms(TAA),
                     present: ms(PRESENT),
@@ -201,7 +233,10 @@ impl GpuTimer {
                     // (Plus d'une demi-seconde : la fenêtre était cachée, pas une attente.)
                     gap: gap.filter(|g| *g < 500.0).unwrap_or(0.0),
                     gap_n: gap.filter(|g| *g < 500.0).map_or(0, |_| 1),
+                    whole: whole.unwrap_or(0.0),
+                    whole_n: whole.map_or(0, |_| 1),
                 });
+                n += 1;
             }
             buf.unmap();
             state.store(FREE, Ordering::Release);

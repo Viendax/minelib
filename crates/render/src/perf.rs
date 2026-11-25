@@ -35,6 +35,11 @@ pub struct GpuTimes {
     /// seulement quand les deux images ont été mesurées (`gap_n`).
     pub gap: f32,
     pub gap_n: u32,
+    /// (v316) Toutes les commandes de l'image sur la carte, de la première à la dernière,
+    /// passes sans mesure comprises (nuages, carte du soleil, miroirs, boules de lumière…) ;
+    /// compté seulement quand la carte sait horodater hors d'une passe (`whole_n`).
+    pub whole: f32,
+    pub whole_n: u32,
 }
 
 impl GpuTimes {
@@ -251,6 +256,8 @@ pub fn gpu(t: GpuTimes) {
         p.window_gpu.0.span += t.span;
         p.window_gpu.0.gap += t.gap;
         p.window_gpu.0.gap_n += t.gap_n;
+        p.window_gpu.0.whole += t.whole;
+        p.window_gpu.0.whole_n += t.whole_n;
         p.window_gpu.1 += 1;
     });
 }
@@ -372,7 +379,12 @@ pub fn frame_end() {
                 } else {
                     String::new()
                 };
-                format!(" | GPU moyen : scène {:.2}{}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2}{gap})", g.scene / k, g.extra(k), g.taa / k, g.present / k, g.span / k)
+                let whole = if g.whole_n > 0 {
+                    format!(", toutes les commandes : {:.2}", g.whole / g.whole_n as f32)
+                } else {
+                    String::new()
+                };
+                format!(" | GPU moyen : scène {:.2}{}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2}{whole}{gap})", g.scene / k, g.extra(k), g.taa / k, g.present / k, g.span / k)
             } else {
                 " | GPU : mesure indisponible".to_string()
             };
