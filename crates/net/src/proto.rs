@@ -82,6 +82,9 @@ use serde::{Deserialize, Serialize};
 /// (v328, toujours 75) La graine du monde verrouillée (`SERVER_SEED`, `Response::SeedLock`,
 /// `ProvinceSettings::seed_open`).
 /// (v329, toujours 75) `TunnelWant::turn`, `TunnelWay::turn` et `Request::TurnAt`.
+/// (v330, toujours 75) La graine d'un monde de construction n'est plus dans sa carte, et ses
+/// joueurs qui ne sont pas OP ne la reçoivent plus : `Request::Host::seed` et `terrain`,
+/// `Response::Hosted::terrain`, `Response::Joined::terrain`, `Response::SeedLock::seed`.
 pub const PROTOCOL: u32 = 75;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
@@ -361,6 +364,16 @@ pub enum Request {
         /// une (la même protection que `DeleteWorld`). Vide : aucun.
         replace: String,
         code: Option<u32>,
+        /// (v330) Monde de construction : sa graine (`seed` : celle d'un monde d'avant la
+        /// v330, ou de 64 bits, `minelib_net::graine`) et sa clé de terrain (`terrain` : la
+        /// graine d'un monde d'avant, sinon `graine::terrain_key`) ; 0 : on ne la connaît pas
+        /// (une copie gardée par un invité), et en FPS (la carte les porte). Ni l'une ni
+        /// l'autre n'est dans la carte envoyée au relais : il les garde pour ce monde (celles
+        /// de son créateur font foi), donne la clé à qui le rejoint (`Response::Joined`) ou le
+        /// réveille (`Response::Hosted`), et la graine à ses OP seulement
+        /// (`Response::SeedLock`).
+        seed: u64,
+        terrain: u64,
     },
     /// Mode FPS : cherche une partie en attente sur cette carte (compatible : personne
     /// qu'on a signalé, réputation proche) ; sans résultat, en ouvre une dont on est l'hôte.
@@ -1293,6 +1306,9 @@ pub enum Response {
     Hosted {
         room: u64,
         world: String,
+        /// (v330) La clé de terrain du monde de construction que garde le relais (0 : aucune ;
+        /// en FPS, 0) : celui qui réveille un monde dont sa copie ne l'a pas en a besoin.
+        terrain: u64,
     },
     /// (v326) Réponse à un nouveau monde quand son créateur en a déjà le nombre permis : pour
     /// l'ouvrir, son plus ancien monde endormi (`world`, nommé `name`) doit être supprimé, ce
@@ -1309,6 +1325,12 @@ pub enum Response {
         map: String,
         map_sig: [u8; 32],
         world: String,
+        /// (v330) La clé de terrain du monde de construction (0 : le relais ne la connaît pas,
+        /// ou une partie FPS : la carte la porte). Pas dans la carte téléchargée : le jeu la
+        /// garde en mémoire le temps de la partie (le terrain en vient), jamais dans ses
+        /// fichiers. D'un monde d'avant la v330, c'est sa graine ; d'un monde créé depuis, on
+        /// n'en remonte pas à la graine (`minelib_net::graine`).
+        terrain: u64,
     },
     Leaderboard {
         list: Vec<RankEntry>,
@@ -1868,6 +1890,8 @@ pub enum Response {
     SeedLock {
         locked: bool,
         allowed: bool,
+        /// (v330) La graine, à qui peut la voir et si le relais la connaît (sinon 0).
+        seed: u64,
     },
     /// (v231) Poussé : `from` nous invite dans son monde de construction `room` (`name`).
     Invited {

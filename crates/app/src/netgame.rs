@@ -5279,6 +5279,8 @@ mod tests {
             map: "plat".into(),
             map_sig: [1; 32],
             max_players: 4,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&hc, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -5537,6 +5539,8 @@ mod tests {
             map: "plat".into(),
             map_sig: [1; 32],
             max_players: 2,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&hc, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -6077,6 +6081,8 @@ mod tests {
             map: "plat".into(),
             map_sig: [1; 32],
             max_players: 10,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&hc, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,

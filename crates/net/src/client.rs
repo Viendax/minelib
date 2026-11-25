@@ -140,6 +140,10 @@ pub enum Cmd {
         map: String,
         map_sig: [u8; 32],
         max_players: u16,
+        /// (v330) Monde de construction : sa graine et sa clé de terrain (voir
+        /// `Request::Host`) ; 0 en FPS.
+        seed: u64,
+        terrain: u64,
     },
     RoomStarted(bool),
     RoomPaused(bool),
@@ -176,6 +180,8 @@ pub enum Cmd {
         map_sig: [u8; 32],
         replace: String,
         code: Option<u32>,
+        seed: u64,
+        terrain: u64,
     },
     /// (v325) Réveille le monde endormi `world` (son entrée dans la liste) : il garde son
     /// créateur, ses OP, ses bannis, sa liste blanche ; son contenu est la copie en ligne
@@ -185,6 +191,9 @@ pub enum Cmd {
         map: String,
         map_sig: [u8; 32],
         world: String,
+        /// (v330) Ce que la copie en sait (0 : rien ; le relais le garde).
+        seed: u64,
+        terrain: u64,
     },
     /// (v320) Passeur sans joueur (`minelib-relay --passeur`), à dire avant `Passeur(true)` :
     /// son adresse publique (un serveur la connaît, il n'a pas de box à interroger) et son
@@ -414,11 +423,17 @@ pub enum Event {
         fixed: bool,
     },
     /// (v328) La graine du monde du serveur de construction : verrouillée, et ce que ce
-    /// joueur peut en faire (voir `Response::SeedLock`).
+    /// joueur peut en faire (voir `Response::SeedLock`). (v330) `seed` : la graine, à qui
+    /// peut la voir (0 sinon, ou si le relais ne la connaît pas).
     SeedLock {
         locked: bool,
         allowed: bool,
+        seed: u64,
     },
+    /// (v330) Clé de terrain du monde de construction où l'on entre (avant `Hosted` ou
+    /// `Joined`) : le relais la donne, elle n'est pas dans la carte. 0 : il ne la connaît pas
+    /// (ou une partie FPS : la carte la porte).
+    WorldTerrain(u64),
     /// (v244) Foudre de Zeus légendaire du serveur (voir `Response::Zeus`).
     Zeus {
         seq: u32,
@@ -1504,7 +1519,15 @@ impl Worker {
             Response::BulkDone { id, error } => Event::BulkDone { id, error },
             Response::SetTime { hours, fixed } => Event::SetTime { hours, fixed },
             Response::SetWeather { kind, left, fixed } => Event::SetWeather { kind, left, fixed },
-            Response::SeedLock { locked, allowed } => Event::SeedLock { locked, allowed },
+            Response::SeedLock {
+                locked,
+                allowed,
+                seed,
+            } => Event::SeedLock {
+                locked,
+                allowed,
+                seed,
+            },
             Response::Zeus {
                 seq,
                 act,
@@ -2117,6 +2140,8 @@ impl Worker {
                 map,
                 map_sig,
                 max_players,
+                seed,
+                terrain,
             } => match self.request(&Request::Host {
                 kind,
                 name,
@@ -2126,9 +2151,16 @@ impl Worker {
                 wake: String::new(),
                 replace: String::new(),
                 code: None,
+                seed,
+                terrain,
             })? {
-                Response::Hosted { room, world } => {
+                Response::Hosted {
+                    room,
+                    world,
+                    terrain,
+                } => {
                     self.emit_world(world);
+                    self.emit(Event::WorldTerrain(terrain));
                     self.emit(Event::Hosted(room));
                     Ok(())
                 }
@@ -2148,6 +2180,8 @@ impl Worker {
                 map_sig,
                 replace,
                 code,
+                seed,
+                terrain,
             } => match self.request(&Request::Host {
                 kind: 1,
                 name,
@@ -2157,9 +2191,16 @@ impl Worker {
                 wake: String::new(),
                 replace,
                 code,
+                seed,
+                terrain,
             })? {
-                Response::Hosted { room, world } => {
+                Response::Hosted {
+                    room,
+                    world,
+                    terrain,
+                } => {
                     self.emit_world(world);
+                    self.emit(Event::WorldTerrain(terrain));
                     self.emit(Event::Hosted(room));
                     Ok(())
                 }
@@ -2178,6 +2219,8 @@ impl Worker {
                 map,
                 map_sig,
                 world,
+                seed,
+                terrain,
             } => match self.request(&Request::Host {
                 kind: 1,
                 name,
@@ -2187,9 +2230,16 @@ impl Worker {
                 wake: world,
                 replace: String::new(),
                 code: None,
+                seed,
+                terrain,
             })? {
-                Response::Hosted { room, world } => {
+                Response::Hosted {
+                    room,
+                    world,
+                    terrain,
+                } => {
                     self.emit_world(world);
+                    self.emit(Event::WorldTerrain(terrain));
                     self.emit(Event::Hosted(room));
                     Ok(())
                 }
@@ -2214,8 +2264,10 @@ impl Worker {
                     map,
                     map_sig,
                     world,
+                    terrain,
                 } => {
                     self.emit_world(world);
+                    self.emit(Event::WorldTerrain(terrain));
                     self.emit(Event::Joined {
                         room,
                         host,
@@ -2242,8 +2294,10 @@ impl Worker {
                         map,
                         map_sig,
                         world,
+                        terrain,
                     } => {
                         self.emit_world(world);
+                        self.emit(Event::WorldTerrain(terrain));
                         self.emit(Event::Joined {
                             room,
                             host,
@@ -2252,8 +2306,13 @@ impl Worker {
                         });
                         Ok(())
                     }
-                    Response::Hosted { room, world } => {
+                    Response::Hosted {
+                        room,
+                        world,
+                        terrain,
+                    } => {
                         self.emit_world(world);
+                        self.emit(Event::WorldTerrain(terrain));
                         self.emit(Event::Hosted(room));
                         Ok(())
                     }
@@ -2662,6 +2721,7 @@ impl Worker {
                 map,
                 map_sig,
                 world,
+                terrain: _,
             } => {
                 self.pseudo = cert.pseudo.clone();
                 self.emit_world(world);

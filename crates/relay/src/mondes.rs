@@ -361,6 +361,8 @@ mod tests {
                 map: "ile".into(),
                 map_sig: [3; 32],
                 max_players: 0,
+                seed: 0,
+                terrain: 0,
             });
             match wait(c, &|e| matches!(e, Event::Hosted(_))) {
                 Event::Hosted(r) => r,
@@ -434,6 +436,8 @@ mod tests {
                 map: "ile".into(),
                 map_sig: [5; 32],
                 world: world.into(),
+                seed: 0,
+                terrain: 0,
             });
         };
         wake(&zoe, "anamonde/ile");
@@ -533,6 +537,8 @@ mod tests {
             map: "ouvert".into(),
             map_sig: [1; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let t = Instant::now();
         loop {
@@ -617,6 +623,8 @@ mod tests {
             map: "coffre".into(),
             map_sig: [4; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         wait(&ana, &|e| matches!(e, Event::Hosted(_)));
         ana.send(Cmd::DeleteWorld(None));
@@ -694,6 +702,8 @@ mod tests {
                     map: "neuf".into(),
                     map_sig: [7; 32],
                     max_players: 0,
+                    seed: 0,
+                    terrain: 0,
                 });
             } else {
                 c.send(Cmd::HostReplacing {
@@ -702,6 +712,8 @@ mod tests {
                     map_sig: [7; 32],
                     replace: replace.into(),
                     code,
+                    seed: 0,
+                    terrain: 0,
                 });
             }
             wait(c, &|e| {

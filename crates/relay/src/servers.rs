@@ -76,6 +76,19 @@ pub struct Store {
     /// (v328) Serveurs dont la graine est déverrouillée par un OP (fichier `….graine`) ;
     /// les autres l'ont verrouillée (par défaut).
     seeds_open: std::collections::BTreeSet<String>,
+    /// (v330) Graine et clé de terrain de chaque monde (fichier `….graines`), dites par son
+    /// hôte en l'ouvrant : elles ne sont plus dans sa carte. La clé va à qui le rejoint, la
+    /// graine à ses OP seulement.
+    world_seeds: HashMap<String, WorldSeed>,
+}
+
+/// (v330) Graine d'un monde (`minelib_net::graine` ; celle d'un monde d'avant la v330 tient
+/// sur 32 bits) et clé de son terrain (d'un monde d'avant, la graine elle-même) ; 0 : pas
+/// connue.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorldSeed {
+    pub seed: u64,
+    pub terrain: u64,
 }
 
 /// (v238) Un OP nommé (pas le créateur) nomme un OP au plus une fois toutes les… et pas
@@ -197,6 +210,10 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let world_seeds = std::fs::read(path.with_extension("graines"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Self {
             path,
             servers,
@@ -213,6 +230,40 @@ impl Store {
             op_ready: HashMap::new(),
             legends,
             seeds_open,
+            world_seeds,
+        }
+    }
+
+    /// (v330) Graine et clé de terrain du monde `server` (par défaut : pas connues).
+    pub fn world_seed(&self, server: &str) -> WorldSeed {
+        self.world_seeds.get(server).copied().unwrap_or_default()
+    }
+
+    /// (v330) Ce que l'hôte `by` dit de la graine du monde en l'ouvrant ou en le réveillant :
+    /// celle de son créateur fait foi ; un autre (qui garde le dernier état) ne la donne que
+    /// si le relais ne la connaît pas. Rend ce que le relais en garde.
+    pub fn note_world_seed(&mut self, server: &str, creator: &str, by: &str, given: WorldSeed) -> WorldSeed {
+        let had = self.world_seed(server);
+        let mut now = had;
+        let trusted = by.eq_ignore_ascii_case(creator);
+        if given.terrain != 0 && (trusted || had.terrain == 0) {
+            now.terrain = given.terrain;
+            if given.seed != 0 {
+                now.seed = given.seed;
+            }
+        } else if given.seed != 0 && now.seed == 0 && given.terrain == now.terrain {
+            now.seed = given.seed;
+        }
+        if now != had {
+            self.world_seeds.insert(server.to_string(), now);
+            self.save_world_seeds();
+        }
+        now
+    }
+
+    fn save_world_seeds(&self) {
+        if let Ok(b) = postcard::to_allocvec(&self.world_seeds) {
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("graines"), &b);
         }
     }
 
@@ -442,6 +493,15 @@ impl Store {
         self.weathers.remove(server);
         self.legends.remove(server);
         self.op_ready.remove(server);
+        // (v330) Sa graine aussi, verrouillée ou non.
+        if self.world_seeds.remove(server).is_some() {
+            self.save_world_seeds();
+        }
+        if self.seeds_open.remove(server) {
+            if let Ok(b) = postcard::to_allocvec(&self.seeds_open) {
+                let _ = crate::accounts::write_atomic(&self.path.with_extension("graine"), &b);
+            }
+        }
         if self.positions.remove(server).is_some() {
             self.positions_dirty = true;
             self.save_positions_now();
@@ -936,6 +996,36 @@ mod tests {
         for ext in ["graine", "whitelist"] {
             let _ = std::fs::remove_file(path.with_extension(ext));
         }
+    }
+
+    /// (v330) Graine et clé de terrain d'un monde : celles du créateur font foi ; celui qui
+    /// garde le dernier état (sans elles) ne les efface pas, ni n'en impose d'autres ; gardées
+    /// sur le disque ; oubliées avec le monde.
+    #[test]
+    fn the_relay_keeps_the_seed_its_creator_gives() {
+        let path = std::env::temp_dir().join(format!("minelib-graines-{}", rand::random::<u32>()));
+        let mut s = Store::open(path.clone());
+        let k = key("Createur", "monde");
+        let ws = |seed, terrain| WorldSeed { seed, terrain };
+        assert_eq!(s.world_seed(&k), ws(0, 0));
+        // Un gardien sans rien, avant tout : rien.
+        assert_eq!(s.note_world_seed(&k, "Createur", "Gardien", ws(0, 0)), ws(0, 0));
+        assert_eq!(s.note_world_seed(&k, "Createur", "createur", ws(77, 99)), ws(77, 99));
+        // Le gardien (copie sans graine) : ce que garde le relais.
+        assert_eq!(s.note_world_seed(&k, "Createur", "Gardien", ws(0, 0)), ws(77, 99));
+        // Un autre n'en impose pas d'autres.
+        assert_eq!(s.note_world_seed(&k, "Createur", "Gardien", ws(5, 6)), ws(77, 99));
+        // Gardées sur le disque.
+        let mut again = Store::open(path.clone());
+        assert_eq!(again.world_seed(&k), ws(77, 99));
+        // Le créateur fait foi.
+        assert_eq!(again.note_world_seed(&k, "Createur", "Createur", ws(8, 9)), ws(8, 9));
+        again.forget(&k);
+        assert_eq!(Store::open(path.clone()).world_seed(&k), ws(0, 0));
+        for ext in ["graines", "graine", "whitelist"] {
+            let _ = std::fs::remove_file(path.with_extension(ext));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// (v229) La météo imposée : par un OP seulement, pour une durée ordinaire tirée par le

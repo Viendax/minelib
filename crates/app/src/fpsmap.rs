@@ -14,6 +14,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use minelib_net::game::{self, FpsMap, MapPackage, Zone};
+use minelib_world::gen::Generator;
 use minelib_world::lap::wrap_block;
 use minelib_world::ChunkPos;
 
@@ -260,6 +261,26 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
         .copied()
         .unwrap_or("procedural")
         .to_string();
+    // (v330) Un monde créé depuis la v330 : la carte porte sa clé de terrain (pas sa graine)
+    // avec son générateur, « procedural2:clé ». Un serveur de construction ne la met pas dans
+    // la carte qu'il envoie (`without_seed`) : le relais la donne.
+    let generator = if Generator::parse(&generator) == Generator::Procedural2 {
+        let key = kv
+            .get("cle")
+            .and_then(|v| u64::from_str_radix(v, 16).ok())
+            .filter(|k| *k != 0)
+            .or_else(|| {
+                kv.get("graine")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(minelib_net::graine::terrain_key)
+            });
+        match key {
+            Some(k) => format!("procedural2:{k:016x}"),
+            None => "procedural2".to_string(),
+        }
+    } else {
+        generator
+    };
     // Modifications : enregistrements de 14 octets, triés.
     let mut records: Vec<[u8; 14]> = Vec::new();
     if let Ok(bin) = fs::read(dir.join("edits.bin")) {
@@ -358,6 +379,36 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
     })
 }
 
+/// (v330) La carte d'un serveur de construction, telle qu'elle part au relais : sans la graine
+/// ni la clé de terrain (le relais les garde, et ne donne la graine qu'aux OP du serveur) ;
+/// et ce qu'elle en avait : (graine, clé de terrain), 0 : pas connue. D'un monde d'avant la
+/// v330, la graine fait le terrain : c'est aussi sa clé.
+pub fn without_seed(mut p: MapPackage, dir: &Path) -> (MapPackage, u64, u64) {
+    let generator = Generator::parse(&p.generator);
+    let (seed, terrain) = if generator == Generator::Procedural2 {
+        let key = p
+            .generator
+            .split_once(':')
+            .and_then(|(_, k)| u64::from_str_radix(k.trim(), 16).ok())
+            .unwrap_or(0);
+        let graine = fs::read_to_string(dir.join("level.txt"))
+            .ok()
+            .and_then(|l| {
+                l.lines()
+                    .filter_map(|l| l.split_once('='))
+                    .find(|(k, _)| k.trim() == "graine")
+                    .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        (graine, key)
+    } else {
+        (u64::from(p.seed), u64::from(p.seed))
+    };
+    p.seed = 0;
+    p.generator = generator.name().to_string();
+    (p, seed, terrain)
+}
+
 /// (v224) Préfixe des lumières de l'éditeur parmi les torches d'un paquet.
 const LIGHT_PREFIX: &str = "lumiere,";
 
@@ -432,18 +483,22 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         .take(40)
         .collect();
     // La carte vient d'un autre joueur : rien de ce qu'elle contient ne peut ajouter de
-    // lignes au fichier du monde.
-    let generator: String = p
-        .generator
+    // lignes au fichier du monde. (v330) « procedural2:clé » : la clé de terrain, à part.
+    let (gen_text, key_text) = p.generator.split_once(':').unwrap_or((&p.generator, ""));
+    let generator: String = gen_text
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
         .take(24)
         .collect();
+    let key = u64::from_str_radix(key_text.trim(), 16)
+        .ok()
+        .filter(|k| *k != 0 && Generator::parse(&generator) == Generator::Procedural2)
+        .map_or(String::new(), |k| format!("cle={k:016x}\n"));
     fs::write(
         dir.join("level.txt"),
         format!(
             "name={name}\nseed={}\ncreated=0\nlast_played=0\nclock=0\nnight=0\ngenerator={}\n\
-             gamemode=fps\nfly=0\nhealth=20\n",
+             {key}gamemode=fps\nfly=0\nhealth=20\n",
             p.seed, generator
         ),
     )?;
@@ -605,6 +660,81 @@ mod tests {
 
     /// (v232) Une carte téléchargée, copiée dans ses mondes : même carte (signature), son nom,
     /// en mode FPS, retrouvée ensuite (pas copiée deux fois).
+    /// Tous les fichiers d'un dossier, mis bout à bout (pour y chercher une graine).
+    fn all_bytes(dir: &Path) -> Vec<u8> {
+        let mut out = Vec::new();
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            if e.path().is_dir() {
+                out.extend(all_bytes(&e.path()));
+            } else {
+                out.extend(fs::read(e.path()).unwrap());
+            }
+        }
+        out
+    }
+
+    fn contains(hay: &[u8], needle: &str) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    /// (v330) La carte d'un serveur de construction part sans la graine ni la clé de terrain
+    /// (le relais les garde) : la copie de qui le rejoint n'en a rien, ni en clair ni en
+    /// hexadécimal ; avec la clé que donne le relais, son terrain est celui du monde. Un monde
+    /// d'avant la v330 : sa graine fait le terrain, c'est aussi la clé. Une carte FPS, elle,
+    /// porte sa clé de terrain (pas sa graine).
+    #[test]
+    fn a_server_map_carries_no_seed() {
+        use minelib_world::gen::Terrain;
+        let root = std::env::temp_dir().join(format!("minelib-sans-graine-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let graine = 9_876_543_210_123_456_789u64;
+        let dir = crate::save::create_world(&root.join("src"), "Secret", graine).unwrap();
+        let key = minelib_net::graine::terrain_key(graine);
+        // Carte FPS : la clé, pas la graine.
+        let fps = package(&dir).unwrap();
+        assert_eq!(fps.generator, format!("procedural2:{key:016x}"));
+        let fps_copy = unpack(&root.join("maps"), "Secret", &fps.to_bytes()).unwrap();
+        let (meta, world) = crate::save::load_world(&fps_copy).map(|(d, w)| (d.meta, w)).unwrap();
+        assert_eq!((meta.graine, meta.key), (None, Some(key)));
+        assert_eq!(world.terrain, Terrain::v2(key));
+        assert!(!contains(&all_bytes(&fps_copy), &graine.to_string()));
+        // Serveur de construction : ni l'une ni l'autre.
+        let (p, seed, terrain) = without_seed(package(&dir).unwrap(), &dir);
+        assert_eq!((seed, terrain), (graine, key));
+        assert_eq!((p.seed, p.generator.as_str()), (0, "procedural2"));
+        let copy = unpack(&root.join("maps"), "Secret", &p.to_bytes()).unwrap();
+        let bytes = all_bytes(&copy);
+        for secret in [graine.to_string(), format!("{key:016x}"), key.to_string()] {
+            assert!(!contains(&bytes, &secret), "{secret} dans la copie");
+        }
+        // La copie se reconnaît (même signature que la carte envoyée), sans clé.
+        assert_eq!(package(&copy).unwrap().signature(), p.signature());
+        let (meta, mut guest) = crate::save::load_world(&copy).map(|(d, w)| (d.meta, w)).unwrap();
+        assert_eq!((meta.seed, meta.graine, meta.key), (0, None, None));
+        // Avec la clé du relais : le terrain et la météo du monde du créateur.
+        let (_, mut own) = crate::save::load_world(&dir).unwrap();
+        crate::session::give_terrain(&mut guest, terrain);
+        assert_eq!((guest.terrain, guest.seed), (own.terrain, own.seed));
+        let at = ChunkPos { x: 3, z: -7 };
+        own.ensure_chunk(at);
+        guest.ensure_chunk(at);
+        for y in (0..300).step_by(3) {
+            assert_eq!(own.get(53, y, -110), guest.get(53, y, -110), "y {y}");
+        }
+        // Monde d'avant la v330 (graine de 32 bits, écrite à la main).
+        let old = root.join("src").join("ancien");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("level.txt"), "name=Ancien\nseed=3141592653\ngenerator=procedural\n").unwrap();
+        let (p, seed, terrain) = without_seed(package(&old).unwrap(), &old);
+        assert_eq!((seed, terrain, p.seed), (3_141_592_653, 3_141_592_653, 0));
+        let copy = unpack(&root.join("maps"), "Ancien", &p.to_bytes()).unwrap();
+        assert!(!contains(&all_bytes(&copy), "3141592653"));
+        let (_, mut guest) = crate::save::load_world(&copy).unwrap();
+        crate::session::give_terrain(&mut guest, terrain);
+        assert_eq!(guest.terrain, minelib_world::gen::Terrain::v1(3_141_592_653));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_downloaded_map_is_copied_once_into_the_solo_worlds() {
         let root = std::env::temp_dir().join(format!("minelib-copie-{}", std::process::id()));

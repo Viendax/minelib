@@ -262,6 +262,10 @@ struct Hosting {
     /// (v326) Le monde endormi supprimé pour faire place à celui-ci (sa copie sur ce PC est
     /// effacée une fois celui-ci ouvert).
     replaced: Option<String>,
+    /// (v330) Réveil d'un monde dont la copie n'a pas la clé de terrain (gardée par un invité
+    /// devenu propriétaire) : la partie ne s'ouvre qu'une fois le monde réveillé, avec la clé
+    /// que donne le relais.
+    deferred: bool,
 }
 
 /// (v326) Comment ouvrir un monde en ligne.
@@ -344,6 +348,9 @@ struct Game {
     world_key: Option<(String, String)>,
     /// (v325) Ouverture (ou réveil) d'un monde en ligne envoyée, pas encore confirmée.
     hosting: Option<Hosting>,
+    /// (v330) Clé de terrain du monde de construction où l'on entre, donnée par le relais
+    /// (`Event::WorldTerrain`, avant `Hosted` ou `Joined`) : elle n'est pas dans sa carte.
+    world_terrain: Option<u64>,
     /// (v325) Réveil d'un monde par son créateur alors qu'un autre en garde le dernier état :
     /// le deuxième clic (même monde, peu après) le confirme.
     wake_confirm: Option<(String, f32)>,
@@ -583,6 +590,7 @@ impl Game {
             pending_build: None,
             world_key: None,
             hosting: None,
+            world_terrain: None,
             wake_confirm: None,
             limit_ask: None,
             direct_confirm: false,
@@ -641,6 +649,7 @@ impl Game {
                 view_distance,
                 far_origin: true,
                 origin: None,
+                terrain: None,
             },
             ui: Ui::default(),
             sysmon: SysMonitor::start(),
@@ -857,6 +866,12 @@ impl Game {
     /// depuis l'origine de sa carte (v322 ; avant, depuis le centre du monde : voir
     /// `SessionConfig::far_origin`).
     fn play_with(&mut self, dir: PathBuf, far_origin: bool) {
+        self.play_with_terrain(dir, far_origin, None);
+    }
+
+    /// (v330) `play_with`, avec la clé de terrain donnée par le relais d'un serveur de
+    /// construction (sa copie du monde ne l'a pas).
+    fn play_with_terrain(&mut self, dir: PathBuf, far_origin: bool, terrain: Option<u64>) {
         // Nouveau monde : rien de l'ancien ne doit rester à l'écran.
         self.session = None;
         self.played = true;
@@ -871,6 +886,7 @@ impl Game {
             far_origin,
             // (v322) Rouverte pour une partie FPS : depuis son origine (`rebase_world`).
             origin: self.next_origin.take(),
+            terrain,
             ..self.config
         };
         match Session::open(dir, config) {
@@ -1067,6 +1083,8 @@ impl Game {
         // sait : la partie rouverte les reprend (on ne quitte pas le serveur).
         let carry = s.take_carry();
         let online = carry.online();
+        // (v330) La clé de terrain que le relais avait donnée (pas dans la copie du monde).
+        let terrain = s.terrain_given;
         drop(s);
         log::info!(
             "loin de l'origine de la partie : rouverte depuis une origine plus proche (joueur en {:.1} / {:.1} / {:.1}){}",
@@ -1075,7 +1093,7 @@ impl Game {
             place[2],
             if online { ", sans quitter le serveur" } else { "" }
         );
-        self.play_with(dir, true);
+        self.play_with_terrain(dir, true, terrain);
         if let Some(n) = &mut self.session {
             n.put_carry(carry);
             // (v322) Rouverte pour la partie FPS du serveur : on y entre.
@@ -1423,7 +1441,7 @@ impl Game {
             .enumerate()
         {
             let y = list_y + 2.0 * s + i as f32 * row_h;
-            let detail = format!("graine {}", w.meta.seed);
+            let detail = format!("graine {}", w.meta.seed_label());
             if c.list_row(
                 list_x + 2.0 * s,
                 y,
@@ -1576,6 +1594,8 @@ impl Game {
                 continue;
             }
             match &e {
+                // (v330) La clé de terrain du monde où l'on entre (pas dans sa carte).
+                Event::WorldTerrain(t) => self.world_terrain = (*t != 0).then_some(*t),
                 // (v325) Le monde de construction où l'on entre : celui qu'on ouvre ou réveille
                 // est gardé, dès maintenant, par la copie où l'on joue.
                 Event::World(key) => {
@@ -1641,7 +1661,31 @@ impl Game {
                     self.limit_ask = None;
                     // (v325) Monde ouvert (ou réveillé) : sa météo (celle qu'un OP y a
                     // imposée, gardée par le relais), et le monde pour ceux qui le rejoignent.
-                    if let Some(h) = self.hosting.take() {
+                    let mut hosting = self.hosting.take();
+                    // (v330) Réveillé depuis une copie sans clé de terrain : la partie s'ouvre
+                    // maintenant, avec celle du relais ; s'il ne l'a pas, on n'y reste pas.
+                    if let Some(h) = hosting.as_ref().filter(|h| h.deferred) {
+                        let link = self.accounts.link.clone();
+                        match (self.world_terrain, link) {
+                            (Some(t), Some(link)) => {
+                                self.play_with_terrain(h.dir.clone(), true, Some(t));
+                                self.attach_host_net(link);
+                            }
+                            _ => {}
+                        }
+                        if self.session.is_none() {
+                            hosting = None;
+                            self.current_room = None;
+                            self.world_key = None;
+                            self.accounts.room(Cmd::Leave);
+                            self.notify(
+                                "Le serveur ne connaît pas la graine de ce monde : son créateur \
+                                 doit le réveiller."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    if let Some(h) = hosting {
                         self.accounts.room(Cmd::ServerAdmin {
                             action: minelib_net::proto::SERVER_WEATHER,
                             pseudo: String::new(),
@@ -3021,14 +3065,32 @@ impl Game {
             self.notify("Monde illisible.".to_string());
             return;
         };
+        // (v330) La carte part sans la graine ni la clé de terrain : le relais les garde (il
+        // ne donne la clé qu'aux joueurs, et la graine qu'aux OP du serveur).
+        let (p, seed, terrain) = fpsmap::without_seed(p, &dir);
         let sig = p.signature();
         self.world_key = None;
         self.wake_confirm = None;
-        self.play_with(dir.clone(), true);
-        if self.session.is_none() {
-            // (Monde illisible : rien n'est ouvert en ligne.)
-            drop_fresh(&self.paths.root, &dir);
-            return;
+        self.world_terrain = None;
+        // (v330) Une copie sans clé de terrain (gardée par un invité devenu propriétaire) : la
+        // partie ne s'ouvre qu'une fois le monde réveillé, avec la clé du relais
+        // (`Event::Hosted`).
+        let deferred = terrain == 0 && matches!(how, Open::Wake { .. });
+        if !deferred {
+            self.play_with(dir.clone(), true);
+            if self.session.is_none() {
+                // (Monde illisible : rien n'est ouvert en ligne.)
+                drop_fresh(&self.paths.root, &dir);
+                return;
+            }
+        } else {
+            // (Ce que `play_with` fait d'abord : plus garant, avant d'entrer dans le monde.)
+            if self.garant.take().is_some() {
+                self.accounts.room(minelib_net::client::Cmd::Leave);
+            }
+            self.announce_garant(false);
+            self.session = None;
+            self.clear_meshes = true;
         }
         self.hosting = Some(Hosting {
             dir,
@@ -3038,19 +3100,11 @@ impl Game {
                 Open::Replacing { world, .. } => Some(world.clone()),
                 _ => None,
             },
+            deferred,
         });
         let pseudo = self.accounts.pseudo();
-        if let Some(s) = &mut self.session {
-            if s.game.mode == save::GameMode::Fps {
-                s.game.mode = save::GameMode::Creative;
-            }
-            s.voice = Some(voice::Voice::new(link.clone()));
-            let mut b = buildnet::BuildNet::new(link, pseudo.clone(), true);
-            b.set_node_dir(self.accounts.relay_dir());
-            b.set_identity(self.accounts.identity.clone());
-            // (v318) La partie compte depuis cette origine (loin du centre, proche du joueur).
-            b.set_origin(s.world.origin_blocks());
-            s.build = Some(b);
+        if !deferred {
+            self.attach_host_net(link);
         }
         self.accounts.room(match how {
             Open::Wake { title, world } => minelib_net::client::Cmd::WakeWorld {
@@ -3058,6 +3112,8 @@ impl Game {
                 map: name.clone(),
                 map_sig: sig,
                 world,
+                seed,
+                terrain,
             },
             Open::New => minelib_net::client::Cmd::Host {
                 kind: 1,
@@ -3065,6 +3121,8 @@ impl Game {
                 map: name.clone(),
                 map_sig: sig,
                 max_players: 0,
+                seed,
+                terrain,
             },
             Open::Replacing { world, code } => minelib_net::client::Cmd::HostReplacing {
                 name: format!("{name} ({pseudo})"),
@@ -3072,10 +3130,30 @@ impl Game {
                 map_sig: sig,
                 replace: world,
                 code,
+                seed,
+                terrain,
             },
         });
         // (v229) La météo du serveur, et le monde (pour ceux qui le rejoignent, pas pour la
         // liste des cartes) : une fois ouvert (`Event::Hosted`).
+    }
+
+    /// (v325) La partie ouverte (ou réveillée) en ligne dont on est l'hôte : son mode, la voix
+    /// et le réseau du monde de construction.
+    fn attach_host_net(&mut self, link: std::sync::mpsc::Sender<minelib_net::transport::Inbound>) {
+        let pseudo = self.accounts.pseudo();
+        if let Some(s) = &mut self.session {
+            if s.game.mode == save::GameMode::Fps {
+                s.game.mode = save::GameMode::Creative;
+            }
+            s.voice = Some(voice::Voice::new(link.clone()));
+            let mut b = buildnet::BuildNet::new(link, pseudo, true);
+            b.set_node_dir(self.accounts.relay_dir());
+            b.set_identity(self.accounts.identity.clone());
+            // (v318) La partie compte depuis cette origine (loin du centre, proche du joueur).
+            b.set_origin(s.world.origin_blocks());
+            s.build = Some(b);
+        }
     }
 
     /// Monde de construction rejoint.
@@ -3101,7 +3179,8 @@ impl Game {
                 }
             }
         };
-        self.play_with(dir, true);
+        // (v330) La clé de terrain que le relais vient de donner (pas dans la carte).
+        self.play_with_terrain(dir, true, self.world_terrain);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Creative;
@@ -3319,7 +3398,7 @@ impl Game {
             } else {
                 format!(
                     "graine {}   -   dernière partie {}",
-                    w.meta.seed,
+                    w.meta.seed_label(),
                     save::format_date(w.meta.last_played)
                 )
             };

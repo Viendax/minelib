@@ -3338,8 +3338,23 @@ fn push_seed_lock(st: &State, server: &str, creator: &str, id: u64) {
         &Response::SeedLock {
             locked: st.servers.seed_locked(server),
             allowed,
+            // (v330) La graine elle-même, à qui peut la voir seulement.
+            seed: if allowed {
+                st.servers.world_seed(server).seed
+            } else {
+                0
+            },
         },
     );
+}
+
+/// (v330) Ce que l'hôte `pseudo` du monde de construction `rid` dit de sa graine en
+/// l'ouvrant (voir `servers::Store::note_world_seed`) ; rend ce que le relais en garde.
+fn note_world_seed(st: &mut State, rid: u64, pseudo: &str, given: servers::WorldSeed) -> servers::WorldSeed {
+    let Some((server, creator)) = st.rooms.get(&rid).map(|r| (r.server.clone(), r.creator.clone())) else {
+        return servers::WorldSeed::default();
+    };
+    st.servers.note_world_seed(&server, &creator, pseudo, given)
 }
 
 /// (v224) Demande de lumière de l'éditeur (`BuildMsg::LightPut`), à l'arbitre de son chunk
@@ -5030,12 +5045,14 @@ fn take_over_join(st: &mut State, id: u64, pseudo: &str, key: [u8; 32]) -> Respo
         "relais de secours : monde « {} » repris (partie {rid})",
         info.name
     );
+    let terrain = st.servers.world_seed(&info.server).terrain;
     Response::Joined {
         room: rid,
         host: pseudo.to_string(),
         map: info.map,
         map_sig: info.map_sig,
         world: info.server,
+        terrain,
     }
 }
 
@@ -6850,12 +6867,19 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
         }
     }
     let world = world_of(st, room);
+    // (v330) La clé de terrain d'un monde de construction (pas dans sa carte).
+    let terrain = st
+        .rooms
+        .get(&room)
+        .filter(|r| r.kind == 1)
+        .map_or(0, |r| st.servers.world_seed(&r.server).terrain);
     Response::Joined {
         room,
         host: host_pseudo,
         map,
         map_sig,
         world,
+        terrain,
     }
 }
 
@@ -7219,6 +7243,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             wake,
             replace,
             code,
+            seed,
+            terrain,
         } => {
             // (v311) Pas d'ouvertures en rafale (la liste des parties et des mondes ne se
             // remplit pas à la chaîne). (v326) Comptée une fois ouverte seulement.
@@ -7275,9 +7301,18 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             st.worlds.note_open(pseudo);
             let rid = open_room(st, id, pseudo, kind, name, map, map_sig, max_players, ident);
+            // (v330) Graine et clé de terrain d'un monde de construction : gardées ici, plus
+            // dans sa carte. Celui qui le réveille sans les avoir (une copie gardée par un
+            // invité) reçoit la clé.
+            let terrain = if kind == 1 {
+                note_world_seed(st, rid, pseudo, servers::WorldSeed { seed, terrain }).terrain
+            } else {
+                0
+            };
             Response::Hosted {
                 room: rid,
                 world: world_of(st, rid),
+                terrain,
             }
         }
         Request::DeleteWorld { code } => {
@@ -7431,6 +7466,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     Response::Hosted {
                         room: rid,
                         world: String::new(),
+                        terrain: 0,
                     }
                 }
             };
@@ -11389,6 +11425,8 @@ mod tests {
             map: "de_dust".into(),
             map_sig: [7; 32],
             max_players: 10,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&host, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -11664,6 +11702,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -11802,6 +11842,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             world: "alice/monde".into(),
+            seed: 0,
+            terrain: 0,
         });
         let room2 = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -12035,6 +12077,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [3; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&creator, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -12282,6 +12326,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [5; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&host, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -12375,6 +12421,8 @@ mod tests {
             map: "survie".into(),
             map_sig: [3; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -12499,6 +12547,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [9; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -12774,6 +12824,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [4; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -12953,6 +13005,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -13099,6 +13153,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -13181,6 +13237,8 @@ mod tests {
     /// apprend ce qui vaut pour lui (le créateur et les OP la voient, les autres non) quand il
     /// le demande, quand un OP la déverrouille ou la verrouille (pour tous), et quand il devient
     /// OP ou ne l'est plus. Un joueur qui n'est pas OP ne la change pas.
+    /// (v330) Le relais garde la graine et la clé de terrain que le créateur lui dit : qui
+    /// rejoint reçoit la clé, et la graine seulement s'il peut la voir.
     #[test]
     fn the_seed_lock_is_said_to_each_player_of_a_server() {
         let dir = std::env::temp_dir().join(format!("minelib-graine-{}", rand::random::<u32>()));
@@ -13203,9 +13261,19 @@ mod tests {
             c
         };
         let lock_of = |c: &Client| match wait(c, |e| matches!(e, Event::SeedLock { .. })) {
-            Event::SeedLock { locked, allowed } => (locked, allowed),
+            Event::SeedLock {
+                locked,
+                allowed,
+                seed,
+            } => (locked, allowed, seed),
             _ => unreachable!(),
         };
+        let terrain_of = |c: &Client| match wait(c, |e| matches!(e, Event::WorldTerrain(_))) {
+            Event::WorldTerrain(t) => t,
+            _ => unreachable!(),
+        };
+        // (v330) La graine (64 bits) et la clé de terrain du monde, dites par son créateur.
+        let (graine, cle) = (0x1234_5678_9abc_def0u64, 0x0fed_cba9_8765_4321u64);
         let admin = |c: &Client, action: u8, pseudo: &str, reason: &str| {
             c.send(Cmd::ServerAdmin {
                 action,
@@ -13220,33 +13288,38 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: graine,
+            terrain: cle,
         });
+        assert_eq!(terrain_of(&createur), cle);
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
             _ => unreachable!(),
         };
         let eve = login("Eve");
         eve.send(Cmd::Join(room));
+        // (v330) Qui rejoint reçoit la clé de terrain (pas la graine).
+        assert_eq!(terrain_of(&eve), cle);
         wait(&eve, |e| matches!(e, Event::Joined { .. }));
-        // Demandée : verrouillée ; le créateur la voit, Eve non.
+        // Demandée : verrouillée ; le créateur la voit (et la reçoit), Eve non.
         admin(&createur, proto::SERVER_SEED, "", "");
-        assert_eq!(lock_of(&createur), (true, true));
+        assert_eq!(lock_of(&createur), (true, true, graine));
         admin(&eve, proto::SERVER_SEED, "", "");
-        assert_eq!(lock_of(&eve), (true, false));
+        assert_eq!(lock_of(&eve), (true, false, 0));
         // Eve n'est pas OP : refusé.
         admin(&eve, proto::SERVER_SEED, "", "unlock");
         assert!(wait_error(&eve).contains("OP"));
         // Le créateur la déverrouille : tous l'apprennent ; puis la verrouille.
         admin(&createur, proto::SERVER_SEED, "", "unlock");
-        assert_eq!(lock_of(&eve), (false, true));
-        assert_eq!(lock_of(&createur), (false, true));
+        assert_eq!(lock_of(&eve), (false, true, graine));
+        assert_eq!(lock_of(&createur), (false, true, graine));
         admin(&createur, proto::SERVER_SEED, "", "lock");
-        assert_eq!(lock_of(&eve), (true, false));
+        assert_eq!(lock_of(&eve), (true, false, 0));
         // Eve devient OP : elle la voit ; puis ne l'est plus.
         admin(&createur, proto::SERVER_OP, "Eve", "");
-        assert_eq!(lock_of(&eve), (true, true));
+        assert_eq!(lock_of(&eve), (true, true, graine));
         admin(&createur, proto::SERVER_DEOP, "Eve", "");
-        assert_eq!(lock_of(&eve), (true, false));
+        assert_eq!(lock_of(&eve), (true, false, 0));
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13343,6 +13416,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -13513,6 +13588,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -13642,6 +13719,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -13788,6 +13867,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -14016,6 +14097,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [6; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -14227,6 +14310,8 @@ mod tests {
             map: "monde".into(),
             map_sig: [5; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -15563,6 +15648,8 @@ mod tests {
                 wake: String::new(),
                 replace: String::new(),
                 code: None,
+                seed: 0,
+                terrain: 0,
             },
         ) {
             Some(Response::Hosted { room, .. }) => room,

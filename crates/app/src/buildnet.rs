@@ -3959,6 +3959,8 @@ mod tests {
             map: "autre".into(),
             map_sig: [8; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         ailleurs.wait(|e| matches!(e, Event::Hosted(_)));
         let mut garant = Bot::new(&addr, h.public, "Garant", true);
@@ -3974,6 +3976,8 @@ mod tests {
                     map: format!("encore{k}"),
                     map_sig: [7 + k as u8; 32],
                     max_players: 0,
+                    seed: 0,
+                    terrain: 0,
                 });
                 w.wait(|e| matches!(e, Event::Hosted(_)));
                 let g = Bot::new(&addr, h.public, &name, true);
@@ -3994,6 +3998,8 @@ mod tests {
             map: "essai".into(),
             map_sig: [7; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let mut room = None;
         let t = Instant::now();
@@ -4373,6 +4379,8 @@ mod tests {
                 map: format!("autre{map}"),
                 map_sig: [map; 32],
                 max_players: 0,
+                seed: 0,
+                terrain: 0,
             });
             a.wait(|e| matches!(e, Event::Hosted(_)));
             ailleurs.push(a);
@@ -4395,6 +4403,8 @@ mod tests {
             map: "essai".into(),
             map_sig: [7; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let mut room = None;
         let t = Instant::now();
@@ -4800,6 +4810,8 @@ mod tests {
             map: "loin".into(),
             map_sig: [9; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let mut room = None;
         let t = Instant::now();
@@ -5235,6 +5247,8 @@ mod tests {
                     map: format!("ailleurs{k}"),
                     map_sig: [20 + k as u8; 32],
                     max_players: 0,
+                    seed: 0,
+                    terrain: 0,
                 });
                 w.wait(|e| matches!(e, Event::Hosted(_)));
                 let g = Bot::new(&addr, h.public, name, true);
@@ -5251,6 +5265,8 @@ mod tests {
             map: "provinces".into(),
             map_sig: [9; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let mut room = None;
         let t = Instant::now();
@@ -7745,6 +7761,8 @@ mod tests {
             map: "essai".into(),
             map_sig: [7; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let mut room = None;
         let t = Instant::now();
@@ -7812,6 +7830,8 @@ mod tests {
             map: "essai".into(),
             map_sig: [7; 32],
             max_players: 0,
+            seed: 0,
+            terrain: 0,
         });
         let mut room = None;
         let t = Instant::now();

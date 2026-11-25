@@ -27,9 +27,42 @@ use crate::mcimport;
 #[derive(Clone, Debug)]
 pub struct WorldMeta {
     pub name: String,
+    /// Graine d'un monde d'avant la v330 (elle fait son terrain) ; d'un monde créé depuis, sa
+    /// graine publique (météo, éclairs : `minelib_net::graine::public_seed`). (v330) 0 dans
+    /// la copie d'un serveur de construction : le relais la donne, elle n'est pas écrite.
     pub seed: u32,
+    /// (v330) Graine d'un monde créé depuis la v330 (64 bits, `graine=` dans `level.txt`) ;
+    /// absente d'une carte reçue d'un autre joueur.
+    pub graine: Option<u64>,
+    /// (v330) Clé de terrain d'un monde `procedural2` (`cle=`, en hexadécimal) : gardée pour
+    /// ne pas refaire le calcul lent de `graine` à chaque ouverture ; une carte FPS la porte
+    /// (pas sa graine). Absente de la copie d'un serveur de construction.
+    pub key: Option<u64>,
     pub created: u64,
     pub last_played: u64,
+}
+
+impl WorldMeta {
+    /// (v330) La graine dans la liste des mondes : celle d'un monde créé depuis la v330, sinon
+    /// celle d'un monde d'avant ; « — » pour une carte qui n'a que sa clé de terrain.
+    pub fn seed_label(&self) -> String {
+        match (self.graine, self.key) {
+            (Some(g), _) => g.to_string(),
+            (None, Some(_)) => "—".to_string(),
+            (None, None) => self.seed.to_string(),
+        }
+    }
+
+    /// (v330) La graine à montrer (`/seed`, écran F3, liste des mondes) : celle d'un monde
+    /// créé depuis la v330, sinon celle d'un monde d'avant ; `None` : pas dans ce monde (une
+    /// carte reçue d'un autre joueur).
+    pub fn shown_seed(&self, generator: Generator) -> Option<u64> {
+        match self.graine {
+            Some(g) => Some(g),
+            None if generator == Generator::Procedural2 || self.seed == 0 => None,
+            None => Some(self.seed as u64),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -161,19 +194,12 @@ pub fn now() -> u64 {
 }
 
 /// Graine à partir du texte saisi : nombre tel quel, sinon hachage du texte, vide = aléatoire.
-pub fn parse_seed(text: &str) -> u32 {
-    let t = text.trim();
-    if t.is_empty() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(1, |d| d.as_nanos() as u64);
-        return (n ^ (n >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15) as u32;
-    }
-    if let Ok(v) = t.parse::<i64>() {
-        return v as u32;
-    }
-    t.bytes()
-        .fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619))
+/// (v330) Sur 64 bits (`minelib_net::graine::parse`).
+pub fn parse_seed(text: &str) -> u64 {
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| d.as_nanos() as u64);
+    minelib_net::graine::parse(text, n ^ u64::from(std::process::id()).rotate_left(32))
 }
 
 /// Date « jj/mm/aaaa hh:mm » (UTC) depuis un horodatage Unix.
@@ -219,6 +245,8 @@ pub fn list_worlds(saves: &Path) -> Vec<WorldSummary> {
                         |l| l.name.clone(),
                     ),
                     seed: lvl.as_ref().map_or(0, |l| l.seed as u32),
+                    graine: None,
+                    key: None,
                     created: 0,
                     last_played: lvl.as_ref().map_or(0, |l| l.last_played_s),
                 };
@@ -244,13 +272,50 @@ fn parse_meta(text: &str, fallback: &str) -> WorldMeta {
             .cloned()
             .unwrap_or_else(|| fallback.to_owned()),
         seed: kv.get("seed").and_then(|v| v.parse().ok()).unwrap_or(0),
+        graine: kv.get("graine").and_then(|v| v.parse().ok()),
+        key: kv
+            .get("cle")
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            .filter(|k| *k != 0),
         created: num("created"),
         last_played: num("last_played"),
     }
 }
 
 /// Crée le dossier d'un nouveau monde (nom de dossier dérivé du nom, rendu unique).
-pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
+/// (v330) Un monde créé depuis la v330 a une graine de 64 bits (`graine`) : son terrain vient
+/// de sa clé (`minelib_net::graine::terrain_key`, calculée ici une fois et gardée), sa météo
+/// de sa graine publique.
+pub fn create_world(saves: &Path, name: &str, graine: u64) -> Result<PathBuf> {
+    let key = minelib_net::graine::terrain_key(graine);
+    create_world_as(
+        saves,
+        name,
+        WorldSeeds {
+            seed: minelib_net::graine::public_seed(key),
+            graine: Some(graine),
+            key: Some(key),
+        },
+        Generator::Procedural2,
+    )
+}
+
+/// (v330) Graine d'un monde à créer (voir `WorldMeta`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorldSeeds {
+    pub seed: u32,
+    pub graine: Option<u64>,
+    pub key: Option<u64>,
+}
+
+/// (v330) Crée un monde avec ces graines et ce générateur (une copie : celle de « Télécharger
+/// la carte », d'un monde d'avant la v330 ou non).
+pub fn create_world_as(
+    saves: &Path,
+    name: &str,
+    seeds: WorldSeeds,
+    generator: Generator,
+) -> Result<PathBuf> {
     let base: String = name
         .chars()
         .map(|c| {
@@ -278,7 +343,9 @@ pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
     let t = now();
     let meta = WorldMeta {
         name: name.trim().to_owned(),
-        seed,
+        seed: seeds.seed,
+        graine: seeds.graine,
+        key: seeds.key,
         created: t,
         last_played: t,
     };
@@ -287,7 +354,7 @@ pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
         &SaveData {
             game: GameState::default(),
             meta,
-            generator: Generator::Procedural,
+            generator,
             player: None,
             clock: 0.0,
             time: crate::daytime::START_HOUR,
@@ -350,6 +417,13 @@ fn write_level(dir: &Path, d: &SaveData) -> Result<()> {
         "name={}\nseed={}\ncreated={}\nlast_played={}\n",
         d.meta.name, d.meta.seed, d.meta.created, d.meta.last_played
     );
+    // (v330) La graine d'un monde créé depuis la v330, et sa clé de terrain.
+    if let Some(g) = d.meta.graine {
+        s += &format!("graine={g}\n");
+    }
+    if let Some(k) = d.meta.key {
+        s += &format!("cle={k:016x}\n");
+    }
     s += &format!(
         "clock={}\nheure={}\nheure_fixe={}\ngenerator={}\n",
         d.clock,
@@ -557,7 +631,7 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
         }
         inv
     });
-    let data = SaveData {
+    let mut data = SaveData {
         game: GameState {
             mode: kv
                 .get("gamemode")
@@ -614,6 +688,20 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
 
     let mut world = World::new(data.meta.seed);
     world.generator = data.generator;
+    // (v330) Un monde créé depuis la v330 : le terrain de sa clé (gardée, sinon tirée de sa
+    // graine). Sans l'une ni l'autre (la copie d'un serveur de construction), la partie la
+    // reçoit du relais (`SessionConfig::terrain`).
+    if data.generator == Generator::Procedural2 {
+        if let Some(k) = data
+            .meta
+            .key
+            .or_else(|| data.meta.graine.map(minelib_net::graine::terrain_key))
+        {
+            world.terrain = minelib_world::gen::Terrain::v2(k);
+            // (Gardée avec le monde à son prochain enregistrement : pas recalculée.)
+            data.meta.key = Some(k);
+        }
+    }
     world.clock = data.clock;
     if let Ok(bin) = fs::read(dir.join("edits.bin")) {
         let n = bin
@@ -777,6 +865,8 @@ fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
         meta: WorldMeta {
             name: imp.level.name.clone(),
             seed,
+            graine: None,
+            key: None,
             created: t,
             last_played: imp.level.last_played_s,
         },
@@ -821,7 +911,15 @@ mod tests {
         assert_eq!(list_worlds(&dir).len(), 2);
 
         let (mut data, mut world) = load_world(&w1).unwrap();
-        assert_eq!(data.meta.seed, 42);
+        // (v330) Un monde neuf : graine de 64 bits, terrain de sa clé, graine publique tirée
+        // de la clé (météo).
+        let key = minelib_net::graine::terrain_key(42);
+        assert_eq!(data.meta.graine, Some(42));
+        assert_eq!(data.meta.key, Some(key));
+        assert_eq!(data.meta.seed, minelib_net::graine::public_seed(key));
+        assert_eq!(data.generator, Generator::Procedural2);
+        assert_eq!(world.terrain, minelib_world::gen::Terrain::v2(key));
+        assert_eq!(data.meta.shown_seed(data.generator), Some(42));
         assert_eq!(data.meta.name, "Mon monde !");
         world.ensure_chunk(ChunkPos { x: 0, z: 0 });
         world.set(3, 150, 4, BlockId::PLANKS);
@@ -848,6 +946,8 @@ mod tests {
         save_world(&w1, &data, &world).unwrap();
 
         let (d2, mut w) = load_world(&w1).unwrap();
+        assert_eq!((d2.meta.graine, d2.meta.key), (Some(42), Some(key)));
+        assert_eq!(w.terrain, world.terrain);
         w.ensure_chunk(ChunkPos { x: 0, z: 0 });
         assert_eq!(w.get(3, 150, 4), BlockId::PLANKS);
         assert_eq!(w.get(5, 150, 5), BlockId::TORCH);

@@ -446,6 +446,23 @@ pub struct SessionConfig {
     /// partie FPS du serveur de construction), quand le passage en mode FPS rouvre la partie
     /// depuis elle (`Session::wants_rebase`, `Game::rebase_world`).
     pub origin: Option<ChunkPos>,
+    /// (v330) Clé de terrain donnée par le relais d'un serveur de construction (graine d'un
+    /// monde d'avant la v330, ou `minelib_net::graine::terrain_key`) : la copie du monde ne
+    /// l'a pas. Gardée en mémoire seulement (jamais écrite dans ses fichiers).
+    pub terrain: Option<u64>,
+}
+
+/// (v330) Le terrain (et la graine publique : météo, éclairs) d'un monde de construction dont
+/// la copie n'a pas la graine, à partir de la clé que donne le relais : d'un monde
+/// `procedural2`, sa clé de terrain ; d'un monde d'avant la v330, sa graine.
+pub(crate) fn give_terrain(world: &mut World, key: u64) {
+    if world.generator == minelib_world::gen::Generator::Procedural2 {
+        world.terrain = minelib_world::gen::Terrain::v2(key);
+        world.seed = minelib_net::graine::public_seed(key);
+    } else {
+        world.seed = key as u32;
+        world.terrain = minelib_world::gen::Terrain::v1(key as u32);
+    }
 }
 
 /// (v309) « Aucun problème jusqu'à 16,7 millions » : à moins de tant de blocs du centre du
@@ -575,6 +592,7 @@ struct Online {
     friends_said: bool,
     light_op: (bool, Option<std::time::Instant>),
     seed_lock: Option<(bool, bool)>,
+    relay_seed: Option<u64>,
 }
 
 pub struct Session {
@@ -1034,6 +1052,15 @@ pub struct Session {
     /// (v328) `/seed lock` vient d'être demandé au relais (sa réponse se lit au tchat : pas
     /// deux fois le même message).
     seed_lock_asked: Option<std::time::Instant>,
+    /// (v330) La graine du monde, dite par le relais à qui peut la voir (OP, ou graine
+    /// déverrouillée) : elle n'est plus dans la copie du monde d'un serveur de construction.
+    relay_seed: Option<u64>,
+    /// (v330) Clé de terrain d'un monde `procedural2` (de sa sauvegarde, ou donnée par le
+    /// relais) : « Télécharger la carte » la donne à la copie. `None` : monde d'avant.
+    terrain_key: Option<u64>,
+    /// (v330) Clé de terrain donnée par le relais à l'ouverture (`SessionConfig::terrain`) :
+    /// la partie rouverte depuis une autre origine la reprend.
+    pub terrain_given: Option<u64>,
     /// Lumières à afficher cette image, et état de leurs shaders (« Préparation des
     /// lumières… » tant qu'ils compilent).
     lights_wanted: bool,
@@ -1097,6 +1124,15 @@ impl Session {
     /// Ouvre un monde enregistré.
     pub fn open(dir: PathBuf, cfg: SessionConfig) -> Result<Self> {
         let (data, mut world) = save::load_world(&dir)?;
+        // (v330) Serveur de construction : le terrain de la clé que donne le relais (la copie
+        // du monde ne l'a pas) ; d'un monde d'avant la v330, c'est sa graine.
+        let terrain_given = cfg.terrain.filter(|k| *k != 0);
+        if let Some(k) = terrain_given {
+            give_terrain(&mut world, k);
+        }
+        let terrain_key = (world.generator == minelib_world::gen::Generator::Procedural2)
+            .then(|| terrain_given.or(data.meta.key))
+            .flatten();
         let dir_for_lights = dir.clone();
         // (v309) Place absolue du joueur (enregistrée en double précision).
         let (mut abs, mut player, fresh) = match data.player {
@@ -1290,7 +1326,7 @@ impl Session {
             build_match_origin: ChunkPos { x: 0, z: 0 },
             match_opening: false,
             dir,
-            workers: Workers::new(data.meta.seed, world.generator, world.origin()),
+            workers: Workers::new(world.terrain, world.generator, world.origin()),
             streamer: Streamer::new(radius),
             meta: data.meta,
             world,
@@ -1518,6 +1554,9 @@ impl Session {
             light_op_ok: false,
             seed_lock: None,
             seed_lock_asked: None,
+            relay_seed: None,
+            terrain_key,
+            terrain_given,
             light_clear_asked: false,
             lights_wanted: false,
             shadow_lights: Vec::new(),
@@ -1666,6 +1705,15 @@ impl Session {
         self.build.is_none() || self.seed_lock.is_some_and(|(_, allowed)| allowed)
     }
 
+    /// (v330) La graine du monde, si on la connaît : celle de sa sauvegarde (son monde à soi),
+    /// sinon celle que le relais nous a dite (OP, ou graine déverrouillée). À ne montrer que
+    /// si `seed_allowed`.
+    pub fn known_seed(&self) -> Option<u64> {
+        self.meta
+            .shown_seed(self.world.generator)
+            .or(self.relay_seed)
+    }
+
     /// Copie du monde tel qu'il est maintenant (serveur de construction compris) dans ses
     /// mondes solo, sous un nouveau nom. Renvoie son dossier. (v328) Refusée quand la graine
     /// est verrouillée pour ce joueur (`seed_allowed`).
@@ -1674,9 +1722,23 @@ impl Session {
             anyhow::bail!("carte verrouillée par les OP du serveur (/seed lock)");
         }
         let name = format!("{} (copie)", self.meta.name);
-        let dir = save::create_world(saves, &name, self.meta.seed)?;
+        // (v330) La copie a tout ce qu'il faut pour son terrain : la graine (d'un monde d'avant
+        // la v330 : celle de la partie, que le relais a donnée), la graine de 64 bits si on la
+        // connaît, la clé de terrain.
+        let seeds = save::WorldSeeds {
+            seed: self.world.seed,
+            graine: self
+                .meta
+                .graine
+                .or(self.relay_seed.filter(|_| self.terrain_key.is_some())),
+            key: self.terrain_key,
+        };
+        let dir = save::create_world_as(saves, &name, seeds, self.world.generator)?;
         let mut meta = self.meta.clone();
         meta.name = name;
+        meta.seed = seeds.seed;
+        meta.graine = seeds.graine;
+        meta.key = seeds.key;
         meta.created = save::now();
         meta.last_played = save::now();
         let mut game = self.game;
@@ -1722,6 +1784,7 @@ impl Session {
             // ouverture.)
             far_origin: true,
             origin: None,
+            terrain: None,
         }
     }
 
@@ -1904,6 +1967,7 @@ impl Session {
                 friends_said: self.friends_said,
                 light_op: (self.light_op_ok, self.light_op_probe),
                 seed_lock: self.seed_lock,
+                relay_seed: self.relay_seed,
             })
         });
         Carry {
@@ -1945,8 +2009,10 @@ impl Session {
             friends_said,
             light_op,
             seed_lock,
+            relay_seed,
         } = *o;
         self.seed_lock = seed_lock;
+        self.relay_seed = relay_seed;
         let to = self.world.origin_blocks();
         // L'écart le plus court entre les deux origines, sur la carte bouclée.
         let w = minelib_world::lap::wrap_block;
@@ -8845,8 +8911,26 @@ impl Session {
                 ),
                 // (v328) La graine du monde : ce qui vaut pour nous (à l'arrivée, quand un OP
                 // la verrouille ou non, ou qu'on devient OP ou qu'on ne l'est plus).
-                Event::SeedLock { locked, allowed } => {
+                Event::SeedLock {
+                    locked,
+                    allowed,
+                    seed,
+                } => {
                     let before = self.seed_lock.replace((*locked, *allowed));
+                    // (v330) La graine elle-même, à qui peut la voir ; plus permise : oubliée.
+                    // (Une province dit ce qui change sans la graine : on garde celle qu'on
+                    // a, ou on la redemande au relais du monde.)
+                    if !*allowed {
+                        self.relay_seed = None;
+                    } else if *seed != 0 {
+                        self.relay_seed = Some(*seed);
+                    } else if self.relay_seed.is_none() && self.known_seed().is_none() {
+                        self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                            action: minelib_net::proto::SERVER_SEED,
+                            pseudo: String::new(),
+                            reason: String::new(),
+                        });
+                    }
                     let mine = self
                         .seed_lock_asked
                         .take()
@@ -9942,10 +10026,12 @@ impl Session {
                 }
                 let sub = words.get(1).map(|w| w.to_lowercase()).unwrap_or_default();
                 if sub.is_empty() {
-                    if self.seed_allowed() {
+                    // (v330) Celle de la sauvegarde, ou que le relais nous a dite.
+                    let known = self.seed_allowed().then(|| self.known_seed()).flatten();
+                    if let Some(seed) = known {
                         self.chat
-                            .say(format!("Graine du monde : {}", self.world.seed), chat::YELLOW);
-                    } else if self.seed_lock.is_none() {
+                            .say(format!("Graine du monde : {seed}"), chat::YELLOW);
+                    } else if self.seed_allowed() || self.seed_lock.is_none() {
                         self.chat.say(
                             "Graine du monde : le serveur ne l'a pas encore dit, réessaie dans un instant.",
                             chat::GREY,
@@ -12580,7 +12666,8 @@ impl Session {
             laps: self.laps(),
             hit,
             // (v328) Verrouillée par les OP du serveur : pas à l'écran F3 non plus.
-            seed: self.seed_allowed().then_some(self.world.seed),
+            seed: self.seed_allowed().then(|| self.known_seed()).flatten(),
+            seed_locked: !self.seed_allowed(),
             chunks_loaded: self.world.len(),
             stats,
             held: self
@@ -15469,6 +15556,7 @@ mod far_origin_tests {
             view_distance: 4,
             far_origin,
             origin,
+            terrain: None,
         };
         let player = [1.0e9, 70.0, -5.0e8];
         let near_player = origin_near(player);

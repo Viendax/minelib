@@ -4926,7 +4926,16 @@ pub(crate) fn settings(st: &mut State, settings: proto::ProvinceSettings) {
         let locked = st.servers.seed_locked(&server);
         let allowed = st.servers.seed_allowed(&server, &creator, p);
         if (locked, allowed) != (locked0, allowed0) {
-            transport::push(&c.tx, &Response::SeedLock { locked, allowed });
+            // (v330) Sans la graine : la province ne la connaît pas (qui devient OP la
+            // redemande au relais du monde).
+            transport::push(
+                &c.tx,
+                &Response::SeedLock {
+                    locked,
+                    allowed,
+                    seed: 0,
+                },
+            );
         }
     }
     for id in banned {

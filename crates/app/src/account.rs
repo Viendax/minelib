@@ -1320,6 +1320,7 @@ impl Accounts {
                 }
                 e @ (Event::Hosted(_)
                 | Event::World(_)
+                | Event::WorldTerrain(_)
                 | Event::HostRefused(_)
                 | Event::WorldLimit { .. }
                 | Event::Reported(_)

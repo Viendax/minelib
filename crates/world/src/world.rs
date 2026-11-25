@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::flame::{CHEMICALS, WOOD_FLAME};
-use crate::gen::{generate, Generator};
+use crate::gen::{generate, Generator, Terrain};
 use crate::lap::{wrap_block, wrap_chunk};
 use crate::{BlockId, Chunk, ChunkPos, CHUNK_HEIGHT, CHUNK_SIZE};
 
@@ -39,7 +39,12 @@ pub struct Light {
 /// `torches_abs`, `load_torch`, `bases`, `set_bases`) et la génération restent en
 /// coordonnées **absolues**. Origine (0, 0) : local = absolu, rien ne change.
 pub struct World {
+    /// Graine du monde (d'un monde créé depuis la v330 : la « graine publique », tirée de sa
+    /// clé de terrain) : la météo, les éclairs, la Foudre de Zeus en viennent.
     pub seed: u32,
+    /// (v330) Les graines du relief (`Terrain`) : celles de `seed` (monde d'avant), ou de la
+    /// clé de terrain d'un monde `procedural2`.
+    pub terrain: Terrain,
     /// (v309) Origine des coordonnées locales, en chunks (voir plus haut).
     origin: ChunkPos,
     /// Chunks chargés, à leur place locale.
@@ -83,6 +88,7 @@ impl World {
     pub fn new(seed: u32) -> Self {
         Self {
             seed,
+            terrain: Terrain::v1(seed),
             origin: ChunkPos { x: 0, z: 0 },
             chunks: HashMap::new(),
             torches: HashMap::new(),
@@ -242,7 +248,7 @@ impl World {
             .bases
             .get(&at)
             .and_then(|d| Chunk::from_rle(pos, d))
-            .unwrap_or_else(|| generate(self.generator, self.seed, at));
+            .unwrap_or_else(|| generate(self.generator, self.terrain, at));
         c.pos = pos;
         c
     }
@@ -445,9 +451,9 @@ impl World {
             .and_then(|d| Chunk::from_rle(chunk.pos, d))
         {
             chunk = c;
-        } else if self.generator != Generator::Procedural {
+        } else if !self.generator.procedural() {
             let pos = chunk.pos;
-            chunk = generate(self.generator, self.seed, at);
+            chunk = generate(self.generator, self.terrain, at);
             chunk.pos = pos;
         }
         self.apply_edits(&mut chunk);
@@ -881,7 +887,7 @@ mod tests {
         w.set(-5, 120, 40, BlockId::BRICK);
         w.unload(pos);
         assert_eq!(w.get(-5, 120, 40), BlockId::AIR);
-        w.insert(crate::gen::generate_chunk(3, pos));
+        w.insert(crate::gen::generate_chunk(Terrain::v1(3), pos));
         assert_eq!(w.get(-5, 120, 40), BlockId::BRICK);
         let e: Vec<_> = w.edits().collect();
         assert_eq!(e.len(), 1);
