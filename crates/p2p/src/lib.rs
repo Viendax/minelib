@@ -1294,6 +1294,104 @@ mod tests {
         assert!(said_back(&mut c, b"fin!!"));
     }
 
+    /// (v332) Essai réel, sur ton PC : `MINELIB_TURN_ESSAI` donne la source (l'adresse du
+    /// Worker, ou `turn:hôte:port utilisateur motdepasse`). La voie rapide d'une partie FPS
+    /// entre deux nœuds de ce PC, par le vrai serveur TURN : 256 positions par seconde dans
+    /// un sens et 256 entrées dans l'autre pendant 5 secondes, à la taille d'une partie à
+    /// 10 ; ce qui arrive, et l'aller-retour mesuré de bout en bout.
+    #[test]
+    #[ignore = "serveur TURN réel (MINELIB_TURN_ESSAI)"]
+    fn a_fps_fast_way_through_a_real_turn_server() {
+        use minelib_net::fast::{Endpoint, TurnPair, Way, TO_GUEST, TO_HOST};
+        let src = std::env::var("MINELIB_TURN_ESSAI").expect("MINELIB_TURN_ESSAI");
+        let sources = turn::parse_sources(&src);
+        let _serial = serial();
+        let (host, guest) = (
+            Node::start_offline().unwrap(),
+            Node::start_offline().unwrap(),
+        );
+        for n in [&host, &guest] {
+            n.passeurs().start_turn(sources.clone());
+        }
+        let t = std::time::Instant::now();
+        while host.passeurs().turn_addr().is_none() || guest.passeurs().turn_addr().is_none() {
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "pas d'adresse relayée"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (ha, ga) = (
+            host.passeurs().turn_addr().unwrap(),
+            guest.passeurs().turn_addr().unwrap(),
+        );
+        eprintln!("TURN : adresses relayées {ha} (hôte) et {ga} (invité)");
+        let (gtx, grx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (htx, hrx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (gtx, htx) = (std::sync::Mutex::new(gtx), std::sync::Mutex::new(htx));
+        let g_end = Endpoint::start(
+            TO_HOST,
+            Box::new(move |_, m| {
+                let _ = gtx.lock().unwrap().send(m);
+            }),
+        )
+        .unwrap();
+        let h_end = Endpoint::start(
+            TO_GUEST,
+            Box::new(move |_, m| {
+                let _ = htx.lock().unwrap().send(m);
+            }),
+        )
+        .unwrap();
+        let (route, key): (u64, [u8; 32]) = (rand::random(), rand::random());
+        let way = |peer, mine, other| Way {
+            peer,
+            route,
+            key,
+            vias: Vec::new(),
+            turn: Some(TurnPair { mine, peer: other }),
+        };
+        g_end.set_ways(vec![way(0, ga, ha)]);
+        h_end.set_ways(vec![way(3, ha, ga)]);
+        let t = std::time::Instant::now();
+        while !(g_end.open(0) && h_end.open(3)) {
+            assert!(t.elapsed() < Duration::from_secs(15), "voie rapide fermée");
+            g_end.send_all(0, b"bonjour");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while grx.try_recv().is_ok() {}
+        while hrx.try_recv().is_ok() {}
+        // Positions (249 octets, comme pour 9 joueurs vus) et entrées (66 octets).
+        let n = 256 * 5;
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            let mut pos = vec![0xEEu8; 249];
+            pos[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            assert!(h_end.send_one(3, &pos) || !h_end.open(3));
+            g_end.send_all(0, &[0xDDu8; 66]);
+            let due = start + Duration::from_micros(3906 * (i + 1));
+            if let Some(w) = due.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(w);
+            }
+        }
+        let count = |rx: &std::sync::mpsc::Receiver<Vec<u8>>| {
+            let mut got = 0u64;
+            while rx.recv_timeout(Duration::from_millis(500)).is_ok() {
+                got += 1;
+            }
+            got
+        };
+        let (to_guest, to_host) = (count(&grx), count(&hrx));
+        let rtt = h_end.paths(3)[0].rtt_ms.unwrap_or(f32::NAN);
+        let (sent, received) = guest.passeurs().turn_counts();
+        eprintln!(
+            "TURN RÉEL (voie rapide FPS) : {to_guest}/{n} positions vers l'invité, \
+             {to_host}/{n} entrées vers l'hôte, aller-retour {rtt:.1} ms ; client de l'invité : \
+             {sent} paquets envoyés, {received} reçus"
+        );
+        assert!(to_guest * 100 >= n * 95 && to_host * 100 >= n * 95);
+    }
+
     /// (v301) Le premier passeur d'un tunnel tombe : le tunnel continue par le second,
     /// sans se refermer.
     #[test]
