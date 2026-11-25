@@ -19,6 +19,7 @@ use std::time::Duration;
 pub mod passeur;
 pub mod portmap;
 pub mod rendezvous;
+pub mod turn;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -258,6 +259,19 @@ pub fn allow_dht() {
     DHT_ALLOWED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// (v329) Les nœuds de ce programme prennent-ils une adresse chez un serveur TURN
+/// (`relais_turn.txt`) ? Le jeu et le relais officiel oui (`enable_turn`) ; un passeur
+/// sans joueur n'en a pas besoin, et les essais choisissent eux-mêmes.
+static TURN_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn enable_turn() {
+    TURN_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn turn_enabled() -> bool {
+    TURN_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn dht_allowed() -> bool {
     DHT_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -454,6 +468,14 @@ async fn pipe(
         let _ = tokio::io::copy(&mut recv, &mut w).await;
     };
     tokio::join!(up, down);
+}
+
+/// (v329) Le nœud s'en va : son client TURN aussi (l'adresse relayée n'est plus dite aux
+/// relais), même si iroh garde encore un moment de quoi joindre son transport.
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.passeurs.stop_turn();
+    }
 }
 
 impl Node {
@@ -999,6 +1021,7 @@ mod tests {
                 route,
                 host,
                 vias: vias.clone(),
+                turn: None,
             };
             tunnel_given(r, false);
         }
@@ -1040,6 +1063,130 @@ mod tests {
         // Le tunnel fermé, le joueur rend sa route.
         drop(c);
         drop(guest);
+    }
+
+    /// (v329) Une route par un serveur TURN, donnée aux deux bouts comme le fait le relais
+    /// du monde : chacun reçoit l'adresse relayée de l'autre, après les passeurs `passeurs`.
+    fn give_turn(host: &Node, guest: &Node, route: u64, passeurs: &[&minelib_net::fast::Passeur]) {
+        use minelib_net::fast::{tunnel_given, TunnelRoute, Via};
+        minelib_net::fast::note_passeurs();
+        let vias: Vec<Via> = passeurs
+            .iter()
+            .map(|p| {
+                let seal = [p.port() as u8; 32];
+                p.set_lot(route, &[(route, seal)]);
+                Via {
+                    addr: SocketAddr::from(([127, 0, 0, 1], p.port())),
+                    seal,
+                }
+            })
+            .collect();
+        let relayed = |n: &Node| Via {
+            addr: SocketAddr::V4(n.passeurs().turn_addr().expect("adresse relayée")),
+            seal: [0x77; 32],
+        };
+        // (L'hôte reçoit l'adresse du joueur, le joueur celle de l'hôte.)
+        for (is_host, other) in [(true, guest), (false, host)] {
+            let r = TunnelRoute {
+                node: host.id(),
+                route,
+                host: is_host,
+                vias: vias.clone(),
+                turn: Some(relayed(other)),
+            };
+            tunnel_given(r, false);
+        }
+    }
+
+    /// Deux nœuds sans serveur d'iroh ni adresse directe, chacun avec une adresse chez le
+    /// serveur TURN `server`.
+    fn turn_nodes(server: &turn::essai::MiniTurn) -> (Node, Node) {
+        let host = Node::start_offline().unwrap();
+        host.serve(echo());
+        let guest = Node::start_offline().unwrap();
+        for n in [&host, &guest] {
+            n.passeurs().start_turn(vec![server.source()]);
+        }
+        let t = std::time::Instant::now();
+        while host.passeurs().turn_addr().is_none() || guest.passeurs().turn_addr().is_none() {
+            assert!(t.elapsed() < Duration::from_secs(10), "pas d'adresse relayée");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (host, guest)
+    }
+
+    /// (v329) Sans passeur, sans serveur d'iroh et sans adresse directe, un tunnel passe par
+    /// un serveur TURN : chaque bout envoie à l'adresse relayée de l'autre par la sienne, et
+    /// ni l'un ni l'autre ne voit l'adresse de l'autre. L'adresse relayée de chaque nœud est
+    /// tenue prête pour le relais (`fast::turn_addr`), et oubliée quand le nœud s'en va.
+    #[test]
+    fn a_tunnel_goes_through_a_turn_server_without_any_passeur() {
+        let _serial = serial();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = turn::essai::MiniTurn::start(rt.handle());
+        let (host, guest) = turn_nodes(&server);
+        assert_eq!(
+            minelib_net::fast::turn_addr(host.id()),
+            host.passeurs().turn_addr()
+        );
+        give_turn(&host, &guest, 0x61, &[]);
+        let t = guest.tunnel(host.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        assert!(said_back(&mut c, b"salut"));
+        for i in 0..1000u32 {
+            assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
+        }
+        assert!(guest.passeurs().via_turn(0x61));
+        let (sent, received) = guest.passeurs().turn_counts();
+        assert!(sent > 20 && received > 20, "{sent} envoyés, {received} reçus");
+        let carried = server.relayed.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(carried > 40, "le serveur TURN a porté {carried} paquets");
+        assert_eq!(node_direct(host.id()), Some(true));
+        drop(c);
+        let gid = guest.id();
+        drop(guest);
+        assert_eq!(minelib_net::fast::turn_addr(gid), None);
+    }
+
+    /// (v329) Une route a un passeur et un saut TURN : elle passe par le passeur (le TURN de
+    /// Cloudflare compte ce qu'il porte) ; le passeur tombe, le tunnel continue par TURN sans
+    /// se refermer.
+    #[test]
+    fn a_tunnel_moves_to_turn_when_its_passeur_falls() {
+        let _serial = serial();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = turn::essai::MiniTurn::start(rt.handle());
+        let (host, guest) = turn_nodes(&server);
+        let (tx, _probes) = std::sync::mpsc::channel();
+        let p = minelib_net::fast::Passeur::start(0, tx).unwrap();
+        give_turn(&host, &guest, 0x62, &[&p]);
+        let t = guest.tunnel(host.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(25))).unwrap();
+        assert!(said_back(&mut c, b"avant"));
+        for i in 0..100u32 {
+            assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
+        }
+        assert!(!guest.passeurs().via_turn(0x62), "le passeur d'abord");
+        assert!(p.carried() > 20);
+        p.clear();
+        let fell = std::time::Instant::now();
+        assert!(said_back(&mut c, b"apres"), "le tunnel s'est refermé");
+        eprintln!("TUNNEL : reprise par TURN en {:?}", fell.elapsed());
+        assert!(fell.elapsed() < Duration::from_secs(12));
+        assert!(guest.passeurs().via_turn(0x62));
+        for i in 0..200u32 {
+            assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
+        }
     }
 
     /// (v301) Le premier passeur d'un tunnel tombe : le tunnel continue par le second,

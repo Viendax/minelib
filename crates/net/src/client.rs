@@ -923,6 +923,8 @@ struct Worker {
     logs_at: Instant,
     /// (v301) Dernière demande de tunnel (`crate::fast::tunnel_want`) déjà envoyée.
     tunnel_seen: u64,
+    /// (v329) Dernières adresses TURN dites à ce relais (`crate::fast::turn_addrs`).
+    turn_seen: u64,
 }
 
 /// Passeur tenu par une connexion au relais. Il est gardé quand le jeu cesse de s'annoncer
@@ -983,6 +985,7 @@ impl Worker {
                 .unwrap_or_else(Instant::now),
             // (Les demandes d'avant cette connexion ne la regardent pas.)
             tunnel_seen: crate::fast::tunnel_wants(u64::MAX, "").1,
+            turn_seen: 0,
         }
     }
 
@@ -1127,14 +1130,34 @@ impl Worker {
         if self.pseudo.is_empty() {
             return;
         }
+        let v4 = |a: std::net::SocketAddrV4| (a.ip().octets(), a.port());
         for ask in nodes {
             let req = match ask {
-                crate::fast::TunnelAsk::Want(node) => Request::TunnelWant { node },
+                crate::fast::TunnelAsk::Want(node, turn) => Request::TunnelWant {
+                    node,
+                    turn: turn.map(v4),
+                },
                 crate::fast::TunnelAsk::Bad(route) => Request::TunnelBad { route },
             };
             if self.oneway(&req).is_err() {
                 return;
             }
+        }
+        // (v329) Nos adresses chez un serveur TURN : quand elles changent, et à chaque
+        // connexion (le relais les oublie avec elle).
+        if self.chan.is_none() {
+            self.turn_seen = 0;
+        } else if let Some((version, all)) = crate::fast::turn_addrs(self.turn_seen) {
+            for (node, a) in all {
+                let req = Request::TurnAt {
+                    node,
+                    turn: a.map(v4),
+                };
+                if self.oneway(&req).is_err() {
+                    return;
+                }
+            }
+            self.turn_seen = version;
         }
     }
 
@@ -1363,6 +1386,7 @@ impl Worker {
                 host,
                 own,
                 passeurs,
+                turn,
             } => {
                 let vias = passeurs
                     .iter()
@@ -1377,6 +1401,7 @@ impl Worker {
                         route,
                         host,
                         vias,
+                        turn: turn.map(|h| h.via()),
                     },
                     own,
                 );

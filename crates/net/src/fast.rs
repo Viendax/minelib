@@ -184,13 +184,17 @@ pub fn raw_open(
 // reçoivent les routes (`Response::TunnelWay`) ; et le passeur de ce jeu, s'il en a un.
 
 /// Route d'un tunnel, donnée par le relais du monde : vers le nœud `node` (`host` faux),
-/// ou vers un joueur qui joint notre nœud `node` (`host` vrai). Aucun passeur : fermée.
+/// ou vers un joueur qui joint notre nœud `node` (`host` vrai). Aucun passeur ni saut
+/// TURN : fermée.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TunnelRoute {
     pub node: [u8; 32],
     pub route: u64,
     pub host: bool,
     pub vias: Vec<Via>,
+    /// (v329) L'adresse relayée de l'autre bout chez un serveur TURN, et la clé du sceau
+    /// de ce saut : nos paquets y vont par notre propre adresse relayée.
+    pub turn: Option<Via>,
 }
 
 /// Demandes gardées (les connexions au relais les envoient chacune à leur tour).
@@ -199,8 +203,9 @@ const WANTS_KEPT: usize = 64;
 /// Ce que le nœud iroh du jeu fait dire au relais du monde.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TunnelAsk {
-    /// Une route vers ce nœud (demande, ou renouvellement).
-    Want([u8; 32]),
+    /// Une route vers ce nœud (demande, ou renouvellement), et (v329) notre adresse
+    /// relayée chez un serveur TURN si on en a une.
+    Want([u8; 32], Option<SocketAddrV4>),
     /// (v304) Plus rien ne passe par cette route depuis quelques secondes : qu'on lui
     /// donne d'autres passeurs.
     Bad(u64),
@@ -230,9 +235,11 @@ static TUNNELS: Mutex<Tunnels> = Mutex::new(Tunnels {
 
 /// Ce jeu ouvre (ou garde ouvert) un tunnel vers le nœud `node` : ses connexions au relais
 /// demandent une route par des passeurs. À refaire toutes les `TUNNEL_RENEW` tant que le
-/// tunnel sert : le relais reprend les routes qu'on ne redemande plus.
-pub fn tunnel_want(node: [u8; 32]) {
-    tunnel_ask(TunnelAsk::Want(node));
+/// tunnel sert : le relais reprend les routes qu'on ne redemande plus. (v329) `turn` :
+/// l'adresse relayée du nœud qui ouvre le tunnel, s'il en a une (le relais en fait un saut
+/// de la route si l'autre bout en a une aussi).
+pub fn tunnel_want(node: [u8; 32], turn: Option<SocketAddrV4>) {
+    tunnel_ask(TunnelAsk::Want(node, turn));
 }
 
 /// (v304) Plus rien ne passe par la route `route` : ses bouts le disent au relais, qui
@@ -322,7 +329,7 @@ pub fn tunnel_given(mut r: TunnelRoute, own: bool) {
                 .collect();
         }
         if !r.host {
-            if r.vias.is_empty() {
+            if r.vias.is_empty() && r.turn.is_none() {
                 t.routes.retain(|x| x.route != r.route);
             } else {
                 t.routes.retain(|x| x.node != r.node);
@@ -340,6 +347,51 @@ pub fn tunnel_given(mut r: TunnelRoute, own: bool) {
 pub fn tunnel_route(node: [u8; 32]) -> Option<TunnelRoute> {
     let t = TUNNELS.lock().unwrap();
     t.routes.iter().find(|r| r.node == node).cloned()
+}
+
+/// (v329) Adresses relayées (serveur TURN) des nœuds de ce programme, et le numéro de leur
+/// dernier changement : les connexions aux relais les disent (`Request::TurnAt`) quand il
+/// change, et à chaque nouvelle connexion. Un nœud qui n'en a plus garde sa place (rien),
+/// pour que les relais l'oublient aussi.
+struct TurnAddrs {
+    version: u64,
+    nodes: Vec<([u8; 32], Option<SocketAddrV4>)>,
+}
+
+static TURN_ADDRS: Mutex<TurnAddrs> = Mutex::new(TurnAddrs {
+    version: 0,
+    nodes: Vec::new(),
+});
+
+/// Nœuds gardés au plus (les plus anciens s'en vont).
+const TURN_NODES: usize = 32;
+
+pub fn set_turn_addr(node: [u8; 32], addr: Option<SocketAddrV4>) {
+    let mut t = TURN_ADDRS.lock().unwrap();
+    match t.nodes.iter_mut().find(|(n, _)| *n == node) {
+        Some((_, a)) if *a == addr => return,
+        Some((_, a)) => *a = addr,
+        None => t.nodes.push((node, addr)),
+    }
+    let extra = t.nodes.len().saturating_sub(TURN_NODES);
+    t.nodes.drain(..extra);
+    t.version += 1;
+}
+
+/// Adresse relayée du nœud `node` de ce programme.
+pub fn turn_addr(node: [u8; 32]) -> Option<SocketAddrV4> {
+    let t = TURN_ADDRS.lock().unwrap();
+    t.nodes.iter().find(|(n, _)| *n == node).and_then(|(_, a)| *a)
+}
+
+/// Adresse relayée de chaque nœud (rien : il n'en a plus).
+pub type TurnAddrList = Vec<([u8; 32], Option<SocketAddrV4>)>;
+
+/// Toutes, si elles ont changé depuis le numéro `seen` (0 : jamais dites) : (numéro,
+/// adresses).
+pub fn turn_addrs(seen: u64) -> Option<(u64, TurnAddrList)> {
+    let t = TURN_ADDRS.lock().unwrap();
+    (t.version != seen && t.version > 0).then(|| (t.version, t.nodes.clone()))
 }
 
 
@@ -1735,6 +1787,7 @@ mod tests {
             route,
             host,
             vias,
+            turn: None,
         };
         assert!(tunnel_route(node).is_none());
         tunnel_given(route(1, false, vec![via([82, 1, 2, 3], 4000)]), false);
@@ -1772,13 +1825,50 @@ mod tests {
                 SocketAddr::from(([127, 0, 0, 1], 47_002)),
             ]
         );
+        // (v329) Une route par TURN seulement (aucun passeur) est gardée comme une autre.
+        let relayed = Via {
+            addr: SocketAddr::from(([104, 30, 1, 2], 50_000)),
+            seal: key(4),
+        };
+        tunnel_given(
+            TunnelRoute {
+                turn: Some(relayed),
+                ..route(4, false, Vec::new())
+            },
+            false,
+        );
+        assert_eq!(tunnel_route(node).unwrap().turn, Some(relayed));
+        tunnel_given(route(4, false, Vec::new()), false);
+        assert!(tunnel_route(node).is_none());
         // Les demandes : chaque connexion ne voit que celles faites après elle.
         let (_, start) = tunnel_wants(u64::MAX, "");
-        tunnel_want(node);
-        tunnel_want(node);
+        tunnel_want(node, None);
+        tunnel_want(node, None);
         let (nodes, last) = tunnel_wants(start, "");
-        assert!(nodes.contains(&TunnelAsk::Want(node)) && last >= start + 2);
-        assert!(!tunnel_wants(last, "").0.contains(&TunnelAsk::Want(node)));
+        assert!(nodes.contains(&TunnelAsk::Want(node, None)) && last >= start + 2);
+        assert!(!tunnel_wants(last, "").0.contains(&TunnelAsk::Want(node, None)));
+    }
+
+    /// (v329) Les adresses relayées des nœuds : dites quand elles changent, et redites à
+    /// une connexion qui n'en a rien entendu.
+    #[test]
+    fn relayed_addresses_are_told_again_only_when_they_change() {
+        let (a, b) = ([0xC1; 32], [0xC2; 32]);
+        let x = SocketAddrV4::new([104, 30, 2, 3].into(), 40_001);
+        let start = turn_addrs(0).map_or(0, |(v, _)| v);
+        set_turn_addr(a, Some(x));
+        let (v1, all) = turn_addrs(start).unwrap();
+        assert!(all.contains(&(a, Some(x))));
+        assert_eq!(turn_addr(a), Some(x));
+        set_turn_addr(a, Some(x));
+        assert!(turn_addrs(v1).is_none(), "rien de neuf");
+        set_turn_addr(b, None);
+        set_turn_addr(a, None);
+        let (_, all) = turn_addrs(v1).unwrap();
+        assert!(all.contains(&(a, None)) && all.contains(&(b, None)));
+        assert_eq!(turn_addr(a), None);
+        // Une connexion neuve (0) les entend toutes.
+        assert!(turn_addrs(0).is_some());
     }
 
     #[test]

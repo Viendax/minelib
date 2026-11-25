@@ -1,0 +1,18 @@
+# Serveurs TURN de Minelib (v329) : un chemin de plus pour les tunnels, sans passeur ni
+# machine à nous. Quand les deux bouts d'une route ont une adresse chez un serveur TURN, le
+# relais du monde leur donne celle de l'autre : leurs paquets passent par ce serveur, et
+# aucun des deux ne voit l'adresse IP de l'autre (ce que voit le serveur : l'adresse IP
+# des jeux qui passent par lui, jamais le contenu, chiffré de bout en bout).
+#
+# Une source par ligne :
+# - `https://…` : un service qui donne des identifiants TURN (format des « iceServers » de
+#   WebRTC). Le nôtre : un Worker chez Cloudflare (gratuit), qui donne ceux d'ExpressTURN
+#   (1 000 Go par mois gratuits, sans carte bancaire, serveur en France) sans les écrire
+#   dans ce dépôt public ; voir deploiement/cloudflare-turn.
+# - `turn:<hôte>:<port> <utilisateur> <mot de passe>` : un serveur à soi (coturn), avec des
+#   identifiants fixes. Compilés dans le jeu, ils sont publics : à réserver aux essais.
+#
+# La première qui répond sert. La variable `MINELIB_TURN` (sources séparées par des
+# virgules) remplace cette liste. Vide : pas de TURN, le jeu fait comme avant.
+
+https://turn.countercraft.workers.dev

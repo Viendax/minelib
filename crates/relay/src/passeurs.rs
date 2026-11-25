@@ -30,12 +30,21 @@
 //!
 //! Tout est redonné d'un bloc à chaque demande (routes et clés neuves) : quand un passeur
 //! s'en va ou que l'hôte change, l'ancienne attribution est retirée à ceux qui la portaient.
+//!
+//! (v329) **Un tunnel peut aussi passer par un serveur TURN** (voir `minelib_p2p::turn`) :
+//! quand le joueur (`TunnelWant::turn`) et l'hôte du nœud
+//! (`Request::TurnAt`, ou ce relais lui-même pour ses propres nœuds) y ont chacun une
+//! adresse relayée, chacun reçoit celle de l'autre comme un saut de plus de la route, après
+//! ses passeurs, ou seul quand il n'y a pas de passeurs. Aucun des deux ne voit l'adresse
+//! IP de l'autre ; le serveur TURN les voit toutes deux, comme un passeur seul, sans rien
+//! lire.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::Instant;
 
 use minelib_net::proto::{FastHop, FastWay, Request, Response};
+use std::net::SocketAddr;
 use minelib_net::transport;
 
 use super::State;
@@ -106,6 +115,9 @@ pub(crate) const OWN: u64 = u64::MAX;
 const OWN_CHAINS: usize = 2;
 /// Demandes de tunnel acceptées d'une connexion par minute.
 const WANTS_PER_MIN: u16 = 240;
+/// (v329) Adresses TURN acceptées d'une connexion par minute, et nœuds par connexion.
+const TURN_ATS_PER_MIN: u8 = 30;
+const TURN_NODES_PER_CONN: usize = 8;
 
 /// (v301) Tunnel iroh d'un joueur vers un relais hébergé, porté par des passeurs.
 struct Tunnel {
@@ -117,6 +129,11 @@ struct Tunnel {
     guest: u64,
     host: u64,
     guest_hw: Vec<[u8; 32]>,
+    /// (v329) Adresse relayée du joueur chez un serveur TURN (redite à chaque demande), et
+    /// le saut TURN donné : adresses relayées du joueur et de l'hôte, clé de son sceau
+    /// (gardée tant qu'elles ne changent pas).
+    guest_turn: Option<SocketAddrV4>,
+    turn: Option<(SocketAddrV4, SocketAddrV4, [u8; 32])>,
     /// Passeurs retenus (connexion, clé du sceau de la route chez lui). (v308) Toujours
     /// deux, en chaîne : le premier du côté du joueur, le second du côté de l'hôte. (v320)
     /// Lien vers ce relais : une ou deux chaînes ainsi, l'une après l'autre (chacune son
@@ -188,6 +205,12 @@ pub(crate) struct Fast {
     own_nodes: Vec<[u8; 32]>,
     own_hw: Vec<[u8; 32]>,
     log_seen: u64,
+    /// (v329) Adresses relayées (serveur TURN) des nœuds hébergés par chaque connexion,
+    /// celles des nœuds de ce relais lui-même (vues au dernier battement), et les
+    /// annonces récentes de chaque connexion.
+    turns: HashMap<(u64, [u8; 32]), SocketAddrV4>,
+    own_turns: HashMap<[u8; 32], SocketAddrV4>,
+    turn_asks: HashMap<u64, (Instant, u8)>,
 }
 
 impl Fast {
@@ -231,6 +254,28 @@ impl Fast {
         self.offers.values().filter(|o| o.verified).count()
     }
 
+    /// (v329) Ce que ce relais dit aux jeux (`PasseursKnown`) : ses passeurs vérifiés, plus
+    /// un s'il connaît un nœud joignable par TURN. Sans rien de tout cela, un jeu ouvre ses
+    /// tunnels sans demander de route ni l'attendre.
+    fn routable(&self) -> usize {
+        // (Seuls comptent les nœuds que leur connexion héberge ici : un jeu dit aussi
+        // l'adresse de son propre nœud, qui ne sert qu'à ses demandes.)
+        let hosted = self
+            .turns
+            .keys()
+            .any(|(c, n)| self.nodes.get(n) == Some(c));
+        self.verified() + usize::from(hosted || !self.own_turns.is_empty())
+    }
+
+    /// (v329) Nœuds joignables par TURN, et tunnels qui ont un saut par TURN (relevé de
+    /// santé, essais).
+    pub(crate) fn turn_counts(&self) -> (usize, usize) {
+        (
+            self.turns.len() + self.own_turns.len(),
+            self.tunnels.values().filter(|t| t.turn.is_some()).count(),
+        )
+    }
+
     /// (v320) Un passeur vérifié s'est-il annoncé sur ce port (essais) ?
     #[cfg(test)]
     pub(crate) fn offered_at(&self, port: u16) -> bool {
@@ -249,6 +294,12 @@ fn public(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()
         || ip.is_multicast()
         || (o[0] == 100 && (64..128).contains(&o[1])))
+}
+
+/// (v329) Une adresse relayée (serveur TURN) qu'on peut donner à l'autre bout d'une route :
+/// publique, sauf sur un relais qui n'écoute que cette machine (essais, jeu seul).
+fn turn_ok(st: &State, a: &SocketAddrV4) -> bool {
+    !super::machines_apart(st) || public(*a.ip())
 }
 
 /// `PasseurOffer` : où joindre ce passeur (`external`, sinon l'adresse d'où vient sa
@@ -351,6 +402,12 @@ pub(crate) fn gone(st: &mut State, id: u64) {
     st.fast.asks.remove(&id);
     st.fast.told.remove(&id);
     st.fast.log_rate.remove(&id);
+    st.fast.turn_asks.remove(&id);
+    let had_turns = st.fast.turns.keys().any(|(c, _)| *c == id);
+    st.fast.turns.retain(|(c, _), _| *c != id);
+    if had_turns {
+        announce(st);
+    }
     // (v320) Les tunnels qu'elle avait demandés passent à une autre connexion du même
     // compte sur la même machine, s'il y en a une : c'est ainsi que le jeu change de lien
     // avec ce relais (la nouvelle connexion, venue par les passeurs, entre ; puis l'ancienne,
@@ -405,6 +462,32 @@ pub(crate) fn off(st: &mut State, id: u64) {
 /// `MISSES_MAX` sondes de suite n'est plus retenu (jusqu'à sa prochaine annonce).
 pub(crate) fn upkeep(st: &mut State) {
     own_reports(st);
+    own_turns(st);
+    probe_all(st);
+    // (v301) Tunnels que leur joueur ne redemande plus.
+    let old: Vec<u64> = st
+        .fast
+        .tunnels
+        .iter()
+        .filter(|(_, t)| {
+            let idle = t.renewed.elapsed();
+            idle >= TUNNEL_ORPHAN
+                || (idle >= TUNNEL_LEASE
+                    && st
+                        .conns
+                        .values()
+                        .any(|c| c.pseudo.as_deref() == Some(t.pseudo.as_str())))
+        })
+        .map(|(r, _)| *r)
+        .collect();
+    for route in old {
+        tunnel_close(st, route);
+    }
+}
+
+/// Sondes des passeurs (voir `upkeep`). (v329 : à part, pour que les tunnels d'un relais
+/// sans passeur, qui passent par TURN, soient repris eux aussi.)
+fn probe_all(st: &mut State) {
     let Some(sock) = &st.fast.sock else {
         return;
     };
@@ -443,25 +526,113 @@ pub(crate) fn upkeep(st: &mut State) {
     if any_lost {
         announce(st);
     }
-    // (v301) Tunnels que leur joueur ne redemande plus.
-    let old: Vec<u64> = st
+}
+
+/// (v329) Les adresses relayées des nœuds de ce relais lui-même (son client TURN les dit à
+/// `minelib_net::fast`) : quand l'une change, les liens vers ce nœud reçoivent leur route
+/// de nouveau.
+fn own_turns(st: &mut State) {
+    let mut changed = Vec::new();
+    for node in st.fast.own_nodes.clone() {
+        let now = minelib_net::fast::turn_addr(node);
+        if st.fast.own_turns.get(&node).copied() != now {
+            match now {
+                Some(a) => st.fast.own_turns.insert(node, a),
+                None => st.fast.own_turns.remove(&node),
+            };
+            changed.push(node);
+        }
+    }
+    if changed.is_empty() {
+        return;
+    }
+    let routes: Vec<u64> = st
         .fast
         .tunnels
         .iter()
-        .filter(|(_, t)| {
-            let idle = t.renewed.elapsed();
-            idle >= TUNNEL_ORPHAN
-                || (idle >= TUNNEL_LEASE
-                    && st
-                        .conns
-                        .values()
-                        .any(|c| c.pseudo.as_deref() == Some(t.pseudo.as_str())))
-        })
+        .filter(|(_, t)| t.host == OWN && changed.contains(&t.node))
         .map(|(r, _)| *r)
         .collect();
-    for route in old {
-        tunnel_close(st, route);
+    for r in routes {
+        tunnel_assign(st, r);
     }
+    announce(st);
+}
+
+/// (v329) `TurnAt` : le nœud `node` hébergé par cette connexion a (ou n'a plus) une
+/// adresse relayée chez un serveur TURN. Les tunnels vers lui reçoivent leur route de
+/// nouveau, avec ou sans saut TURN.
+pub(crate) fn turn_at(st: &mut State, id: u64, node: [u8; 32], turn: Option<SocketAddrV4>) {
+    let a = st.fast.turn_asks.entry(id).or_insert((Instant::now(), 0));
+    if a.0.elapsed() >= std::time::Duration::from_secs(60) {
+        *a = (Instant::now(), 0);
+    }
+    if a.1 >= TURN_ATS_PER_MIN {
+        st.fast.refused[1] += 1;
+        return;
+    }
+    a.1 += 1;
+    // (Une adresse de réseau local ne mène qu'à des machines d'ici.)
+    let turn = turn.filter(|a| turn_ok(st, a));
+    let key = (id, node);
+    if st.fast.turns.get(&key).copied() == turn {
+        return;
+    }
+    match turn {
+        Some(a) => {
+            let mine = st.fast.turns.keys().filter(|(c, _)| *c == id).count();
+            if !st.fast.turns.contains_key(&key) && mine >= TURN_NODES_PER_CONN {
+                return;
+            }
+            st.fast.turns.insert(key, a);
+        }
+        None => {
+            st.fast.turns.remove(&key);
+        }
+    }
+    let routes: Vec<u64> = st
+        .fast
+        .tunnels
+        .iter()
+        .filter(|(_, t)| t.host == id && t.node == node)
+        .map(|(r, _)| *r)
+        .collect();
+    for r in routes {
+        tunnel_assign(st, r);
+    }
+    announce(st);
+}
+
+/// (v329) Le saut TURN du tunnel `route`, s'il y en a un : les deux bouts ont chacun une
+/// adresse relayée. La clé de son sceau reste la même tant que les deux adresses ne
+/// changent pas (le saut redonné à chaque demande ne coupe rien). Ce qui va au joueur
+/// (l'adresse de l'hôte), ce qui va à l'hôte (celle du joueur).
+fn turn_hops(st: &mut State, route: u64) -> Option<(FastHop, FastHop)> {
+    let pair = st.fast.tunnels.get(&route).and_then(|t| {
+        let g = t.guest_turn?;
+        let h = if t.host == OWN {
+            st.fast.own_turns.get(&t.node).copied()?
+        } else {
+            st.fast.turns.get(&(t.host, t.node)).copied()?
+        };
+        (g != h).then_some((g, h))
+    });
+    let t = st.fast.tunnels.get_mut(&route)?;
+    let Some((g, h)) = pair else {
+        t.turn = None;
+        return None;
+    };
+    let seal = match t.turn {
+        Some((og, oh, seal)) if og == g && oh == h => seal,
+        _ => rand::random(),
+    };
+    t.turn = Some((g, h, seal));
+    let hop = |a: SocketAddrV4| FastHop {
+        addr: a.ip().octets(),
+        port: a.port(),
+        seal,
+    };
+    Some((hop(h), hop(g)))
 }
 
 /// Nouvelle attribution pour les parties que portait ce passeur.
@@ -523,7 +694,7 @@ pub(crate) fn greet(st: &mut State, id: u64) {
     if st.fast.told.insert(id) {
         if st.fast.said {
             if let Some(c) = st.conns.get(&id) {
-                let n = st.fast.verified() as u32;
+                let n = st.fast.routable() as u32;
                 transport::push(&c.tx, &Response::PasseursKnown { n });
             }
         }
@@ -548,7 +719,7 @@ pub(crate) fn greet_all(st: &mut State) {
 /// (v304) Il y a maintenant des passeurs, ou il n'y en a plus : dit à tous ceux qui sont
 /// entrés. Sans passeur, leur jeu ouvre ses tunnels sans demander de route.
 fn announce(st: &mut State) {
-    let n = st.fast.verified() as u32;
+    let n = st.fast.routable() as u32;
     if (n > 0) == st.fast.said {
         return;
     }
@@ -581,6 +752,8 @@ pub(crate) fn node_ready(st: &mut State, id: u64, node: [u8; 32]) {
         .is_some_and(|c| *c != id && st.conns.contains_key(c));
     if !live {
         st.fast.nodes.insert(node, id);
+        // (v329) Il a peut-être déjà dit son adresse relayée.
+        announce(st);
     }
 }
 
@@ -589,7 +762,14 @@ pub(crate) fn node_ready(st: &mut State, id: u64, node: [u8; 32]) {
 /// nœud : leurs paquets y passent en UDP, sans que l'un voie l'adresse de l'autre, au lieu
 /// des serveurs relais d'iroh. Le passeur ne sait ni qui ils sont ni ce qu'il porte (le
 /// tunnel est chiffré de bout en bout).
-pub(crate) fn tunnel_want(st: &mut State, id: u64, node: [u8; 32]) {
+pub(crate) fn tunnel_want(
+    st: &mut State,
+    id: u64,
+    node: [u8; 32],
+    turn: Option<SocketAddrV4>,
+) {
+    // (v329) Son adresse relayée : une adresse publique seulement.
+    let turn = turn.filter(|a| turn_ok(st, a));
     // (v320) Vers ce relais lui-même : il tient le bout hôte (`OWN`).
     let own = st.fast.own_nodes.contains(&node);
     let host = if own {
@@ -639,15 +819,22 @@ pub(crate) fn tunnel_want(st: &mut State, id: u64, node: [u8; 32]) {
     match had {
         // Il s'en sert toujours.
         Some((route, h)) if h == host => {
+            let mut moved = false;
             if let Some(t) = st.fast.tunnels.get_mut(&route) {
                 t.renewed = Instant::now();
                 t.guest = id;
+                // (v329) Son adresse relayée a changé (ou il en a une, ou plus) : le saut TURN
+                // est redonné.
+                moved = t.guest_turn != turn;
+                t.guest_turn = turn;
             }
             // (v320) Un lien vers ce relais : sa route est redite à chaque demande (celle-ci
             // peut venir d'une connexion neuve, entrée par ce lien même), et complétée d'une
             // seconde chaîne si des passeurs sont arrivés depuis.
             if own {
                 own_assign(st, route);
+            } else if moved {
+                tunnel_assign(st, route);
             }
             return;
         }
@@ -676,6 +863,8 @@ pub(crate) fn tunnel_want(st: &mut State, id: u64, node: [u8; 32]) {
             guest: id,
             host,
             guest_hw,
+            guest_turn: turn,
+            turn: None,
             passeurs: Vec::new(),
             bad: Vec::new(),
             at: Instant::now(),
@@ -718,6 +907,8 @@ fn tunnel_assign(st: &mut State, route: u64) {
     let (guest, host, node) = (t.guest, t.host, t.node);
     let bad = t.bad.clone();
     let before: Vec<u64> = t.passeurs.iter().map(|(p, _)| *p).collect();
+    // (v329) Donnée avant (par des passeurs ou par TURN) : sa reprise doit être dite.
+    let given = !before.is_empty() || t.turn.is_some();
     let apart = super::machines_apart(st);
     let ends: Vec<&super::Conn> = [guest, host]
         .iter()
@@ -785,13 +976,26 @@ fn tunnel_assign(st: &mut State, route: u64) {
             );
         }
     }
-    if picked.is_empty() {
+    // (v329) Le saut TURN, si les deux bouts ont une adresse relayée : avec les passeurs,
+    // ou seul.
+    let turn = turn_hops(st, route);
+    if picked.is_empty() && turn.is_none() {
         st.fast.tunnels.remove(&route);
         // (Jamais donnée : rien à reprendre. Le joueur n'attend pas de réponse, d'autres
         // relais à qui il a fait la même demande ne connaissent même pas ce nœud.)
-        if !before.is_empty() {
-            tunnel_tell(st, guest, host, node, route, &[], &[]);
+        if given {
+            tunnel_tell(st, guest, host, node, route, &[], &[], None);
         }
+        return;
+    }
+    if picked.is_empty() {
+        if let Some(t) = st.fast.tunnels.get_mut(&route) {
+            if !t.passeurs.is_empty() {
+                t.passeurs.clear();
+                t.at = Instant::now();
+            }
+        }
+        tunnel_tell(st, guest, host, node, route, &[], &[], turn);
         return;
     }
     // Le premier parle au joueur, le second à l'hôte ; entre eux, une adresse fixée ici.
@@ -825,7 +1029,16 @@ fn tunnel_assign(st: &mut State, route: u64) {
         t.passeurs = vec![(first.0, seal), (second.0, seal)];
         t.at = Instant::now();
     }
-    tunnel_tell(st, guest, host, node, route, &[hop(first.1)], &[hop(second.1)]);
+    tunnel_tell(
+        st,
+        guest,
+        host,
+        node,
+        route,
+        &[hop(first.1)],
+        &[hop(second.1)],
+        turn,
+    );
 }
 
 /// (v320) Passeurs d'un lien vers ce relais (`OWN`) : les chaînes qui peuvent encore servir
@@ -840,6 +1053,7 @@ fn own_assign(st: &mut State, route: u64) {
     let (guest, node) = (t.guest, t.node);
     let bad = t.bad.clone();
     let before = t.passeurs.clone();
+    let given = !before.is_empty() || t.turn.is_some();
     let guest_hw = t.guest_hw.clone();
     let apart = super::machines_apart(st);
     // Un passeur sert : vérifié, toujours là, pas signalé pour ce lien, ni le joueur, ni
@@ -934,10 +1148,12 @@ fn own_assign(st: &mut State, route: u64) {
             );
         }
     }
-    if chains.is_empty() {
+    // (v329) Le saut TURN, si le joueur et ce relais ont chacun une adresse relayée.
+    let turn = turn_hops(st, route);
+    if chains.is_empty() && turn.is_none() {
         st.fast.tunnels.remove(&route);
-        if !before.is_empty() {
-            tunnel_tell(st, guest, OWN, node, route, &[], &[]);
+        if given {
+            tunnel_tell(st, guest, OWN, node, route, &[], &[], None);
         }
         return;
     }
@@ -981,12 +1197,13 @@ fn own_assign(st: &mut State, route: u64) {
             t.at = Instant::now();
         }
     }
-    tunnel_tell(st, guest, OWN, node, route, &to_guest, &to_host);
+    tunnel_tell(st, guest, OWN, node, route, &to_guest, &to_host, turn);
 }
 
 /// La route du tunnel (ou sa reprise : aucun passeur) est dite à ses deux bouts, l'hôte
 /// d'abord (il doit s'être montré au passeur avant le premier paquet du joueur). Chaque
 /// bout ne reçoit que les passeurs auxquels il écrit lui-même (`to_guest`, `to_host`).
+#[allow(clippy::too_many_arguments)]
 fn tunnel_tell(
     st: &State,
     guest: u64,
@@ -995,15 +1212,23 @@ fn tunnel_tell(
     route: u64,
     to_guest: &[FastHop],
     to_host: &[FastHop],
+    turn: Option<(FastHop, FastHop)>,
 ) {
-    for (c, is_host, hops) in [(host, true, to_host), (guest, false, to_guest)] {
+    let (turn_guest, turn_host) = match turn {
+        Some((g, h)) => (Some(g), Some(h)),
+        None => (None, None),
+    };
+    for (c, is_host, hops, turn) in [
+        (host, true, to_host, turn_host),
+        (guest, false, to_guest, turn_guest),
+    ] {
         // (v320) Le bout hôte d'un lien vers ce relais : tenu ici même, par le nœud iroh
         // qui le sert (dans ce programme).
         if c == OWN {
             let vias = hops
                 .iter()
                 .map(|h| minelib_net::fast::Via {
-                    addr: std::net::SocketAddr::from((h.addr, h.port)),
+                    addr: SocketAddr::from((h.addr, h.port)),
                     seal: h.seal,
                 })
                 .collect();
@@ -1013,6 +1238,7 @@ fn tunnel_tell(
                     route,
                     host: true,
                     vias,
+                    turn: turn.map(|h| h.via()),
                 },
                 false,
             );
@@ -1027,6 +1253,7 @@ fn tunnel_tell(
                     host: is_host,
                     own: false,
                     passeurs: hops.to_vec(),
+                    turn,
                 },
             );
         }
@@ -1049,7 +1276,7 @@ fn tunnel_close(st: &mut State, route: u64) {
             );
         }
     }
-    tunnel_tell(st, t.guest, t.host, t.node, route, &[], &[]);
+    tunnel_tell(st, t.guest, t.host, t.node, route, &[], &[], None);
 }
 
 /// La partie est finie : ses passeurs n'ont plus rien à porter pour elle.
@@ -1636,7 +1863,7 @@ mod tests {
         let (c5, _) = login("PasLien4");
         c5.send(Cmd::Passeur(true));
         until(|| h.state.lock().unwrap().fast.verified() == 4);
-        minelib_net::fast::tunnel_want(relay_node.id());
+        minelib_net::fast::tunnel_want(relay_node.id(), None);
         until(|| {
             let st = h.state.lock().unwrap();
             st.fast
@@ -1658,7 +1885,10 @@ mod tests {
         let (a, _) = login("PasUne0");
         a.send(Cmd::Passeur(true));
         until(|| h.state.lock().unwrap().fast.verified() == 1);
-        transport::push(&gl, &Request::TunnelWant { node: [0x5a; 32] });
+        transport::push(&gl, &Request::TunnelWant {
+                node: [0x5a; 32],
+                turn: None,
+            });
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(h.state.lock().unwrap().fast.tunnels(), 0, "un passeur seul : rien");
         let (b, _) = login("PasUne1");
@@ -1666,7 +1896,10 @@ mod tests {
         b.send(Cmd::Passeur(true));
         c.send(Cmd::Passeur(true));
         until(|| h.state.lock().unwrap().fast.verified() == 3);
-        transport::push(&gl, &Request::TunnelWant { node: [0x5a; 32] });
+        transport::push(&gl, &Request::TunnelWant {
+                node: [0x5a; 32],
+                turn: None,
+            });
         until(|| h.state.lock().unwrap().fast.tunnels() == 1);
         let st = h.state.lock().unwrap();
         let t = st.fast.tunnels.values().next().unwrap();
@@ -1747,6 +1980,9 @@ mod tests {
         let kbs = (n * block.len()) as f64 / 1024.0 / took.as_secs_f64();
         println!("DEBIT : {} octets en {:.2} s, {:.0} Ko/s", n * block.len(), took.as_secs_f64(), kbs);
         assert!(kbs > 400.0, "{kbs:.0} Ko/s");
+        // (Le jeu redemande sa route toutes les 30 s ; ici, où le relais la reprend au bout
+        // de 6 s, avant le flux.)
+        minelib_net::fast::tunnel_want(node.id(), None);
         // Une partie FPS : 256 messages de 300 octets par seconde pendant 3 s.
         let msg = vec![3u8; 300];
         let mut late = Vec::new();
@@ -1771,6 +2007,66 @@ mod tests {
             start.elapsed().as_secs_f64()
         );
         assert!(start.elapsed() < Duration::from_secs(5), "le flux a pris du retard");
+    }
+
+    /// (v329) Sans aucun passeur, un joueur ouvre un tunnel vers le relais qu'un autre
+    /// héberge : le nœud de l'hôte (`TurnAt`) et celui du joueur (`TunnelWant::turn`) ont
+    /// chacun une adresse chez un serveur TURN, le relais du monde donne à chacun celle de
+    /// l'autre, et le tunnel passe par le serveur TURN, sans serveur d'iroh. Le relais se dit
+    /// joignable tant que l'hôte a son adresse relayée ; l'hôte la perd : la route est
+    /// reprise.
+    #[test]
+    fn without_passeurs_a_tunnel_goes_through_a_turn_server() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = minelib_p2p::turn::essai::MiniTurn::start(rt.handle());
+        let (h, login) = relay("turn");
+        let (_host, hl) = login("HoteTurn");
+        let host_node = hosted(&h, &hl);
+        let hid = host_node.id();
+        assert_eq!(h.state.lock().unwrap().fast.routable(), 0, "ni passeur ni TURN");
+        host_node.passeurs().start_turn(vec![server.source()]);
+        until(|| {
+            let st = h.state.lock().unwrap();
+            st.fast
+                .nodes
+                .get(&hid)
+                .is_some_and(|c| st.fast.turns.contains_key(&(*c, hid)))
+        });
+        assert_eq!(h.state.lock().unwrap().fast.routable(), 1, "joignable par TURN");
+        minelib_net::fast::tunnel_asker("MoiTurn");
+        let (_me, _) = login("MoiTurn");
+        let mine = minelib_p2p::Node::start_offline().unwrap();
+        mine.passeurs().start_turn(vec![server.source()]);
+        until(|| mine.passeurs().turn_addr().is_some());
+        let t = mine
+            .tunnel_by_passeurs(hid, Duration::from_secs(10))
+            .expect("tunnel par TURN");
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        for i in 0..300u32 {
+            assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
+        }
+        {
+            let st = h.state.lock().unwrap();
+            let tun = st.fast.tunnels.values().find(|t| t.node == hid).unwrap();
+            assert!(tun.passeurs.is_empty(), "aucun passeur");
+            let (g, hh, _) = tun.turn.unwrap();
+            assert_eq!(Some(g), mine.passeurs().turn_addr());
+            assert_eq!(Some(hh), host_node.passeurs().turn_addr());
+            assert_eq!(st.fast.turn_counts().1, 1);
+        }
+        let (sent, received) = mine.passeurs().turn_counts();
+        assert!(sent > 20 && received > 20, "{sent} envoyés, {received} reçus");
+        // L'hôte n'a plus d'adresse relayée : plus de saut TURN, la route est reprise.
+        host_node.passeurs().stop_turn();
+        until(|| {
+            let st = h.state.lock().unwrap();
+            st.fast.tunnels.values().all(|t| t.node != hid) && st.fast.routable() == 0
+        });
     }
 
     /// (v301, v308) Un joueur ouvre un tunnel vers le relais qu'un autre héberge : le
@@ -1829,6 +2125,7 @@ mod tests {
                 &gl,
                 &Request::TunnelWant {
                     node: host_node.id(),
+                    turn: None,
                 },
             );
             std::thread::sleep(Duration::from_millis(150));
@@ -1870,7 +2167,10 @@ mod tests {
         // Douze tunnels d'un joueur qui ne relaie pas : deux passeurs chacun, les moins
         // chargés d'abord ; à la fin, chacun des trois en porte huit.
         for i in 0..12u8 {
-            transport::push(&g1, &Request::TunnelWant { node: node(i) });
+            transport::push(&g1, &Request::TunnelWant {
+                    node: node(i),
+                    turn: None,
+                });
         }
         until(|| h.state.lock().unwrap().fast.tunnels() == 12);
         {
@@ -1880,11 +2180,17 @@ mod tests {
             assert_eq!(loads, vec![8, 8, 8]);
         }
         // Un autre joueur qui ne relaie pas : plus de place pour lui.
-        transport::push(&g2, &Request::TunnelWant { node: node(12) });
+        transport::push(&g2, &Request::TunnelWant {
+                node: node(12),
+                turn: None,
+            });
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(h.state.lock().unwrap().fast.tunnels(), 12);
         // Celui qui relaie : servi, par les deux autres passeurs.
-        transport::push(&cl, &Request::TunnelWant { node: node(12) });
+        transport::push(&cl, &Request::TunnelWant {
+                node: node(12),
+                turn: None,
+            });
         until(|| h.state.lock().unwrap().fast.tunnels() == 13);
         let st = h.state.lock().unwrap();
         let t = st

@@ -13,12 +13,18 @@
 //! avec les chemins directs : le plus rapide des deux quand il y a les deux, et ses
 //! serveurs relais seulement quand il ne reste rien d'autre. L'adresse d'un pair sur ce
 //! transport est le numéro de la route que le relais du monde a ouverte entre les deux.
+//!
+//! (v329) Une route peut aussi passer par un serveur TURN (`crate::turn`) : chaque bout y
+//! a une adresse relayée, et le relais du monde donne à chacun
+//! celle de l'autre comme un saut de plus, après ses passeurs. Les paquets de ce saut
+//! partent par notre client TURN au lieu de la socket des passeurs, et en reviennent par
+//! lui ; le reste (sceau, sens, passeur muet, signes de vie) est le même.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::transports::{
@@ -48,12 +54,23 @@ fn route_of(a: &CustomAddr) -> Option<u64> {
     (a.id() == TRANSPORT_ID).then(|| a.data().try_into().ok().map(u64::from_le_bytes))?
 }
 
+/// Un saut de la route : un passeur, ou (v329, `turn`) l'adresse relayée de l'autre bout
+/// chez un serveur TURN, que nos paquets joignent par notre propre client TURN.
+struct Hop {
+    addr: SocketAddr,
+    /// Clé du sceau de la route pour ce saut.
+    seal: [u8; 32],
+    /// Dernier paquet de l'autre bout venu par lui.
+    heard: Option<Instant>,
+    turn: bool,
+}
+
 struct Route {
     /// Notre sens sur cette route (`fast::TO_HOST` ou `fast::TO_GUEST`).
     dir: u8,
-    /// Passeurs de la route (adresse, clé du sceau, dernier paquet venu par lui), et celui
-    /// qu'on emploie.
-    vias: Vec<(SocketAddr, [u8; 32], Option<Instant>)>,
+    /// Sauts de la route (ses passeurs, puis le saut TURN s'il y en a un), et celui qu'on
+    /// emploie.
+    vias: Vec<Hop>,
     via: usize,
     seq: u64,
     /// (v304) Dernière fois qu'on a dit au relais que plus rien n'y passait.
@@ -61,17 +78,17 @@ struct Route {
 }
 
 impl Route {
-    /// Le passeur à employer : celui en cours tant qu'il donne signe de vie, sinon celui
+    /// Le saut à employer : celui en cours tant qu'il donne signe de vie, sinon celui
     /// dont on a eu des nouvelles le plus récemment.
     fn pick(&mut self, now: Instant) -> usize {
         let alive = |h: Option<Instant>| h.is_some_and(|t| now.duration_since(t) < SILENT);
-        if !alive(self.vias[self.via].2) {
+        if !alive(self.vias[self.via].heard) {
             if let Some((i, _)) = self
                 .vias
                 .iter()
                 .enumerate()
-                .filter(|(_, v)| alive(v.2))
-                .max_by_key(|(_, v)| v.2)
+                .filter(|(_, v)| alive(v.heard))
+                .max_by_key(|(_, v)| v.heard)
             {
                 log::info!("tunnel : un passeur se tait, la route passe par l'autre");
                 self.via = i;
@@ -96,16 +113,18 @@ fn on_route(r: &fast::TunnelRoute) {
             .collect()
     };
     let vias: Vec<(SocketAddr, [u8; 32])> = r.vias.iter().map(|v| (v.addr, v.seal)).collect();
+    let turn = r.turn.map(|v| (v.addr, v.seal));
     for (node, t) in nodes {
         // (Chaque bout a ses propres passeurs : ce qui est dit à l'hôte ne vaut que pour
         // le bout hôte de la route, et inversement.)
         let dir = t.0.routes.lock().unwrap().get(&r.route).map(|x| x.dir);
         let dir = dir.filter(|d| (*d == fast::TO_GUEST) == r.host);
+        let none = vias.is_empty() && turn.is_none();
         match dir {
-            Some(_) if vias.is_empty() => t.drop_route(r.route),
-            Some(dir) => t.set_route(r.route, dir, vias.clone()),
-            None if r.host && node == r.node && !vias.is_empty() && !t.has(r.route) => {
-                t.set_route(r.route, fast::TO_GUEST, vias.clone())
+            Some(_) if none => t.drop_route(r.route),
+            Some(dir) => t.set_route(r.route, dir, vias.clone(), turn),
+            None if r.host && node == r.node && !none && !t.has(r.route) => {
+                t.set_route(r.route, fast::TO_GUEST, vias.clone(), turn)
             }
             None => {}
         }
@@ -123,7 +142,16 @@ struct Inner {
     addrs: n0_watcher::Watchable<Vec<CustomAddr>>,
     /// Le moteur du nœud (pour ce qui part d'un autre fil que les siens).
     rt: tokio::runtime::Handle,
+    /// (v329) Le nœud de ce transport, son client TURN s'il en a un, et ce qui en est venu
+    /// sans avoir encore été lu (adresse relayée de l'autre bout, paquet).
+    node: OnceLock<[u8; 32]>,
+    turn: Mutex<Option<Arc<crate::turn::TurnClient>>>,
+    turn_in: Mutex<VecDeque<(SocketAddr, Vec<u8>)>>,
+    turn_waker: Mutex<Option<Waker>>,
 }
+
+/// Paquets venus par TURN gardés en attente de lecture, au plus.
+const TURN_QUEUE: usize = 1024;
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -132,9 +160,9 @@ impl std::fmt::Debug for Inner {
 }
 
 impl Inner {
-    /// Un paquet (`kind`, `body`) sur la route `route`, par le passeur en cours.
+    /// Un paquet (`kind`, `body`) sur la route `route`, par le saut en cours.
     fn send(&self, route: u64, kind: u8, body: &[u8]) -> io::Result<()> {
-        let (to, packet) = {
+        let (to, turn, packet) = {
             let mut routes = self.routes.lock().unwrap();
             let r = routes
                 .get_mut(&route)
@@ -146,32 +174,46 @@ impl Inner {
             }
             let via = r.pick(Instant::now());
             r.seq += 1;
-            let (to, seal, _) = r.vias[via];
-            (to, fast::raw_pack(route, r.dir, r.seq, &seal, kind, body))
+            let h = &r.vias[via];
+            let p = fast::raw_pack(route, r.dir, r.seq, &h.seal, kind, body);
+            (h.addr, h.turn, p)
         };
+        self.out(to, turn, &packet)
+    }
+
+    /// Un paquet vers un saut : la socket des passeurs, ou (v329) notre client TURN.
+    fn out(&self, to: SocketAddr, turn: bool, packet: &[u8]) -> io::Result<()> {
+        if turn {
+            let t = self.turn.lock().unwrap().clone();
+            if let Some(t) = t {
+                t.send(to, packet);
+            }
+            return Ok(());
+        }
         // (Tampon plein : le paquet est perdu, QUIC le renverra.)
-        match self.sock.try_send_to(&packet, to) {
+        match self.sock.try_send_to(packet, to) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e),
         }
     }
 
-    /// Un paquet vide sur chaque route, par chacun de ses passeurs.
+    /// Un paquet vide sur chaque route, par chacun de ses sauts.
     fn keep(&self) {
         let mut out = Vec::new();
         let now = Instant::now();
         for (id, r) in self.routes.lock().unwrap().iter_mut() {
-            for (to, seal, _) in &r.vias {
+            for h in &r.vias {
                 r.seq += 1;
-                out.push((*to, fast::raw_pack(*id, r.dir, r.seq, seal, fast::RAW_KEEP, &[])));
+                let p = fast::raw_pack(*id, r.dir, r.seq, &h.seal, fast::RAW_KEEP, &[]);
+                out.push((h.addr, h.turn, p));
             }
             // (v304) Elle passait, et plus rien ne vient d'aucun de ses passeurs : on le
             // dit au relais, qui lui en donne d'autres. Le tunnel attend (iroh garde un
             // chemin muet 15 s avant d'y renoncer).
             let silent = |h: Option<Instant>| h.is_some_and(|t| now.duration_since(t) >= SILENT);
-            if r.vias.iter().any(|v| v.2.is_some())
-                && r.vias.iter().all(|v| v.2.is_none() || silent(v.2))
+            if r.vias.iter().any(|v| v.heard.is_some())
+                && r.vias.iter().all(|v| v.heard.is_none() || silent(v.heard))
                 && r.reported.is_none_or(|t| now.duration_since(t) >= REPORT_EVERY)
             {
                 r.reported = Some(now);
@@ -179,23 +221,66 @@ impl Inner {
                 fast::tunnel_bad(*id);
             }
         }
-        for (to, p) in out {
-            let _ = self.sock.try_send_to(&p, to);
+        for (to, turn, p) in out {
+            let _ = self.out(to, turn, &p);
         }
     }
 
-    /// (v304) Un paquet sans contenu (`kind`) sur la route `route` : par le passeur
-    /// `via`, ou par tous.
+    /// (v304) Un paquet sans contenu (`kind`) sur la route `route` : par le saut `via`,
+    /// ou par tous.
     fn signal(&self, route: u64, kind: u8, via: Option<SocketAddr>) {
         let mut out = Vec::new();
         if let Some(r) = self.routes.lock().unwrap().get_mut(&route) {
-            for (to, seal, _) in r.vias.iter().filter(|v| via.is_none_or(|a| a == v.0)) {
+            for h in r.vias.iter().filter(|v| via.is_none_or(|a| a == v.addr)) {
                 r.seq += 1;
-                out.push((*to, fast::raw_pack(route, r.dir, r.seq, seal, kind, &[])));
+                let p = fast::raw_pack(route, r.dir, r.seq, &h.seal, kind, &[]);
+                out.push((h.addr, h.turn, p));
             }
         }
-        for (to, p) in out {
-            let _ = self.sock.try_send_to(&p, to);
+        for (to, turn, p) in out {
+            let _ = self.out(to, turn, &p);
+        }
+    }
+
+    /// Un paquet venu de `from` (par TURN si `turn`) : sa route et son contenu s'il est
+    /// pour iroh. Les autres (signes de vie, sondes) sont traités ici.
+    fn accept<'a>(&self, from: SocketAddr, turn: bool, got: &'a [u8]) -> Option<(u64, &'a [u8])> {
+        let mut routes = self.routes.lock().unwrap();
+        let hop = |r: &Route| -> Option<[u8; 32]> {
+            r.vias
+                .iter()
+                .find(|v| v.addr == from && v.turn == turn)
+                .map(|v| v.seal)
+        };
+        let (route, dir, kind, body) = fast::raw_open(got, |r| routes.get(&r).and_then(hop))?;
+        let r = routes.get_mut(&route)?;
+        // (Notre propre sens : un paquet à nous, renvoyé par erreur.)
+        if dir == r.dir {
+            return None;
+        }
+        if let Some(v) = r.vias.iter_mut().find(|v| v.addr == from && v.turn == turn) {
+            v.heard = Some(Instant::now());
+        }
+        // (v304) L'autre bout s'assure que la route passe : on lui répond par le même saut.
+        if kind == fast::RAW_PING {
+            drop(routes);
+            self.signal(route, fast::RAW_PONG, Some(from));
+            return None;
+        }
+        (kind == fast::RAW_DATA).then_some((route, body))
+    }
+
+    /// (v329) Reçu par notre client TURN : gardé pour la prochaine lecture d'iroh.
+    fn turn_in(&self, from: SocketAddr, p: &[u8]) {
+        {
+            let mut q = self.turn_in.lock().unwrap();
+            if q.len() >= TURN_QUEUE {
+                return;
+            }
+            q.push_back((from, p.to_vec()));
+        }
+        if let Some(w) = self.turn_waker.lock().unwrap().take() {
+            w.wake();
         }
     }
 }
@@ -215,6 +300,10 @@ impl PasseurTransport {
             routes: Mutex::new(HashMap::new()),
             addrs: n0_watcher::Watchable::new(Vec::new()),
             rt: tokio::runtime::Handle::current(),
+            node: OnceLock::new(),
+            turn: Mutex::new(None),
+            turn_in: Mutex::new(VecDeque::new()),
+            turn_waker: Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
         tokio::spawn(async move {
@@ -234,29 +323,102 @@ impl PasseurTransport {
     pub(crate) fn register(&self, node: [u8; 32]) {
         fast::set_tunnel_hook(on_route);
         NODES.lock().unwrap().push((node, Arc::downgrade(&self.0)));
+        let _ = self.0.node.set(node);
+        // (v329) Une adresse chez un serveur TURN, si ce programme en veut (`enable_turn`)
+        // et que le jeu en connaît (`relais_turn.txt`).
+        if crate::turn_enabled() {
+            let sources = crate::turn::sources();
+            if !sources.is_empty() {
+                self.start_turn(sources);
+            }
+        }
     }
 
-    /// Ouvre (ou remplace) la route `route` : notre sens, et ses passeurs.
-    pub fn set_route(&self, route: u64, dir: u8, vias: Vec<(SocketAddr, [u8; 32])>) {
+    /// (v329) Démarre le client TURN de ce transport : son adresse relayée est dite au
+    /// relais (`fast::set_turn_addr`), et le saut TURN des routes passe par lui.
+    pub fn start_turn(&self, sources: Vec<crate::turn::Source>) {
+        let weak = Arc::downgrade(&self.0);
+        let node = self.0.node.get().copied();
+        let sink: crate::turn::Sink = Box::new(move |from, p| {
+            if let Some(i) = weak.upgrade() {
+                i.turn_in(from, p);
+            }
+        });
+        let told: crate::turn::Told = Box::new(move |a| {
+            if let Some(n) = node {
+                fast::set_turn_addr(n, a);
+            }
+        });
+        match crate::turn::TurnClient::start(&self.0.rt, sources, sink, told) {
+            Ok(c) => *self.0.turn.lock().unwrap() = Some(c),
+            Err(e) => log::info!("TURN : pas de socket ({e})"),
+        }
+    }
+
+    /// (v329) Arrête le client TURN de ce transport (le nœud s'en va, essais) : son adresse
+    /// relayée n'est plus dite aux relais.
+    pub fn stop_turn(&self) {
+        let t = self.0.turn.lock().unwrap().take();
+        drop(t);
+    }
+
+    /// (v329) Notre adresse relayée chez le serveur TURN, s'il y en a une.
+    pub fn turn_addr(&self) -> Option<SocketAddrV4> {
+        self.0.turn.lock().unwrap().as_ref()?.relayed()
+    }
+
+    /// (v329) Paquets envoyés et reçus par TURN (essais, journal).
+    pub fn turn_counts(&self) -> (u64, u64) {
+        self.0
+            .turn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or((0, 0), |t| t.counts())
+    }
+
+    /// Ouvre (ou remplace) la route `route` : notre sens, ses passeurs, et (v329) l'adresse
+    /// relayée de l'autre bout chez un serveur TURN.
+    pub fn set_route(
+        &self,
+        route: u64,
+        dir: u8,
+        vias: Vec<(SocketAddr, [u8; 32])>,
+        turn: Option<(SocketAddr, [u8; 32])>,
+    ) {
         {
             let mut routes = self.0.routes.lock().unwrap();
             let old = routes.get(&route);
             let seq = old.map_or(0, |r| r.seq);
-            // (Un passeur gardé garde ce qu'on sait de lui.)
-            let vias = vias
+            let hops = vias
                 .into_iter()
-                .map(|(a, s)| {
+                .map(|(a, s)| (a, s, false))
+                .chain(turn.map(|(a, s)| (a, s, true)));
+            // (Un saut gardé garde ce qu'on sait de lui.)
+            let vias: Vec<Hop> = hops
+                .map(|(addr, seal, turn)| {
                     let heard = old
-                        .and_then(|r| r.vias.iter().find(|v| v.0 == a && v.1 == s))
-                        .and_then(|v| v.2);
-                    (a, s, heard)
+                        .and_then(|r| {
+                            r.vias
+                                .iter()
+                                .find(|v| v.addr == addr && v.seal == seal && v.turn == turn)
+                        })
+                        .and_then(|v| v.heard);
+                    Hop {
+                        addr,
+                        seal,
+                        heard,
+                        turn,
+                    }
                 })
                 .collect();
-            let vias: Vec<(SocketAddr, [u8; 32], Option<Instant>)> = vias;
-            // (Le passeur employé le reste s'il est toujours là.)
+            // (Le saut employé le reste s'il est toujours là.)
             let via = old
                 .and_then(|r| r.vias.get(r.via))
-                .and_then(|cur| vias.iter().position(|v| v.0 == cur.0))
+                .and_then(|cur| {
+                    vias.iter()
+                        .position(|v| v.addr == cur.addr && v.turn == cur.turn)
+                })
                 .unwrap_or(0);
             let reported = old.and_then(|r| r.reported);
             routes.insert(
@@ -307,7 +469,7 @@ impl PasseurTransport {
         routes.get(&route).is_some_and(|r| {
             r.vias
                 .iter()
-                .any(|v| v.2.is_some_and(|t| t.elapsed() < SILENT))
+                .any(|v| v.heard.is_some_and(|t| t.elapsed() < SILENT))
         })
     }
 
@@ -315,7 +477,16 @@ impl PasseurTransport {
     pub fn via(&self, route: u64) -> Option<SocketAddr> {
         let routes = self.0.routes.lock().unwrap();
         let r = routes.get(&route)?;
-        r.vias.get(r.via).map(|v| v.0)
+        r.vias.get(r.via).map(|v| v.addr)
+    }
+
+    /// (v329) La route `route` passe-t-elle en ce moment par TURN (essais, journal) ?
+    pub fn via_turn(&self, route: u64) -> bool {
+        let routes = self.0.routes.lock().unwrap();
+        routes
+            .get(&route)
+            .and_then(|r| r.vias.get(r.via))
+            .is_some_and(|v| v.turn)
     }
 }
 
@@ -347,7 +518,18 @@ impl CustomEndpoint for End {
         let mut count = 0;
         let mut errors = 0;
         let mut packet = [0u8; 2048];
-        while count < bufs.len() {
+        let cap = bufs.len();
+        let mut deliver = |count: &mut usize, route: u64, body: &[u8]| {
+            if body.len() > bufs[*count].len() {
+                return;
+            }
+            bufs[*count][..body.len()].copy_from_slice(body);
+            metas[*count].len = body.len();
+            metas[*count].stride = body.len();
+            recv_infos[*count] = RecvInfo::new(addr(route), Some(addr(route)));
+            *count += 1;
+        };
+        while count < cap {
             let mut read = tokio::io::ReadBuf::new(&mut packet);
             match self.0.sock.poll_recv_from(cx, &mut read) {
                 Poll::Pending => break,
@@ -361,42 +543,29 @@ impl CustomEndpoint for End {
                     }
                 }
                 Poll::Ready(Ok(from)) => {
-                    let got = read.filled();
-                    let mut routes = self.0.routes.lock().unwrap();
-                    let opened = fast::raw_open(got, |r| {
-                        routes
-                            .get(&r)
-                            .and_then(|x| x.vias.iter().find(|v| v.0 == from).map(|v| v.1))
-                    });
-                    let Some((route, dir, kind, body)) = opened else {
-                        continue;
-                    };
-                    let Some(r) = routes.get_mut(&route) else {
-                        continue;
-                    };
-                    // (Notre propre sens : un paquet à nous, renvoyé par erreur.)
-                    if dir == r.dir {
-                        continue;
+                    if let Some((route, body)) = self.0.accept(from, false, read.filled()) {
+                        deliver(&mut count, route, body);
                     }
-                    if let Some(v) = r.vias.iter_mut().find(|v| v.0 == from) {
-                        v.2 = Some(Instant::now());
-                    }
-                    // (v304) L'autre bout s'assure que la route passe : on lui répond
-                    // par le même passeur.
-                    if kind == fast::RAW_PING {
-                        drop(routes);
-                        self.0.signal(route, fast::RAW_PONG, Some(from));
-                        continue;
-                    }
-                    if kind != fast::RAW_DATA || body.len() > bufs[count].len() {
-                        continue;
-                    }
-                    bufs[count][..body.len()].copy_from_slice(body);
-                    metas[count].len = body.len();
-                    metas[count].stride = body.len();
-                    recv_infos[count] = RecvInfo::new(addr(route), Some(addr(route)));
-                    count += 1;
                 }
+            }
+        }
+        // (v329) Ce que notre client TURN a reçu entre-temps. (Le réveil est posé avant de
+        // regarder : un paquet arrivé juste après ne peut pas être oublié.)
+        if count < cap {
+            *self.0.turn_waker.lock().unwrap() = Some(cx.waker().clone());
+            let room = cap - count;
+            let got: Vec<(SocketAddr, Vec<u8>)> = {
+                let mut q = self.0.turn_in.lock().unwrap();
+                let n = q.len().min(room);
+                q.drain(..n).collect()
+            };
+            for (from, p) in got {
+                if let Some((route, body)) = self.0.accept(from, true, &p) {
+                    deliver(&mut count, route, body);
+                }
+            }
+            if !self.0.turn_in.lock().unwrap().is_empty() {
+                cx.waker().wake_by_ref();
             }
         }
         if count > 0 {
@@ -477,12 +646,17 @@ pub(crate) async fn ask(t: &PasseurTransport, remote: [u8; 32]) -> Option<u64> {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
-    fast::tunnel_want(remote);
+    fast::tunnel_want(remote, t.turn_addr());
     let start = Instant::now();
     let route = loop {
         if let Some(r) = fast::tunnel_route(remote) {
             let vias = r.vias.iter().map(|v| (v.addr, v.seal)).collect();
-            t.set_route(r.route, fast::TO_HOST, vias);
+            t.set_route(
+                r.route,
+                fast::TO_HOST,
+                vias,
+                r.turn.map(|v| (v.addr, v.seal)),
+            );
             break r.route;
         }
         if start.elapsed() >= ASK_WAIT {
@@ -514,7 +688,7 @@ pub(crate) async fn keep(
     loop {
         tokio::select! {
             _ = conn.closed() => break,
-            _ = tokio::time::sleep(fast::TUNNEL_RENEW) => fast::tunnel_want(remote),
+            _ = tokio::time::sleep(fast::TUNNEL_RENEW) => fast::tunnel_want(remote, t.turn_addr()),
         }
     }
     t.drop_route(route);

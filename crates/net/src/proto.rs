@@ -81,6 +81,7 @@ use serde::{Deserialize, Serialize};
 /// (v326, toujours 75) `Host::replace`, `Host::code` et `Response::WorldLimit`.
 /// (v328, toujours 75) La graine du monde verrouillée (`SERVER_SEED`, `Response::SeedLock`,
 /// `ProvinceSettings::seed_open`).
+/// (v329, toujours 75) `TunnelWant::turn`, `TunnelWay::turn` et `Request::TurnAt`.
 pub const PROTOCOL: u32 = 75;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
@@ -972,6 +973,9 @@ pub enum Request {
     /// avant, par les serveurs relais d'iroh.
     TunnelWant {
         node: [u8; 32],
+        /// (v329) L'adresse relayée du nœud qui ouvre le tunnel, chez un serveur TURN (IPv4,
+        /// port), s'il en a une : avec celle de l'hôte, la route a un saut par TURN.
+        turn: Option<([u8; 4], u16)>,
     },
     /// (v304) D'un bout du tunnel de la route `route` : plus rien n'y passe depuis
     /// quelques secondes. Le relais écarte ses passeurs pour ce tunnel et en donne
@@ -1003,6 +1007,13 @@ pub enum Request {
     /// aux 50 premiers : le jeu demande la page suivante quand on approche de la fin.
     LeaderboardFrom {
         from: u32,
+    },
+    /// (v329) L'adresse relayée du nœud iroh `node` de ce jeu chez un serveur TURN (rien :
+    /// il n'en a plus). Dite à chaque relais quand elle change et à chaque connexion : le
+    /// relais en fait un saut des routes vers ce nœud quand le joueur en a une aussi.
+    TurnAt {
+        node: [u8; 32],
+        turn: Option<([u8; 4], u16)>,
     },
 }
 
@@ -1114,6 +1125,7 @@ impl Request {
                 | Request::NearbyClose { .. }
                 | Request::TunnelWant { .. }
                 | Request::TunnelBad { .. }
+                | Request::TurnAt { .. }
                 | Request::NetLog { .. }
                 | Request::MapReport
                 | Request::BulkEdit { .. }
@@ -1949,6 +1961,9 @@ pub enum Response {
         host: bool,
         own: bool,
         passeurs: Vec<FastHop>,
+        /// (v329) L'adresse relayée de l'autre bout chez un serveur TURN, et la clé du
+        /// sceau de ce saut : un chemin de plus, après les passeurs (ou sans eux).
+        turn: Option<FastHop>,
     },
     /// (v304) Ce relais a (`n` > 0) ou n'a plus de passeurs vérifiés : dit à chaque
     /// connexion ouverte, et quand cela change. Sans passeur, le jeu ouvre ses tunnels
@@ -2798,6 +2813,7 @@ mod push_tests {
                 host: false,
                 own: false,
                 passeurs: Vec::new(),
+                turn: None,
             },
             Response::PasseursKnown { n: 1 },
             Response::PasseurLink {

@@ -2,7 +2,7 @@
 # n'y a ni passeur ni lien direct. Sans eux, ce sont ceux de l'équipe d'iroh (gratuits mais
 # limités en débit : environ 45 Ko/s mesurés, prévus pour le développement).
 #
-# Une adresse par ligne, par exemple `https://203-0-113-7.sslip.io` : un serveur
+# Une adresse par ligne, par exemple `https://minelib1.duckdns.org` : un serveur
 # `iroh-relay` (logiciel libre de l'équipe d'iroh) que l'on fait tourner soi-même, par
 # exemple sur une machine gratuite d'Oracle Cloud (voir deploiement/oracle-gratuit). Le jeu
 # les essaie au lancement (`/ping`, 2 secondes au plus) et ne garde que ceux qui

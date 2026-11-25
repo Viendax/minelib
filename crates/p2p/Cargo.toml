@@ -18,6 +18,12 @@ mainline = "8"
 iroh-dns = "1.4.1"
 ureq = { version = "3", features = ["platform-verifier"] }
 data-encoding = "2"
+# (v329) TURN (relais de Cloudflare ou autre) : intégrité des messages, identifiants.
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+rand = "0.8"
+serde_json = "1"
 # Ouverture d'un port sur la box (passeurs de la voie rapide) : déjà là avec iroh.
 portmapper = "0.19"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }

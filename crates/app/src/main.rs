@@ -349,6 +349,8 @@ struct Game {
     wake_confirm: Option<(String, f32)>,
     /// (v326) Nouveau monde à la limite : la confirmation demandée.
     limit_ask: Option<LimitAsk>,
+    /// (v329) Liens directs demandés : la confirmation est à l'écran.
+    direct_confirm: bool,
     fps_status: Option<String>,
     /// Mise à jour automatique (GitHub).
     updater: update::Updater,
@@ -515,6 +517,9 @@ impl Game {
         let keys = keys::Bindings::load(&paths.root.join("keys.txt"));
         let options = Options::load(&paths.options);
         minelib_p2p::set_hosts_direct(options.host_direct);
+        // (v329) Les nœuds du jeu prennent une adresse chez un serveur TURN
+        // (`relais_turn.txt`) : un chemin de plus pour les tunnels, sans passeur.
+        minelib_p2p::enable_turn();
         account::set_invitation(&options.invitation);
         // (v307) Journal réseau : partagé si le joueur l'a accepté ; reçu si ce PC, quand
         // il est le relais, l'a demandé (paramètres avancés).
@@ -580,6 +585,7 @@ impl Game {
             hosting: None,
             wake_confirm: None,
             limit_ask: None,
+            direct_confirm: false,
             fps_status: None,
             updater: update::Updater::new(),
             was_playing: false,
@@ -3744,6 +3750,7 @@ impl Game {
         }
         if advanced {
             self.screen = Screen::Advanced;
+            self.direct_confirm = false;
         }
         if sound {
             // (v215) Le dernier relevé tout de suite (le refaire prend jusqu'à une seconde
@@ -3918,6 +3925,10 @@ impl Game {
     /// partager avec le relais (la question posée une fois au menu d'accueil), et, quand ce
     /// PC est le relais, recevoir ceux des joueurs qui les partagent.
     fn advanced_screen(&mut self, input: &Input, size: (u32, u32), over_game: bool) {
+        if self.direct_confirm {
+            self.direct_confirm_screen(input, size, over_game);
+            return;
+        }
         let mut c = Ctx::new(&mut self.ui, input, size);
         if over_game {
             c.dim(0.7);
@@ -3999,9 +4010,14 @@ impl Game {
         }
         y += 14.0 * s;
         let done = c.button("Terminé", cx, (c.h * 0.78).max(y), 200.0, true);
+        // (v329) Les mettre à oui se confirme (ce que ça montre, redit) ; les ôter, non.
+        if flip_direct && !direct {
+            self.direct_confirm = true;
+            return;
+        }
         if flip_direct {
-            self.options.host_direct = Some(!direct);
-            minelib_p2p::set_hosts_direct(Some(!direct));
+            self.options.host_direct = Some(false);
+            minelib_p2p::set_hosts_direct(Some(false));
         }
         if flip_pass {
             self.options.passeur = Some(!pass);
@@ -4028,6 +4044,46 @@ impl Game {
         }
         if done || input.pressed(KeyCode::Escape) {
             self.screen = Screen::Settings;
+        }
+    }
+
+    /// (v329) Confirmation des liens directs : ce qu'ils montrent, puis « Activer » ou
+    /// « Annuler » (Échap aussi). Rien ne change sans « Activer ».
+    fn direct_confirm_screen(&mut self, input: &Input, size: (u32, u32), over_game: bool) {
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        if over_game {
+            c.dim(0.8);
+        } else {
+            c.background();
+        }
+        let s = c.s;
+        let ds = (s / 2.0).floor().max(1.0);
+        let cx = c.w / 2.0;
+        c.text_center("Activer les liens directs ?", c.h * 0.22, s * 2.0, WHITE);
+        let mut y = c.h * 0.34;
+        for line in [
+            "Ton jeu se reliera en direct aux joueurs qui les ont activés eux aussi.",
+            "Eux verront ton adresse IP, et toi la leur : elle dit à peu près où tu habites (ville,",
+            "fournisseur d'accès), et permet de viser ta connexion (par exemple pour la saturer).",
+            "Quand ton PC sert une région, une province ou un relais, ceux qui y jouent en direct",
+            "sauront que c'est toi. Pour tous les autres joueurs, rien ne change.",
+            "Pris en compte au prochain lancement du jeu ; tu peux les retirer ici à tout moment.",
+        ] {
+            c.text_center(line, y, ds, GREY);
+            y += 7.0 * ds;
+        }
+        y += 20.0 * s;
+        let yes = c.button("Activer les liens directs", cx, y, 240.0, true);
+        let no = c.button("Annuler", cx, y + 24.0 * s, 240.0, true);
+        if yes {
+            self.options.host_direct = Some(true);
+            minelib_p2p::set_hosts_direct(Some(true));
+            if let Err(e) = self.options.save(&self.paths.options) {
+                log::error!("options : {e:#}");
+            }
+            self.direct_confirm = false;
+        } else if no || input.pressed(KeyCode::Escape) {
+            self.direct_confirm = false;
         }
     }
 

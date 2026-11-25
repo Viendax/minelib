@@ -9465,11 +9465,13 @@ fn health_report(st: &mut State) {
         _ => (f, b + 1),
     });
     let (offers, verified, carried) = st.fast.counts();
+    let (turn_nodes, turn_tunnels) = st.fast.turn_counts();
     let line = format!(
         "relais (santé, {:.0} s) : {} connexions, {fps} parties FPS, {build} mondes ; {} demandes, \
          attente la plus longue {:.0} ms, traitement le plus long {:.0} ms ; {} positions \
          écartées ; {} connexions de compte (refusées {}, relais occupé {}) ; passeurs : \
-         {offers} annoncés, {verified} vérifiés, {carried} parties portées, {} tunnels portés",
+         {offers} annoncés, {verified} vérifiés, {carried} parties portées, {} tunnels portés ; \
+         TURN : {turn_nodes} nœuds, {turn_tunnels} tunnels",
         since.elapsed().as_secs_f32(),
         st.conns.len(),
         h.requests,
@@ -9515,6 +9517,11 @@ pub(crate) fn handle_prepared(
     st.health.wait_max_ms = st.health.wait_max_ms.max(ms(got - asked));
     st.health.held_max_ms = st.health.held_max_ms.max(ms(got.elapsed()));
     r
+}
+
+/// (v329) Une adresse IPv4 telle que le protocole la porte.
+fn v4((ip, port): ([u8; 4], u16)) -> std::net::SocketAddrV4 {
+    std::net::SocketAddrV4::new(ip.into(), port)
 }
 
 fn handle_locked(
@@ -9627,6 +9634,7 @@ fn handle_locked(
             | Request::FastBad { .. }
             | Request::TunnelWant { .. }
             | Request::TunnelBad { .. }
+            | Request::TurnAt { .. }
             | Request::NetLog { .. }
             | Request::MapReport
     ) {
@@ -9650,7 +9658,10 @@ fn handle_locked(
                     }
                 }
                 Request::NetLog { lines } => journaux::got(st, id, lines),
-                Request::TunnelWant { node } => passeurs::tunnel_want(st, id, node),
+                Request::TunnelWant { node, turn } => {
+                    passeurs::tunnel_want(st, id, node, turn.map(v4))
+                }
+                Request::TurnAt { node, turn } => passeurs::turn_at(st, id, node, turn.map(v4)),
                 Request::TunnelBad { route } => passeurs::tunnel_bad(st, id, route),
                 Request::PasseurOffer { port, external } => {
                     passeurs::offer(st, id, peer, port, external)

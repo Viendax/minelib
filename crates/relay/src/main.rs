@@ -64,6 +64,9 @@ fn main() -> Result<()> {
     // Joignable sans port ouvert, et inscrit dans le DHT.
     // (v326) Une machine sans joueur : le DHT de BitTorrent en plus des relais pkarr.
     minelib_p2p::allow_dht();
+    // (v329) Son nœud prend une adresse chez un serveur TURN (`relais_turn.txt`) : les liens
+    // des joueurs vers lui y passent aussi.
+    minelib_p2p::enable_turn();
     let _node = if dht {
         // (v279) Identité iroh gardée d'un lancement à l'autre (`noeud.key`, comme le jeu) :
         // les jeux retiennent le nœud des relais où ils ont joué et le joignent
