@@ -40,22 +40,39 @@ pub struct SimState {
 
 /// Position d'un joueur à un pas (message court) : regard en 65536e de tour, accroupi
 /// et vitesse sur un octet.
+/// (v334) Position relative à celle du joueur qui reçoit (`you.pos` du même message), en
+/// `POSE_UNIT`es de bloc : 4 à 6 octets au lieu de 12 pour des joueurs à quelques dizaines
+/// de blocs, sans limite de distance ; cap sur 2 octets fixes (3 avant, le plus souvent).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Pose {
     pub id: u64,
-    pub pos: [f32; 3],
+    pub rel: [i32; 3],
+    #[serde(with = "fixed16")]
     pub yaw: i16,
     pub pitch: i16,
     pub crouch: u8,
     pub speed: u8,
 }
 
+/// (v334) Finesse des positions de `Pose` : un 64e de bloc (moins d'un centimètre d'erreur).
+pub const POSE_UNIT: f32 = 64.0;
+
 impl Pose {
-    pub fn of(p: &NetPlayer) -> Self {
+    /// `anchor` : la position du joueur qui reçoit, telle qu'elle part dans le même message.
+    pub fn of(p: &NetPlayer, anchor: [f32; 3]) -> Self {
         let turn = |a: f32| (a / std::f32::consts::TAU * 65536.0).round() as i64 as i16;
+        let q = |v: f32, a: f32| {
+            ((f64::from(v) - f64::from(a)) * f64::from(POSE_UNIT))
+                .round()
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+        };
         Pose {
             id: p.id,
-            pos: p.pos,
+            rel: [
+                q(p.pos[0], anchor[0]),
+                q(p.pos[1], anchor[1]),
+                q(p.pos[2], anchor[2]),
+            ],
             yaw: turn(p.yaw),
             pitch: turn(p.pitch),
             crouch: (p.crouch.clamp(0.0, 1.0) * 255.0) as u8,
@@ -63,14 +80,31 @@ impl Pose {
         }
     }
 
-    /// Met `p` à cette position.
-    pub fn apply(&self, p: &mut NetPlayer) {
+    /// Met `p` à cette position (`anchor` : la même que pour `of`).
+    pub fn apply(&self, p: &mut NetPlayer, anchor: [f32; 3]) {
         let angle = |a: i16| a as f32 / 65536.0 * std::f32::consts::TAU;
-        p.pos = self.pos;
+        let back = |r: i32, a: f32| (f64::from(a) + f64::from(r) / f64::from(POSE_UNIT)) as f32;
+        p.pos = [
+            back(self.rel[0], anchor[0]),
+            back(self.rel[1], anchor[1]),
+            back(self.rel[2], anchor[2]),
+        ];
         p.yaw = angle(self.yaw);
         p.pitch = angle(self.pitch);
         p.crouch = self.crouch as f32 / 255.0;
         p.speed = self.speed as f32 / 10.0;
+    }
+}
+
+/// (v334) Un entier de 16 bits sur 2 octets fixes (un cap tiré au hasard en prend 3 en
+/// varint).
+mod fixed16 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(v: &i16, s: S) -> Result<S::Ok, S::Error> {
+        v.to_le_bytes().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i16, D::Error> {
+        Ok(i16::from_le_bytes(<[u8; 2]>::deserialize(d)?))
     }
 }
 
@@ -83,7 +117,8 @@ pub struct NetPlayer {
     pub pos: [f32; 3],
     /// (v333) Sur le fil comme dans `Pose` : les angles en 65536e de tour, l'accroupi et la
     /// vitesse sur un octet (16 octets de moins par joueur, 64 fois par seconde).
-    #[serde(with = "turn16")]
+    /// (v334) Le cap sur 2 octets fixes.
+    #[serde(with = "turn16fixed")]
     pub yaw: f32,
     #[serde(with = "turn16")]
     pub pitch: f32,
@@ -113,6 +148,19 @@ mod turn16 {
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
         Ok(i16::deserialize(d)? as f32 / 65536.0 * std::f32::consts::TAU)
+    }
+}
+
+/// (v334) Le même, sur 2 octets fixes (pour le cap, tiré sur tout le tour).
+mod turn16fixed {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(a: &f32, s: S) -> Result<S::Ok, S::Error> {
+        ((*a / std::f32::consts::TAU * 65536.0).round() as i64 as i16)
+            .to_le_bytes()
+            .serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+        Ok(i16::from_le_bytes(<[u8; 2]>::deserialize(d)?) as f32 / 65536.0 * std::f32::consts::TAU)
     }
 }
 
@@ -1083,6 +1131,88 @@ pub fn decode<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v334) Positions relatives : à moins d'un centimètre près, même loin du centre du
+    /// monde et loin de celui qui reçoit ; et ce que pèsent les messages d'une partie à
+    /// 10 (identifiants du relais : petits nombres).
+    #[test]
+    fn poses_are_small_and_exact_to_the_centimetre() {
+        let player = |i: u64, at: [f32; 3]| NetPlayer {
+            id: 40 + i,
+            pseudo: String::new(),
+            pos: at,
+            yaw: -2.9 + i as f32 * 0.7,
+            pitch: 0.12,
+            crouch: 0.0,
+            speed: 4.5,
+            hp: 87,
+            alive: true,
+            weapon: 3,
+            kills: 7,
+            deaths: 5,
+            team: 1,
+            flags: 0,
+        };
+        for anchor in [[1234.56, 70.1, -987.6], [1_000_123.4, 64.0, -2_000_456.7]] {
+            for d in [
+                [3.3, 0.0, -2.1],
+                [41.27, 1.5, 17.03],
+                [700.0, -20.0, -1500.0],
+            ] {
+                let p = player(1, [anchor[0] + d[0], anchor[1] + d[1], anchor[2] + d[2]]);
+                let wire = encode(&Pose::of(&p, anchor));
+                let mut back = player(1, [0.0; 3]);
+                decode::<Pose>(&wire).unwrap().apply(&mut back, anchor);
+                for k in 0..3 {
+                    // (Loin du centre, un f32 lui-même n'a que 6 cm de finesse.)
+                    let ulp = f32::EPSILON * p.pos[k].abs().max(1.0) * 2.0;
+                    assert!(
+                        (back.pos[k] - p.pos[k]).abs() <= 1.0 / 128.0 + ulp,
+                        "{k} : {} pour {}",
+                        back.pos[k],
+                        p.pos[k]
+                    );
+                }
+                assert!((back.yaw - p.yaw).abs() < 1e-3);
+            }
+        }
+        let you = SimState {
+            pos: [1234.56, 70.1, -987.6],
+            vel: [3.2, -0.1, 5.5],
+            on_ground: true,
+            stamina: 0.8,
+            duck_speed: 8.0,
+            carry: 250,
+            ..Default::default()
+        };
+        let others: Vec<NetPlayer> = (0..9)
+            .map(|i| player(i, [1200.0 + i as f32 * 3.3, 70.0, -990.0 + i as f32 * 2.1]))
+            .collect();
+        let moves = ToPeer::Moves {
+            tick: 123_456,
+            ack: 123_400,
+            you,
+            players: others.iter().map(|p| Pose::of(p, you.pos)).collect(),
+        };
+        let snap = ToPeer::Snapshot {
+            tick: 123_456,
+            ack: 123_400,
+            you,
+            hp: 87,
+            alive: true,
+            players: others.clone(),
+            hud: MatchHud {
+                money: 4200,
+                time: 75.3,
+                round: 7,
+                ..Default::default()
+            },
+        };
+        let (m, sn) = (encode(&moves).len(), encode(&snap).len());
+        eprintln!("10 joueurs : positions {m} octets, état complet {sn} octets");
+        assert!(m <= 170, "positions : {m} octets (249 avant la v334)");
+        assert!(sn <= 345, "état complet : {sn} octets");
+    }
 
     #[test]
     fn spawns_change_the_map_signature_but_not_the_name() {

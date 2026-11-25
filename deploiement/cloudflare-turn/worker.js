@@ -1,6 +1,11 @@
 // Minelib (v329) : donne aux jeux des identifiants TURN. Voir LISEZMOI.md.
 //
-// Deux façons, selon les secrets du Worker (Paramètres → Variables et secrets) :
+// (v334) Tous les services configurés partent, dans cet ordre : FIXE_*, FIXE2_*, COTURN_*,
+// puis Cloudflare. Le jeu (v334 et suivantes) prend le premier qui lui donne une adresse :
+// un service épuisé (quota du mois) ou en panne laisse la place au suivant, sans mise à
+// jour du jeu. (Les jeux d'avant ne prennent que le premier.)
+//
+// Les façons, selon les secrets du Worker (Paramètres → Variables et secrets) :
 //
 // 1. Identifiants fixes d'un service TURN gratuit (ExpressTURN : 1 000 Go par mois, sans
 //    carte) : ils ne sont pas écrits dans le dépôt public, seulement ici.
@@ -8,6 +13,15 @@
 //                     (par exemple « turn:relay1.expressturn.com:3478 »)
 //   FIXE_UTILISATEUR  nom d'utilisateur donné par le service
 //   FIXE_MOT_DE_PASSE son mot de passe
+//   FIXE2_URLS, FIXE2_UTILISATEUR, FIXE2_MOT_DE_PASSE : un deuxième service (ou un
+//                     deuxième compte), en secours du premier.
+//
+// 1 bis. Un serveur coturn à soi (voir deploiement/turn-vps) : identifiants qui expirent,
+//    calculés ici avec le secret partagé (« use-auth-secret » de coturn) ; le secret ne
+//    quitte jamais ce Worker.
+//   COTURN_URLS       adresses TURN du serveur, séparées par des virgules
+//                     (« turn:<adresse>:3478 »)
+//   COTURN_SECRET     le même que « static-auth-secret » dans turnserver.conf
 //
 // 2. Cloudflare Realtime TURN (1 000 Go gratuits par mois, mais une carte bancaire est
 //    demandée à l'activation, et ce qui dépasse est facturé). La clé TURN ne doit jamais
@@ -76,41 +90,70 @@ async function anonyme(ip) {
   return [...new Uint8Array(h).slice(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Identifiants fixes (FIXE_*), s'il y en a.
-function fixes(env) {
-  if (!env.FIXE_URLS || !env.FIXE_UTILISATEUR || !env.FIXE_MOT_DE_PASSE) return null;
-  const urls = env.FIXE_URLS.split(",").map((u) => u.trim()).filter((u) => u.startsWith("turn"));
-  if (urls.length === 0) return null;
-  return {
-    iceServers: [{ urls, username: env.FIXE_UTILISATEUR, credential: env.FIXE_MOT_DE_PASSE }],
-    ttl: 86400,
-  };
+function adresses(liste) {
+  return (liste || "").split(",").map((u) => u.trim()).filter((u) => u.startsWith("turn"));
+}
+
+// Identifiants fixes (FIXE_* ou FIXE2_*), s'il y en a.
+function fixes(urls, utilisateur, motDePasse) {
+  const u = adresses(urls);
+  if (u.length === 0 || !utilisateur || !motDePasse) return null;
+  return { urls: u, username: utilisateur, credential: motDePasse };
+}
+
+// (v334) Identifiants d'un coturn à soi (« use-auth-secret ») : nom = date d'expiration
+// (secondes Unix) et un nom fixe, mot de passe = HMAC-SHA1 du nom par le secret, en base64.
+async function coturn(env) {
+  const urls = adresses(env.COTURN_URLS);
+  if (urls.length === 0 || !env.COTURN_SECRET) return null;
+  const username = `${Math.floor(Date.now() / 1000) + TTL}:minelib`;
+  const cle = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.COTURN_SECRET),
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", cle, new TextEncoder().encode(username));
+  const credential = btoa(String.fromCharCode(...new Uint8Array(sig)));
+  return { urls, username, credential };
+}
+
+// Cloudflare Realtime TURN, s'il est configuré et sous son plafond.
+async function cloudflare(env, request) {
+  if (!env.TURN_KEY_ID || !env.TURN_KEY_TOKEN) return [];
+  const plafond = Number(env.PLAFOND_GO || 900) * 1e9;
+  const envoyes = await envoyesCeMois(env);
+  if (envoyes !== null && envoyes >= plafond) return [];
+  const ip = request.headers.get("CF-Connecting-IP") || "";
+  const r = await fetch(`${CF}/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.TURN_KEY_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ ttl: TTL, customIdentifier: await anonyme(ip) }),
+  });
+  if (!r.ok) return [];
+  const corps = await r.json();
+  return corps.iceServers ?? [];
 }
 
 export default {
   async fetch(request, env) {
     if (request.method !== "GET") return json({ erreur: "GET seulement" }, 405);
-    const f = fixes(env);
-    if (f) return json(f);
-    if (!env.TURN_KEY_ID || !env.TURN_KEY_TOKEN) {
-      return json({ erreur: "ni FIXE_URLS, FIXE_UTILISATEUR et FIXE_MOT_DE_PASSE, ni TURN_KEY_ID et TURN_KEY_TOKEN" }, 500);
+    const groupes = [
+      fixes(env.FIXE_URLS, env.FIXE_UTILISATEUR, env.FIXE_MOT_DE_PASSE),
+      fixes(env.FIXE2_URLS, env.FIXE2_UTILISATEUR, env.FIXE2_MOT_DE_PASSE),
+      await coturn(env),
+    ].filter((g) => g !== null);
+    groupes.push(...(await cloudflare(env, request)));
+    if (groupes.length === 0) {
+      return json({ erreur: "aucun service TURN configuré (FIXE_*, FIXE2_*, COTURN_*, TURN_KEY_*)" }, 503);
     }
-    const plafond = Number(env.PLAFOND_GO || 900) * 1e9;
-    const envoyes = await envoyesCeMois(env);
-    if (envoyes !== null && envoyes >= plafond) {
-      return json({ iceServers: [], plein: true }, 503);
-    }
-    const ip = request.headers.get("CF-Connecting-IP") || "";
-    const r = await fetch(`${CF}/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.TURN_KEY_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ ttl: TTL, customIdentifier: await anonyme(ip) }),
-    });
-    if (!r.ok) return json({ erreur: `Cloudflare : ${r.status}` }, 502);
-    const corps = await r.json();
-    return json({ iceServers: corps.iceServers ?? [], ttl: TTL });
+    // Des identifiants qui expirent (coturn, Cloudflare : 12 heures) fixent la durée
+    // annoncée : le jeu en redemande avant. Sinon, un jour.
+    const expirent = env.COTURN_SECRET || env.TURN_KEY_ID;
+    return json({ iceServers: groupes, ttl: expirent ? TTL : 86400 });
   },
 };

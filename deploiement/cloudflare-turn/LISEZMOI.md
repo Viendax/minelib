@@ -58,4 +58,14 @@ les secrets `FIXE_*`, c'est ce mode qui sert.
 
 Le jeu accepte toute source d'identifiants au format des « iceServers » de WebRTC, et tout
 serveur TURN standard (RFC 8656) : par exemple coturn (libre) sur une machine à soi.
-Plusieurs lignes dans `relais_turn.txt` : la première qui répond sert.
+
+(v334) **Plusieurs services, en secours l'un de l'autre.** Le Worker donne tous ceux qui
+sont configurés, dans cet ordre : `FIXE_*`, `FIXE2_*` (un deuxième service ou compte, mêmes
+noms avec `2`), `COTURN_URLS` et `COTURN_SECRET` (un coturn à soi, identifiants qui
+expirent : voir `deploiement/turn-vps`), puis Cloudflare. Le jeu (v334 et suivantes) prend
+le premier qui lui donne une adresse ; un service qui refuse (quota du mois épuisé) ou ne
+répond pas passe après les autres pendant 10 minutes. Ajouter un service ne demande donc
+pas de mise à jour du jeu, seulement les variables du Worker et un nouveau déploiement de
+`worker.js`. De même, toutes les lignes de `relais_turn.txt` sont essayées dans l'ordre.
+Le jeu essaie chaque serveur en UDP, puis par TCP au même port (réseaux qui ne laissent pas
+sortir l'UDP) ; une adresse `turn:…?transport=tcp` est jointe par TCP seulement.

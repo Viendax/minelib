@@ -321,8 +321,9 @@ pub fn sources() -> Vec<Source> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Creds {
-    /// `hôte:port`, UDP.
-    servers: Vec<String>,
+    /// `hôte:port`, et (v334) `true` pour un serveur qui ne se joint que par TCP
+    /// (`?transport=tcp`) ; les autres sont essayés en UDP, puis par TCP.
+    servers: Vec<(String, bool)>,
     user: String,
     pass: String,
     ttl: Duration,
@@ -330,7 +331,14 @@ struct Creds {
 
 /// Réponse d'un service d'identifiants : `{"iceServers": [...]}`, une liste, ou un seul
 /// serveur ; `urls` seule ou en liste. Seuls les serveurs `turn:` en UDP sont gardés.
-fn parse_ice(text: &str) -> Option<Creds> {
+fn parse_ice(text: &str) -> Vec<Creds> {
+    parse_ice_groups(text).unwrap_or_default()
+}
+
+/// (v334) Tous les groupes de la réponse (un par serveur ICE avec ses identifiants), dans
+/// l'ordre : le premier qui donne une allocation sert, les suivants sont en secours (un
+/// service épuisé ou en panne, un autre prend la suite).
+fn parse_ice_groups(text: &str) -> Option<Vec<Creds>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let ttl = v
         .get("ttl")
@@ -345,6 +353,7 @@ fn parse_ice(text: &str) -> Option<Creds> {
         },
         _ => return None,
     };
+    let mut groups = Vec::new();
     for s in list {
         let (Some(user), Some(pass)) = (
             s.get("username").and_then(|x| x.as_str()),
@@ -360,23 +369,31 @@ fn parse_ice(text: &str) -> Option<Creds> {
                 .collect(),
             _ => continue,
         };
-        let servers: Vec<String> = urls
-            .iter()
-            .filter_map(|u| {
-                let rest = u.strip_prefix("turn:")?;
-                let (hostport, query) = rest.split_once('?').unwrap_or((rest, ""));
-                if !query.is_empty() && !query.contains("transport=udp") {
-                    return None;
-                }
-                Some(if hostport.contains(':') {
-                    hostport.to_string()
-                } else {
-                    format!("{hostport}:3478")
-                })
-            })
-            .collect();
+        // (v334) `?transport=tcp` : par TCP seulement ; sans précision ou en UDP : UDP, puis
+        // TCP au même port. Un même `hôte:port` n'est gardé qu'une fois. (`turns:`, TLS,
+        // n'est pas pris.)
+        let mut servers: Vec<(String, bool)> = Vec::new();
+        for u in &urls {
+            let Some(rest) = u.strip_prefix("turn:") else {
+                continue;
+            };
+            let (hostport, query) = rest.split_once('?').unwrap_or((rest, ""));
+            let tcp = query.contains("transport=tcp");
+            if !query.is_empty() && !tcp && !query.contains("transport=udp") {
+                continue;
+            }
+            let hp = if hostport.contains(':') {
+                hostport.to_string()
+            } else {
+                format!("{hostport}:3478")
+            };
+            match servers.iter_mut().find(|(h, _)| *h == hp) {
+                Some(e) => e.1 &= tcp,
+                None => servers.push((hp, tcp)),
+            }
+        }
         if !servers.is_empty() {
-            return Some(Creds {
+            groups.push(Creds {
                 servers,
                 user: user.to_string(),
                 pass: pass.to_string(),
@@ -384,17 +401,17 @@ fn parse_ice(text: &str) -> Option<Creds> {
             });
         }
     }
-    None
+    (!groups.is_empty()).then_some(groups)
 }
 
-fn fetch(source: &Source) -> Option<Creds> {
+fn fetch(source: &Source) -> Vec<Creds> {
     match source {
-        Source::Fixed { server, user, pass } => Some(Creds {
-            servers: vec![server.clone()],
+        Source::Fixed { server, user, pass } => vec![Creds {
+            servers: vec![(server.clone(), false)],
             user: user.clone(),
             pass: pass.clone(),
             ttl: Duration::from_secs(365 * 86400),
-        }),
+        }],
         Source::Service(url) => {
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .tls_config(
@@ -409,12 +426,14 @@ fn fetch(source: &Source) -> Option<Creds> {
                 .get(url)
                 .header("User-Agent", "minelib")
                 .call()
-                .ok()?
-                .body_mut()
-                .read_to_string()
-                .ok()?;
+                .ok()
+                .and_then(|mut r| r.body_mut().read_to_string().ok());
+            let Some(body) = body else {
+                log::info!("TURN : service d'identifiants injoignable");
+                return Vec::new();
+            };
             let c = parse_ice(&body);
-            if c.is_none() {
+            if c.is_empty() {
                 log::info!("TURN : réponse sans serveur TURN utilisable");
             }
             c
@@ -442,6 +461,8 @@ const CHANNEL_REST: Duration = Duration::from_secs(900);
 const PEERS_MAX: usize = 512;
 /// Délais d'attente d'une réponse, une réémission après chacun (UDP).
 const RTO: [u64; 4] = [500, 1000, 2000, 4000];
+/// (v334) Un serveur qui a échoué passe après les autres pendant ce temps.
+const BAD_FOR: Duration = Duration::from_secs(600);
 /// Nouvel essai d'allocation après un échec : de 15 s à 10 min.
 const RETRY_MIN: Duration = Duration::from_secs(15);
 const RETRY_MAX: Duration = Duration::from_secs(600);
@@ -527,6 +548,8 @@ pub struct TurnClient {
     tcp: Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Vec<u8>>)>>,
     tcp_n: std::sync::atomic::AtomicU64,
     via_tcp: std::sync::atomic::AtomicBool,
+    /// (v334) Serveurs qui ont échoué récemment (passés après les autres).
+    bad: Mutex<HashMap<SocketAddr, Instant>>,
     st: Mutex<State>,
     wake: Notify,
     stop: watch::Sender<bool>,
@@ -570,6 +593,7 @@ impl TurnClient {
             sock: sock.clone(),
             tcp: Mutex::new(None),
             tcp_n: Default::default(),
+            bad: Default::default(),
             // (Réglage d'essai, ou de secours pour un réseau où UDP passe mal : TCP d'abord.)
             via_tcp: std::sync::atomic::AtomicBool::new(
                 std::env::var_os("MINELIB_TURN_TCP").is_some_and(|v| !v.is_empty()),
@@ -813,6 +837,7 @@ impl TurnClient {
     /// domaine, ou un autre nonce) est suivi d'un nouvel essai. Erreur : le code du refus
     /// (0 : pas de réponse, ou réponse fausse).
     async fn transact(&self, method: u16, attrs: &[(u16, Vec<u8>)]) -> Result<Msg, u16> {
+        let mut last = 0u16;
         for _round in 0..3 {
             let tid: [u8; 12] = rand::random();
             let (pkt, key, server, rx) = {
@@ -863,6 +888,7 @@ impl TurnClient {
                 return Ok(m);
             }
             let code = m.error();
+            last = code;
             if code == 401 || code == 438 {
                 let mut st = self.st.lock().unwrap();
                 if let (Some(a), Some(nonce)) = (st.auth.as_mut(), m.attr(A_NONCE)) {
@@ -876,7 +902,9 @@ impl TurnClient {
             }
             return Err(code);
         }
-        Err(0)
+        // (v334) Toujours refusé après un nouveau nonce : le dernier refus (identifiants
+        // faux, service fermé), pas « pas de réponse ».
+        Err(last)
     }
 
     async fn tend(self: &Arc<Self>) {
@@ -933,24 +961,35 @@ impl TurnClient {
 
     async fn allocate(self: &Arc<Self>) {
         let had = self.st.lock().unwrap().relayed.is_some();
-        let mut creds = None;
+        // (v334) Tous les groupes d'identifiants de toutes les sources, dans l'ordre : le
+        // premier serveur qui donne une allocation sert. Un service épuisé (quota du mois)
+        // ou en panne laisse la place au suivant.
+        let mut groups = Vec::new();
         for s in self.sources.clone() {
             let got = tokio::task::spawn_blocking(move || fetch(&s))
                 .await
-                .ok()
-                .flatten();
-            if got.is_some() {
-                creds = got;
-                break;
-            }
+                .unwrap_or_default();
+            groups.extend(got);
         }
-        let mut servers = Vec::new();
-        if let Some(c) = &creds {
-            for s in &c.servers {
+        let mut tries: Vec<(SocketAddr, bool, usize)> = Vec::new();
+        for (g, c) in groups.iter().enumerate() {
+            for (s, tcp_only) in &c.servers {
                 if let Ok(addrs) = tokio::net::lookup_host(s.as_str()).await {
-                    servers.extend(addrs.filter(|a| a.is_ipv4()).take(1));
+                    for a in addrs.filter(|a| a.is_ipv4()).take(1) {
+                        if !tries.iter().any(|t| t.0 == a && t.2 == g) {
+                            tries.push((a, *tcp_only, g));
+                        }
+                    }
                 }
             }
+        }
+        // (v334) Un serveur qui a échoué depuis moins de `BAD_FOR` passe après les autres :
+        // pas d'attente de réponse à chaque nouvel essai tant que d'autres répondent.
+        {
+            let now = Instant::now();
+            let mut bad = self.bad.lock().unwrap();
+            bad.retain(|_, t| now.duration_since(*t) < BAD_FOR);
+            tries.sort_by_key(|t| bad.contains_key(&t.0));
         }
         // L'ancienne allocation est rendue d'abord : une seule par adresse de ce client.
         if had {
@@ -966,11 +1005,12 @@ impl TurnClient {
         }
         // (v333) L'ancienne connexion TCP, s'il y en avait une, se ferme.
         *self.tcp.lock().unwrap() = None;
-        let Some(c) = creds.filter(|_| !servers.is_empty()) else {
+        if tries.is_empty() {
             self.failed(had, "pas d'identifiants");
             return;
-        };
-        for server in servers {
+        }
+        for (server, tcp_only, g) in tries {
+            let c = &groups[g];
             {
                 let mut st = self.st.lock().unwrap();
                 st.server = Some(server);
@@ -987,11 +1027,18 @@ impl TurnClient {
                 (A_LIFETIME, LIFETIME.to_be_bytes().to_vec()),
             ];
             // (v333) UDP d'abord, puis TCP s'il ne répond pas (ou TCP d'abord, si c'est par
-            // là que la dernière allocation s'est faite). Un refus net (identifiants, quota)
-            // vaut pour les deux.
-            let tcp_first = self.via_tcp.load(std::sync::atomic::Ordering::Relaxed);
+            // là que la dernière allocation s'est faite ; (v334) TCP seul pour un serveur
+            // donné ainsi). Un refus net (identifiants, quota) vaut pour les deux.
+            let tcp_first = tcp_only || self.via_tcp.load(std::sync::atomic::Ordering::Relaxed);
+            let modes: &[bool] = if tcp_only {
+                &[true]
+            } else if tcp_first {
+                &[true, false]
+            } else {
+                &[false, true]
+            };
             let mut got = Err(0);
-            for tcp in [tcp_first, !tcp_first] {
+            for &tcp in modes {
                 *self.tcp.lock().unwrap() = None;
                 if tcp && !self.connect_tcp(server).await {
                     continue;
@@ -1007,6 +1054,7 @@ impl TurnClient {
             let tcp = self.tcp.lock().unwrap().is_some();
             if got.is_err() {
                 *self.tcp.lock().unwrap() = None;
+                self.bad.lock().unwrap().insert(server, Instant::now());
             } else {
                 self.via_tcp
                     .store(tcp, std::sync::atomic::Ordering::Relaxed);
@@ -1030,7 +1078,12 @@ impl TurnClient {
                         st.retry = RETRY_MIN;
                         st.retry_at = None;
                     }
-                    log::info!("TURN : adresse relayée obtenue");
+                    self.bad.lock().unwrap().remove(&server);
+                    log::info!(
+                        "TURN : adresse relayée obtenue{}{}",
+                        if g > 0 { " (service de secours)" } else { "" },
+                        if tcp { " par TCP" } else { "" }
+                    );
                     (self.told)(Some(relayed));
                     self.wake.notify_one();
                     return;
@@ -1499,20 +1552,37 @@ mod tests {
                      "turns:turn.cloudflare.com:5349?transport=tcp",
                      "turn:turn.cloudflare.com:53?transport=udp"],
              "username":"u1","credential":"c1"}],"ttl":43200}"#;
-        let c = parse_ice(cf).unwrap();
+        let all = parse_ice(cf);
+        assert_eq!(all.len(), 1);
+        let c = &all[0];
+        let hp = |h: &str, tcp: bool| (h.to_string(), tcp);
+        // (v334) Le même port en UDP et en TCP : gardé une fois, UDP puis TCP.
         assert_eq!(
             c.servers,
-            ["turn.cloudflare.com:3478", "turn.cloudflare.com:53"]
+            [
+                hp("turn.cloudflare.com:3478", false),
+                hp("turn.cloudflare.com:53", false)
+            ]
         );
         assert_eq!((c.user.as_str(), c.pass.as_str()), ("u1", "c1"));
         assert_eq!(c.ttl, Duration::from_secs(43200));
         // Une liste nue, `urls` seule, sans port : 3478, et une heure par défaut.
-        let c =
-            parse_ice(r#"[{"urls":"turn:t.example","username":"a","credential":"b"}]"#).unwrap();
-        assert_eq!(c.servers, ["t.example:3478"]);
+        let c = &parse_ice(r#"[{"urls":"turn:t.example","username":"a","credential":"b"}]"#)[0];
+        assert_eq!(c.servers, [hp("t.example:3478", false)]);
         assert_eq!(c.ttl, Duration::from_secs(3600));
-        assert!(parse_ice(r#"{"iceServers":[{"urls":"stun:x"}]}"#).is_none());
-        assert!(parse_ice("pas du json").is_none());
+        assert!(parse_ice(r#"{"iceServers":[{"urls":"stun:x"}]}"#).is_empty());
+        assert!(parse_ice("pas du json").is_empty());
+        // (v334) Plusieurs services, chacun ses identifiants, dans l'ordre ; un serveur
+        // donné en TCP seulement l'est.
+        let two = parse_ice(
+            r#"{"iceServers":[{"urls":"turn:a.example:3478","username":"u1","credential":"p1"},
+                {"urls":["turn:b.example:443?transport=tcp"],"username":"u2","credential":"p2"}],
+               "ttl":600}"#,
+        );
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].servers, [hp("a.example:3478", false)]);
+        assert_eq!(two[1].servers, [hp("b.example:443", true)]);
+        assert_eq!((two[1].user.as_str(), two[1].pass.as_str()), ("u2", "p2"));
         let s = parse_sources(
             "# commentaire\n\nhttps://turn.exemple.workers.dev\n\
              turn:10.0.0.1:3478?transport=udp moi secret\nturn:incomplet\n",
@@ -1616,6 +1686,59 @@ mod tests {
         );
         let (sent, received) = a.counts();
         assert!(sent >= 300 && received >= 1, "{sent} {received}");
+    }
+
+    /// (v334) Plusieurs sources : un serveur muet, puis des identifiants refusés, puis un
+    /// bon serveur. Le client finit chez le bon ; à l'allocation suivante, les deux qui ont
+    /// échoué passent après lui (pas d'attente).
+    #[test]
+    fn a_dead_or_refusing_turn_service_hands_over_to_the_next() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let refusing = MiniTurn::start(rt.handle());
+        let good = MiniTurn::start(rt.handle());
+        // Un port où personne ne répond (ni UDP ni TCP).
+        let dead = {
+            let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            u.local_addr().unwrap()
+        };
+        let sources = vec![
+            Source::Fixed {
+                server: dead.to_string(),
+                user: MINI_USER.into(),
+                pass: "x".into(),
+            },
+            Source::Fixed {
+                server: refusing.addr.to_string(),
+                user: MINI_USER.into(),
+                pass: "faux".into(),
+            },
+            good.source(),
+        ];
+        let c =
+            TurnClient::start(rt.handle(), sources, Box::new(|_, _| {}), Box::new(|_| {})).unwrap();
+        wait_for("allocation chez le bon serveur", || c.relayed().is_some());
+        assert_eq!(c.st.lock().unwrap().server, Some(good.addr));
+        {
+            let bad = c.bad.lock().unwrap();
+            assert!(bad.contains_key(&dead) && bad.contains_key(&refusing.addr));
+        }
+        let n = |m: &MiniTurn| m.allocations.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!((n(&refusing), n(&good)), (0, 1));
+        // Nouvelle allocation : le bon d'abord, tout de suite.
+        let before = c.relayed();
+        c.st.lock().unwrap().renew_at = Some(Instant::now());
+        c.wake.notify_one();
+        let t = Instant::now();
+        wait_for("nouvelle allocation", || {
+            c.relayed().is_some_and(|r| Some(r) != before)
+        });
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(c.st.lock().unwrap().server, Some(good.addr));
+        assert_eq!(n(&good), 2);
     }
 
     /// (v333) Un réseau qui ne laisse sortir que TCP (le serveur ne répond plus en UDP) :

@@ -66,6 +66,19 @@ const RELAY_INPUTS_EVERY_TURN: usize = 16;
 /// d'un coup quand la voie rapide les porte.
 const LOW_RATE_STRIKES: u8 = 2;
 const LOW_RATE_FOR: f32 = 60.0;
+/// (v334) Voie rapide aussi : un lien qui ne laisse passer qu'une part des mises à jour
+/// (moins de `STARVED_PERCENT` % de celles qui partent, deux secondes de suite) recevrait
+/// plus au palier du dessous : il y descend. Une perte au hasard (Wi-Fi) ne suffit pas.
+/// Remonter puis redescendre dans les 30 s double l'attente avant le prochain essai (jusqu'à
+/// `LOW_RATE_HOLD_MAX`).
+const STARVED_PERCENT: u32 = 55;
+const LOW_RATE_HOLD_MAX: f32 = 600.0;
+/// (v334) Par TURN, l'hôte envoie au plus 128 mises à jour par seconde (une tous les deux
+/// pas) et l'invité 128 paquets d'entrées : chaque octet par TURN passe deux fois par le
+/// serveur et compte dans son quota du mois ; 128 suffisent.
+const TURN_EVERY: u8 = 2;
+/// (v334) Pas de jeu au moins entre deux paquets d'entrées par TURN (2 : 128 par seconde).
+const TURN_INPUTS_GAP: f32 = 2.0;
 /// Voie rapide : messages venus des passeurs que l'invité regarde avant de dire s'il
 /// reçoit plus vite par eux ou par le relais (`Guest::fast_vote`).
 const FAST_VOTES: u8 = 32;
@@ -1628,12 +1641,87 @@ pub struct Guest {
     ping_timer: f32,
     /// (v333) Pseudos des joueurs : l'hôte ne les redit plus une fois qu'on les a.
     pseudos: HashMap<u64, String>,
+    /// (v334) Dernier état complet connu de chaque joueur (même caché depuis) : des
+    /// positions qui le montrent de nouveau le font apparaître tout de suite, sans attendre
+    /// l'état complet suivant (32 ou 16 par seconde aux paliers du dessous).
+    known: HashMap<u64, NetPlayer>,
     /// (v333) Meilleur ping vu (remonte doucement), secondes de suite où le lien ne suivait
     /// pas, et le palier demandé à l'hôte : une mise à jour de positions tous les combien de
     /// pas (1, 2, 4), depuis combien de temps.
     ping_best: Option<f32>,
     low_strikes: u8,
     rate: (u8, f32),
+    /// (v334) Mises à jour reçues pendant la seconde en cours (`RateWindow`), attente avant
+    /// de remonter d'un palier, et temps depuis la dernière remontée (secondes).
+    window: RateWindow,
+    rate_hold: f32,
+    rate_up: Option<f32>,
+    rate_carried: bool,
+    /// (v334) Horloge (pas) du dernier envoi d'entrées par la voie rapide (par TURN, 128 par
+    /// seconde au plus).
+    fast_inputs_at: std::cell::Cell<Option<f32>>,
+}
+
+/// (v334) Palier suivant (une mise à jour tous les 1, 2 ou 4 pas) : tout d'un coup quand la
+/// voie rapide reprend (`fresh`) ; un de moins après `LOW_RATE_STRIKES` secondes de suite
+/// où le lien ne suit pas ; un de plus après `hold` secondes au même palier sans souci.
+fn next_every(every: u8, at: f32, hold: f32, strikes: u8, fresh: bool, trouble: bool) -> u8 {
+    if fresh {
+        1
+    } else if strikes >= LOW_RATE_STRIKES && every < 4 {
+        every * 2
+    } else if every > 1 && at >= hold && !trouble {
+        every / 2
+    } else {
+        every
+    }
+}
+
+/// (v334) Ce qui est arrivé de l'hôte en une seconde : pas nouveaux, premier et dernier,
+/// écarts d'un pas au suivant. L'écart ordinaire dit à quel palier l'hôte envoie (1, 2 ou 4
+/// pas), le nombre reçu sur ce qu'il en a envoyé dit si le lien suit.
+#[derive(Default, Clone, Copy, Debug)]
+struct RateWindow {
+    got: u32,
+    first: Option<u32>,
+    last: u32,
+    pairs: u32,
+    one: u32,
+    two: u32,
+}
+
+impl RateWindow {
+    fn note(&mut self, tick: u32) {
+        if self.first.is_some() {
+            let d = tick.wrapping_sub(self.last);
+            self.pairs += 1;
+            self.one += u32::from(d == 1);
+            self.two += u32::from(d == 2);
+        } else {
+            self.first = Some(tick);
+        }
+        self.got += 1;
+        self.last = tick;
+    }
+
+    /// (Reçues, envoyées selon l'écart ordinaire) pour la seconde écoulée, et on repart à
+    /// zéro. Rien si trop peu est arrivé pour juger.
+    fn take(&mut self) -> Option<(u32, u32)> {
+        let w = std::mem::take(self);
+        let first = w.first?;
+        if w.pairs < 8 {
+            return None;
+        }
+        let step = if w.one * 10 >= w.pairs {
+            1
+        } else if (w.one + w.two) * 10 >= w.pairs {
+            2
+        } else {
+            4
+        };
+        let sent = w.last.wrapping_sub(first) / step + 1;
+        Some((w.got, sent.max(w.got)))
+    }
 }
 
 pub enum NetGame {
@@ -2316,9 +2404,15 @@ impl NetGame {
             ping: None,
             ping_timer: 1.0,
             pseudos: HashMap::new(),
+            known: HashMap::new(),
             ping_best: None,
             low_strikes: 0,
             rate: (1, 0.0),
+            window: RateWindow::default(),
+            rate_hold: LOW_RATE_FOR,
+            rate_up: None,
+            rate_carried: false,
+            fast_inputs_at: std::cell::Cell::new(None),
             predicted: VecDeque::new(),
             fast: None,
             fast_votes: 0,
@@ -4584,6 +4678,18 @@ impl Host {
             if !r.ready {
                 continue;
             }
+            // (v333) Lien qui ne suit pas : une mise à jour tous les `every` pas (128 par
+            // seconde, ou 64). (v334) Par la voie rapide aussi, et 128 au plus quand elle
+            // passe par TURN. Les états complets suivent : un sur `every` (64, 32 ou 16 par
+            // seconde), des positions entre eux.
+            let turn = self.fast.as_ref().is_some_and(|f| f.on_turn(id));
+            let every =
+                self.low_rate
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(1)
+                    .max(if turn { TURN_EVERY } else { 1 });
+            let snap_due = full && self.tick.is_multiple_of(SNAPSHOT_EVERY * u32::from(every));
             let mp = self.m.players.get(&id);
             let eye = r.player.eye();
             let my_team = team(id);
@@ -4620,30 +4726,30 @@ impl Host {
                     .filter(|(o, p)| *o != id && visible(*o, p))
                     .map(|(_, p)| p.clone()),
             );
-            if !full {
-                let moves = ToPeer::Moves {
-                    tick: self.tick,
-                    ack: r.ack,
-                    you: r.player.net_state(),
-                    players: players.iter().map(game::Pose::of).collect(),
-                };
-                // Par un passeur si la voie rapide vers ce joueur est ouverte (un paquet
-                // perdu est remplacé par le suivant, 4 ms après), sinon par le relais.
-                let fast = self
-                    .fast
-                    .as_ref()
-                    .is_some_and(|f| f.send_one(id, &game::encode(&moves)));
-                // (v333) Lien qui ne suit pas : par le relais, une sur `every` (128 par
-                // seconde avec les états complets), ou aucune (64).
-                let every = u32::from(self.low_rate.get(&id).copied().unwrap_or(1));
-                if !fast && self.tick.is_multiple_of(every) {
-                    self.send_to(id, &moves);
-                    // Ce joueur reçoit plus vite par le relais : une sonde de temps en
-                    // temps par les passeurs, pour qu'il dise quand ce n'est plus vrai.
-                    if self.tick % FAST_PING_EVERY == 1 {
-                        if let Some(f) = self.fast.as_ref().filter(|f| f.slow(id)) {
-                            f.send_any(id, &game::encode(&ToPeer::FastPing { tick: self.tick }));
-                        }
+            if !snap_due {
+                if self.tick.is_multiple_of(u32::from(every)) {
+                    let you = r.player.net_state();
+                    let moves = ToPeer::Moves {
+                        tick: self.tick,
+                        ack: r.ack,
+                        you,
+                        players: players.iter().map(|p| game::Pose::of(p, you.pos)).collect(),
+                    };
+                    // Par un passeur si la voie rapide vers ce joueur est ouverte (un paquet
+                    // perdu est remplacé par le suivant, 4 ms après), sinon par le relais.
+                    let fast = self
+                        .fast
+                        .as_ref()
+                        .is_some_and(|f| f.send_one(id, &game::encode(&moves)));
+                    if !fast {
+                        self.send_to(id, &moves);
+                    }
+                }
+                // Ce joueur reçoit plus vite par le relais : une sonde de temps en temps par
+                // les passeurs, pour qu'il dise quand ce n'est plus vrai.
+                if self.tick % FAST_PING_EVERY == 1 {
+                    if let Some(f) = self.fast.as_ref().filter(|f| f.slow(id)) {
+                        f.send_any(id, &game::encode(&ToPeer::FastPing { tick: self.tick }));
                     }
                 }
                 continue;
@@ -4809,11 +4915,22 @@ impl Guest {
     /// le relais) par chaque passeur. L'hôte n'en garde que ce qui lui manque.
     fn fast_inputs(&self, weapon: u8) {
         let Some(f) = &self.fast else { return };
-        let most = if f.on_turn(0) {
-            FAST_INPUTS_TURN
-        } else {
-            FAST_INPUTS
-        };
+        let turn = f.on_turn(0);
+        // (v334) Par TURN, 128 paquets par seconde au plus (au-delà de 128 images par
+        // seconde, chaque paquet porte les entrées de deux images ; toutes partent aussi par
+        // le relais).
+        if turn {
+            let now = self.clock;
+            if self
+                .fast_inputs_at
+                .get()
+                .is_some_and(|t| (now - t).abs() < TURN_INPUTS_GAP)
+            {
+                return;
+            }
+            self.fast_inputs_at.set(Some(now));
+        }
+        let most = if turn { FAST_INPUTS_TURN } else { FAST_INPUTS };
         let k = most.min(self.pending.len());
         if k == 0 {
             return;
@@ -4954,6 +5071,7 @@ impl Guest {
         if new {
             self.seen_tick = Some(tick);
             self.arrived(tick as f32);
+            self.window.note(tick);
         }
         new
     }
@@ -4969,10 +5087,15 @@ impl Guest {
     /// (v333) Une fois par seconde : le lien suit-il 256 positions par seconde ? Sans voie
     /// rapide, tout vient par le relais, qui met en file ce qu'il ne peut pas passer : le
     /// ping monte. Deux secondes au-dessus du double du meilleur (et de 80 ms de plus au
-    /// moins) : on ne demande plus que les états complets (64 par seconde) ; de nouveau tout
-    /// quand la voie rapide les porte, ou au bout de `LOW_RATE_FOR` (si le lien ne suit
-    /// toujours pas, le ping remonte et on y revient).
+    /// moins) : un palier de moins (128, puis 64 : les états complets seuls) ; de nouveau
+    /// tout quand la voie rapide les porte, ou un palier de plus au bout de `LOW_RATE_FOR`
+    /// (si le lien ne suit toujours pas, le ping remonte et on y revient).
+    /// (v334) Par la voie rapide aussi : ping qui monte, ou moins de `STARVED_PERCENT` % des
+    /// mises à jour envoyées qui arrivent (le lien de l'hôte, partagé par tous ses joueurs,
+    /// ou le sien, est plein) : un palier de moins. 128 tient tant que le lien les porte.
     fn watch_rate(&mut self) {
+        // (v334) Ce que la seconde écoulée a apporté, sur ce que l'hôte a envoyé.
+        let window = self.window.take();
         let Some(ms) = self.ping else { return };
         let best = match self.ping_best {
             // (Il remonte d'une milliseconde par seconde : un chemin qui change ne laisse pas
@@ -4983,28 +5106,47 @@ impl Guest {
         self.ping_best = Some(best);
         let carried = !self.fast_slow && self.fast.as_ref().is_some_and(|f| f.open(0));
         let behind = ms > (best * 2.0).max(best + 80.0);
-        self.low_strikes = if !carried && behind {
+        // (v334) Voie rapide : elle ne laisse passer qu'une part de ce qui part (le lien de
+        // l'hôte, ou le sien, est plein) : le palier du dessous en recevrait plus.
+        let starved =
+            carried && window.is_some_and(|(got, sent)| got * 100 < sent * STARVED_PERCENT);
+        self.low_strikes = if behind || starved {
             self.low_strikes + 1
         } else {
             0
         };
         let (every, at) = self.rate;
-        let next = if carried {
-            1
-        } else if self.low_strikes >= LOW_RATE_STRIKES && every < 4 {
-            every * 2
-        } else if every > 1 && at >= LOW_RATE_FOR && !behind {
-            every / 2
-        } else {
-            every
-        };
+        // Revenu sur la voie rapide depuis le chemin du relais : tout, d'un coup (elle dira
+        // vite si c'est trop).
+        let fresh = carried && !self.rate_carried;
+        self.rate_carried = carried;
+        let next = next_every(
+            every,
+            at,
+            self.rate_hold,
+            self.low_strikes,
+            fresh,
+            behind || starved,
+        );
+        // (v334) Remonté puis redescendu dans les 30 s : on attendra deux fois plus avant de
+        // réessayer ; dix minutes sans redescendre, l'attente revient à une minute.
+        if next > every && self.rate_up.is_some_and(|t| t < 30.0) {
+            self.rate_hold = (self.rate_hold * 2.0).min(LOW_RATE_HOLD_MAX);
+        } else if at >= LOW_RATE_HOLD_MAX {
+            self.rate_hold = LOW_RATE_FOR;
+        }
+        if let Some(t) = &mut self.rate_up {
+            *t += 1.0;
+        }
         if next != every {
+            self.rate_up = (next < every).then_some(0.0);
             self.rate = (next, 0.0);
             self.low_strikes = 0;
             self.to_host(&ToHost::Rate { every: next });
             log::info!(
-                "réseau (FPS) : {} mises à jour par seconde (ping {ms:.0} ms, meilleur {best:.0} ms)",
-                256 / u32::from(next)
+                "réseau (FPS) : {} mises à jour par seconde (ping {ms:.0} ms, meilleur {best:.0} ms{})",
+                256 / u32::from(next),
+                window.map_or(String::new(), |(got, sent)| format!(", reçues {got}/{sent}"))
             );
         }
     }
@@ -5066,6 +5208,7 @@ impl Guest {
                 self.seen_tick = None;
                 self.own_tick = None;
                 self.snap_tick = None;
+                self.known.clear();
                 if !map_ok {
                     out.push(Local::Notice(
                         "Ta carte est différente de celle de l'hôte : impossible de jouer.".into(),
@@ -5083,6 +5226,9 @@ impl Guest {
             } => {
                 // (v333) Pseudos déjà connus : l'hôte ne les redit pas.
                 self.fill_pseudos(&mut players);
+                for p in &players {
+                    self.known.insert(p.id, p.clone());
+                }
                 // (v274) Déjà reçu par l'autre chemin (relais ou passeurs), ou dépassé par
                 // un état complet plus récent : rien à en tirer.
                 if self.snap_tick.is_some_and(|s| tick <= s) {
@@ -5133,8 +5279,13 @@ impl Guest {
                     let list: Vec<NetPlayer> = players
                         .iter()
                         .filter_map(|pose| {
-                            let mut p = self.full.iter().find(|p| p.id == pose.id)?.clone();
-                            pose.apply(&mut p);
+                            let mut p = self
+                                .full
+                                .iter()
+                                .find(|p| p.id == pose.id)
+                                .or_else(|| self.known.get(&pose.id))?
+                                .clone();
+                            pose.apply(&mut p, you.pos);
                             Some(p)
                         })
                         .collect();
@@ -5662,6 +5813,11 @@ mod tests {
         /// retard, pour combien d'états envoyés.
         snaps_got: u32,
         snaps_sent: u32,
+        /// (v334) Pas différents reçus par l'invité (positions et états complets, par les
+        /// deux chemins) pendant le retard, et l'étendue qu'ils couvrent : leur rapport dit
+        /// combien de mises à jour par seconde l'hôte lui envoie (1 : 256, 1/2 : 128).
+        ticks_got: u32,
+        ticks_span: u32,
     }
 
     /// (v331) Les essais de voie rapide qui ont des passeurs et ceux qui passent par TURN,
@@ -5799,6 +5955,7 @@ mod tests {
         // la première copie de chaque pas est celle qui n'a pas de retard.
         let mut snaps_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let (mut snaps_got, mut snaps_sent) = (0u32, 0u32);
+        let mut ticks_seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
         let mut done = false;
         for frame in 0..8000 * div as usize {
             // Depuis combien d'images le retard est en place, et sur quel chemin.
@@ -5867,6 +6024,13 @@ mod tests {
                             if matches!(game::decode::<ToPeer>(d), Some(ToPeer::Snapshot { .. })))
                     {
                         snaps_got += 1;
+                    }
+                    if let (Some(_), Event::FromHost(d)) = (since, &e) {
+                        if let Some(ToPeer::Moves { tick, .. } | ToPeer::Snapshot { tick, .. }) =
+                            game::decode::<ToPeer>(d)
+                        {
+                            ticks_seen.insert(tick);
+                        }
                     }
                     let fast = match &e {
                         Event::FromHost(data) => match game::decode::<ToPeer>(data) {
@@ -6005,6 +6169,11 @@ mod tests {
             snap_behind,
             snaps_got,
             snaps_sent,
+            ticks_got: ticks_seen.len() as u32,
+            ticks_span: match (ticks_seen.first(), ticks_seen.last()) {
+                (Some(a), Some(b)) => b - a + 1,
+                _ => 0,
+            },
         };
         drop(passeurs);
         drop(turn_nodes);
@@ -6019,7 +6188,17 @@ mod tests {
     #[test]
     fn the_fast_way_keeps_up_when_the_relay_lags() {
         let r = fast_match(false);
-        eprintln!("VOIE RAPIDE : {} images bloquées sur {}", r.stalled, r.frames);
+        eprintln!(
+            "VOIE RAPIDE : {} images bloquées sur {}, {} pas reçus sur {}",
+            r.stalled, r.frames, r.ticks_got, r.ticks_span
+        );
+        // (v334) Par les passeurs : chaque pas (256 par seconde).
+        assert!(
+            r.ticks_got * 100 >= r.ticks_span * 90,
+            "{} pas sur {}",
+            r.ticks_got,
+            r.ticks_span
+        );
         // L'invité court à plus de 4 blocs par seconde : par le relais seul, l'hôte l'aurait
         // vu avec 40 images de retard, soit 3 blocs en arrière.
         assert!(r.mid_gap < 1.0, "en pleine course, l'hôte suit l'invité à {} bloc", r.mid_gap);
@@ -6090,10 +6269,17 @@ mod tests {
     fn without_passeurs_the_fast_way_goes_through_turn_when_the_relay_lags() {
         let r = fast_match_with(false, 1, true);
         eprintln!(
-            "VOIE RAPIDE PAR TURN : {} images bloquées sur {}, {} états reçus pour {} envoyés",
-            r.stalled, r.frames, r.snaps_got, r.snaps_sent
+            "VOIE RAPIDE PAR TURN : {} images bloquées sur {}, {} états reçus pour {} envoyés, {} pas reçus sur {}",
+            r.stalled, r.frames, r.snaps_got, r.snaps_sent, r.ticks_got, r.ticks_span
         );
         assert_eq!(r.stats.heard, 1, "le seul chemin : TURN");
+        // (v334) Par TURN, une mise à jour tous les deux pas : 128 par seconde, toutes là.
+        assert!(
+            r.ticks_got * 100 >= r.ticks_span * 45 && r.ticks_got * 100 <= r.ticks_span * 55,
+            "{} pas sur {}",
+            r.ticks_got,
+            r.ticks_span
+        );
         assert!(
             r.mid_gap < 1.0,
             "en pleine course, l'hôte suit l'invité à {} bloc",
@@ -7102,6 +7288,77 @@ mod tests {
         assert_eq!(host(&mut h).low_rate.get(&9), Some(&4));
         h.receive(Some(9), &rate(1), &mut world);
         assert!(host(&mut h).low_rate.is_empty());
+    }
+
+    /// (v334) Ce que l'invité compte en une seconde : 256 pas tous là, un sur deux (l'hôte
+    /// envoie à 128), la moitié perdue au hasard (le lien ne suit pas), ou trop peu pour
+    /// juger.
+    #[test]
+    fn the_rate_window_tells_what_the_host_sent_and_what_got_through() {
+        let mut w = RateWindow::default();
+        for t in 1000..1256 {
+            w.note(t);
+        }
+        assert_eq!(w.take(), Some((256, 256)));
+        for t in (2000..2256).step_by(2) {
+            w.note(t);
+        }
+        assert_eq!(w.take(), Some((128, 128)), "128 envoyées, toutes là");
+        // La moitié perdue, au hasard (le même tirage à chaque essai).
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for t in 3000..3256 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x.is_multiple_of(2) {
+                w.note(t);
+            }
+        }
+        let (got, sent) = w.take().unwrap();
+        assert!(got * 100 < sent * STARVED_PERCENT, "{got} sur {sent}");
+        assert!(sent > 230, "envoyées : {sent}");
+        // Une perte au hasard d'un sur dix ne suffit pas à descendre.
+        for t in 4000..4256 {
+            if t % 10 != 3 {
+                w.note(t);
+            }
+        }
+        let (got, sent) = w.take().unwrap();
+        assert!(got * 100 >= sent * STARVED_PERCENT, "{got} sur {sent}");
+        w.note(5000);
+        w.note(5001);
+        assert_eq!(w.take(), None, "trop peu pour juger");
+        assert_eq!(w.take(), None);
+    }
+
+    /// (v334) Les paliers : un de moins après deux secondes de souci, jamais sous 64 ; un de
+    /// plus après l'attente sans souci ; tout d'un coup quand la voie rapide reprend.
+    #[test]
+    fn rate_steps_go_down_on_trouble_and_back_up_after_a_quiet_wait() {
+        assert_eq!(
+            next_every(1, 5.0, 60.0, 1, false, true),
+            1,
+            "une seconde ne suffit pas"
+        );
+        assert_eq!(next_every(1, 5.0, 60.0, 2, false, true), 2);
+        assert_eq!(next_every(2, 5.0, 60.0, 2, false, true), 4);
+        assert_eq!(
+            next_every(4, 5.0, 60.0, 9, false, true),
+            4,
+            "jamais moins de 64"
+        );
+        assert_eq!(next_every(2, 59.0, 60.0, 0, false, false), 2);
+        assert_eq!(next_every(2, 60.0, 60.0, 0, false, false), 1);
+        assert_eq!(
+            next_every(2, 60.0, 60.0, 0, false, true),
+            2,
+            "pas pendant un souci"
+        );
+        assert_eq!(
+            next_every(4, 0.0, 60.0, 0, true, false),
+            1,
+            "la voie rapide reprend"
+        );
     }
 
     fn host(g: &mut NetGame) -> &mut Host {
