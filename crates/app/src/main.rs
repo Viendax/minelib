@@ -2468,11 +2468,16 @@ impl Game {
     /// rouvre quand il le faut ; les messages des OP arrivés pendant ce temps par les
     /// provinces sont traités comme ceux du relais du monde.
     fn doze_upkeep(&mut self) {
+        // (v317) Dit au réseau, pour les tunnels : en veille, l'un d'eux qui doit s'ouvrir
+        // (une région de plus en vue) demande le retour au relais du monde, seul à pouvoir
+        // lui donner une route par des passeurs. (Dit aussi hors d'un monde : la veille
+        // finie, plus aucun tunnel n'attend.)
+        minelib_net::fast::set_dozing(self.accounts.dozing());
         let Some(b) = self.session.as_mut().and_then(|s| s.build.as_mut()) else {
             return;
         };
         if self.accounts.dozing() {
-            if b.wake_needed() {
+            if b.wake_needed() || minelib_net::fast::take_route_wanted() {
                 self.accounts.wake();
             }
         } else if b.doze_ready() {

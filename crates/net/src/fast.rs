@@ -356,6 +356,39 @@ pub fn passeurs_known() -> bool {
     unix_ms().saturating_sub(PASSEURS_AT.load(Ordering::Relaxed)) < 3000
 }
 
+/// (v317) Le relais du monde avait-il des passeurs la dernière fois que ce jeu lui a parlé,
+/// il y a moins d'un quart d'heure ? (Le temps qu'il garde les routes d'un joueur qui ne
+/// lui parle plus.)
+pub fn passeurs_lately() -> bool {
+    unix_ms().saturating_sub(PASSEURS_AT.load(Ordering::Relaxed)) < 900_000
+}
+
+/// (v317) Ce jeu est en veille au fond d'un pays : il a fermé son lien avec le relais du
+/// monde (`set_dozing`, dit par le jeu). Un tunnel qui doit s'ouvrir à ce moment-là ne
+/// peut pas demander de route : le jeu est prié de revenir au relais du monde
+/// (`want_route`, relevé par `take_route_wanted`), le temps de la demander.
+static DOZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ROUTE_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_dozing(on: bool) {
+    DOZING.store(on, Ordering::Relaxed);
+    if !on {
+        ROUTE_WANTED.store(false, Ordering::Relaxed);
+    }
+}
+
+pub fn dozing() -> bool {
+    DOZING.load(Ordering::Relaxed)
+}
+
+pub fn want_route() {
+    ROUTE_WANTED.store(true, Ordering::Relaxed);
+}
+
+pub fn take_route_wanted() -> bool {
+    ROUTE_WANTED.swap(false, Ordering::Relaxed)
+}
+
 /// Un passeur de ce jeu écoute sur le port `local` ; `external` : l'adresse que la box
 /// lui a donnée, si elle a ouvert le port.
 pub fn set_own_passeur(local: u16, external: Option<SocketAddrV4>) {

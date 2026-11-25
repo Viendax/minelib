@@ -435,6 +435,9 @@ impl CustomSender for Sender {
     }
 }
 
+/// (v317) Temps laissé à un jeu en veille pour revenir au relais du monde quand un tunnel
+/// doit s'ouvrir (retour par certificat : une poignée de main et deux échanges).
+const WAKE_WAIT: Duration = Duration::from_millis(2500);
 /// Temps laissé au relais du monde pour donner une route, puis à la route pour répondre
 /// de bout en bout, avant d'ouvrir le tunnel sans elle. (Un relais qui a des passeurs
 /// répond en quelques dizaines de millisecondes ; sans passeur, on n'attend pas du tout.)
@@ -449,9 +452,30 @@ const CHECK_WAIT: Duration = Duration::from_millis(1500);
 /// chemin comme celui-ci à une connexion déjà ouverte (il n'ouvre de lui-même que des
 /// chemins directs ou par ses serveurs). Le tunnel doit donc partir par le passeur ; les
 /// serveurs d'iroh lui sont ajoutés ensuite, en secours.
+/// (v317) Faut-il attendre que le jeu revienne au relais du monde avant d'ouvrir le
+/// tunnel ? Seulement en veille, et si ce relais avait des passeurs.
+pub(crate) fn wait_for_relay(dozing: bool, passeurs_lately: bool) -> bool {
+    dozing && passeurs_lately
+}
+
 pub(crate) async fn ask(t: &PasseurTransport, remote: [u8; 32]) -> Option<u64> {
     if !fast::passeurs_known() {
-        return None;
+        // (v317) En veille au fond d'un pays, ce jeu n'a plus de lien avec le relais du
+        // monde : s'il avait des passeurs, le jeu y revient (il sait le faire, c'est un
+        // retour ordinaire) et le tunnel l'attend un peu. Avant, un tunnel ouvert en
+        // veille prenait toujours les serveurs d'iroh. Hors veille (relais perdu, pas
+        // encore connecté), rien n'attend.
+        if !wait_for_relay(fast::dozing(), fast::passeurs_lately()) {
+            return None;
+        }
+        fast::want_route();
+        let start = Instant::now();
+        while !fast::passeurs_known() {
+            if start.elapsed() >= WAKE_WAIT {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
     fast::tunnel_want(remote);
     let start = Instant::now();

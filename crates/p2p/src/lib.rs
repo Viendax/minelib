@@ -612,6 +612,60 @@ mod tests {
         c.write_all(what).is_ok() && c.read_exact(&mut back).is_ok() && &back == what
     }
 
+    /// (v317) Les essais qui passent par l'état commun du réseau (passeurs connus, veille)
+    /// vont l'un après l'autre.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// (v317) Un jeu en veille au fond d'un pays n'a plus de lien avec le relais du monde.
+    /// Un tunnel doit s'ouvrir (une région de plus en vue) : au lieu de prendre d'office
+    /// les serveurs d'iroh, il demande au jeu de revenir au relais du monde, attend sa
+    /// route et passe par le passeur. Hors veille, ou si ce relais n'avait pas de passeur,
+    /// rien n'attend.
+    #[test]
+    fn a_tunnel_opened_while_dozing_brings_the_game_back_for_a_route() {
+        use minelib_net::fast;
+        assert!(passeur::wait_for_relay(true, true));
+        assert!(!passeur::wait_for_relay(false, true), "hors veille : pas d'attente");
+        assert!(!passeur::wait_for_relay(true, false), "relais sans passeur");
+        let _serial = serial();
+        let host = Node::start_offline().unwrap();
+        host.serve(echo());
+        let guest = Node::start_offline().unwrap();
+        let (tx, _probes) = std::sync::mpsc::channel();
+        let p = fast::Passeur::start(0, tx).unwrap();
+        // Le relais du monde avait des passeurs ; puis le jeu s'est endormi.
+        fast::note_passeurs();
+        std::thread::sleep(Duration::from_millis(3100));
+        assert!(!fast::passeurs_known() && fast::passeurs_lately());
+        fast::set_dozing(true);
+        // Le jeu : prié de revenir, il revient ; le relais du monde donne alors la route.
+        let hid = host.id();
+        let game = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while !fast::take_route_wanted() {
+                assert!(t.elapsed() < Duration::from_secs(5), "retour jamais demandé");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            give(hid, 0x53, &[&p]);
+            p
+        });
+        let t = guest.tunnel(host.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        assert!(said_back(&mut c, b"salut"), "le tunnel ne passe pas");
+        let p = game.join().unwrap();
+        assert!(p.carried() > 0, "le tunnel n'est pas passé par le passeur");
+        assert_eq!(node_direct(host.id()), Some(true));
+        fast::set_dozing(false);
+        assert!(!fast::take_route_wanted(), "la veille finie, plus rien n'attend");
+        drop(c);
+        drop(guest);
+    }
+
     /// Une route par ces passeurs, donnée aux deux bouts comme le fait le relais du monde.
     fn give(node: [u8; 32], route: u64, passeurs: &[&minelib_net::fast::Passeur]) {
         use minelib_net::fast::{tunnel_given, TunnelRoute, Via};
@@ -643,6 +697,7 @@ mod tests {
     /// rapide (pas de débit limité par un tiers).
     #[test]
     fn a_tunnel_goes_through_a_passeur_without_any_server() {
+        let _serial = serial();
         let host = Node::start_offline().unwrap();
         host.serve(echo());
         let guest = Node::start_offline().unwrap();
@@ -679,6 +734,7 @@ mod tests {
     /// sans se refermer.
     #[test]
     fn a_tunnel_moves_to_its_second_passeur_when_the_first_falls() {
+        let _serial = serial();
         let host = Node::start_offline().unwrap();
         host.serve(echo());
         let guest = Node::start_offline().unwrap();
@@ -805,6 +861,64 @@ mod tests {
         let (relay, paths) = paths_of(host.id(), 1);
         eprintln!("RESEAU 3 : chemins {paths:?}");
         assert_eq!(relay, Some(true));
+    }
+
+    /// (v317) Sur le vrai réseau : débit d'un transfert par les serveurs relais d'iroh, les
+    /// deux bouts sans transport IP (le cas de tout lien sans passeurs depuis la v313) :
+    /// 2 Mo envoyés à un relais qui les compte et répond quand il a tout. C'est ce que
+    /// coûte l'envoi d'un monde ou d'une carte par ce chemin.
+    /// `cargo test -p minelib-p2p --lib -- --ignored --nocapture one_way`
+    #[test]
+    #[ignore = "réseau"]
+    fn on_the_real_network_one_way_two_megabytes() {
+        use std::io::{Read, Write};
+        const TOTAL: usize = 2_000_000;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = server.accept() {
+                std::thread::spawn(move || {
+                    let mut head = [0u8; 5];
+                    if s.read_exact(&mut head).is_err() {
+                        return;
+                    }
+                    let mut who = vec![0u8; head[4] as usize];
+                    let _ = s.read_exact(&mut who);
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut got = 0usize;
+                    while got < TOTAL {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got += n,
+                        }
+                    }
+                    let _ = s.write_all(b"fini!");
+                });
+            }
+        });
+        let host = Node::start_private().unwrap();
+        host.serve(local);
+        std::thread::sleep(Duration::from_secs(4));
+        let guest = Node::start_private().unwrap();
+        let t = guest.tunnel(host.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(150))).unwrap();
+        let chunk = vec![7u8; 10_000];
+        let t0 = std::time::Instant::now();
+        let mut sent = 0;
+        while sent < TOTAL {
+            c.write_all(&chunk).unwrap();
+            sent += chunk.len();
+        }
+        let mut done = [0u8; 5];
+        c.read_exact(&mut done).unwrap();
+        let took = t0.elapsed();
+        println!(
+            "RESEAU UN SENS : {sent} octets reçus par l'hôte en {:.1} s ({:.0} Ko/s)",
+            took.as_secs_f32(),
+            sent as f32 / 1024.0 / took.as_secs_f32()
+        );
+        assert_eq!(&done, b"fini!");
     }
 
     /// (v308) Sur le vrai réseau : 256 messages par seconde et par joueur pendant 20 s
