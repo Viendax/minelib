@@ -120,6 +120,7 @@ mod mcimport;
 mod menu;
 mod multiplayer;
 mod netgame;
+mod online_copies;
 mod passkeys;
 mod player;
 mod player_model;
@@ -246,6 +247,17 @@ enum Field {
     Seed,
 }
 
+/// (v325) Ouverture (ou réveil) d'un monde en ligne envoyée au relais, pas encore confirmée.
+struct Hosting {
+    /// La copie en ligne où l'on joue ; `fresh` : faite pour cette ouverture (rien à garder
+    /// si le relais la refuse).
+    dir: PathBuf,
+    fresh: bool,
+    /// Le monde à envoyer au relais une fois ouvert (signature, nom, paquet) : rien ne part
+    /// pour une ouverture refusée.
+    upload: ([u8; 32], String, Vec<u8>),
+}
+
 struct Game {
     /// Compte du joueur et dialogue avec le relais.
     accounts: account::Accounts,
@@ -293,6 +305,14 @@ struct Game {
     searching: Option<([u8; 32], String, Option<PathBuf>)>,
     /// Monde de construction rejoint mais pas encore téléchargé : (signature, nom, hôte).
     pending_build: Option<([u8; 32], String, String)>,
+    /// (v325) Monde de construction en ligne où l'on est : (relais, clé du monde), dit par le
+    /// relais en y entrant (`Event::World`). Propriétaire, sa copie le garde en partant.
+    world_key: Option<(String, String)>,
+    /// (v325) Ouverture (ou réveil) d'un monde en ligne envoyée, pas encore confirmée.
+    hosting: Option<Hosting>,
+    /// (v325) Réveil d'un monde par son créateur alors qu'un autre en garde le dernier état :
+    /// le deuxième clic (même monde, peu après) le confirme.
+    wake_confirm: Option<(String, f32)>,
     fps_status: Option<String>,
     /// Mise à jour automatique (GitHub).
     updater: update::Updater,
@@ -454,6 +474,8 @@ struct Game {
 impl Game {
     fn new() -> anyhow::Result<Self> {
         let paths = minelib_assets::init()?;
+        // (v325) Copies en ligne sans monde, ou à moitié faites.
+        online_copies::tidy(&paths.root);
         let keys = keys::Bindings::load(&paths.root.join("keys.txt"));
         let options = Options::load(&paths.options);
         minelib_p2p::set_hosts_direct(options.host_direct);
@@ -518,6 +540,9 @@ impl Game {
             sig_cache: fpsmap::SigCache::default(),
             searching: None,
             pending_build: None,
+            world_key: None,
+            hosting: None,
+            wake_confirm: None,
             fps_status: None,
             updater: update::Updater::new(),
             was_playing: false,
@@ -781,6 +806,7 @@ impl Game {
     }
 
     fn play(&mut self, dir: PathBuf) {
+        self.world_key = None;
         self.play_with(dir, true);
     }
 
@@ -1034,8 +1060,16 @@ impl Game {
                 if let Err(e) = s.save() {
                     log::error!("sauvegarde impossible : {e:#}");
                 }
+                if s.build.is_some() {
+                    // (Fermé d'abord : sa copie peut changer de dossier.)
+                    let dir = s.dir.clone();
+                    drop(s);
+                    self.keep_online_copy(&dir);
+                }
             }
         }
+        self.world_key = None;
+        self.hosting = None;
         // Le rendu est emprunté pendant l'image : on vide ses maillages en fin d'image.
         self.clear_meshes = true;
         self.refresh_worlds();
@@ -1329,6 +1363,13 @@ impl Game {
             ds,
             GREY,
         );
+        // (v325) Chaque ouverture : un nouveau serveur, sur une copie à part.
+        c.text_center(
+            "Un nouveau serveur, sur une copie à part : ton monde solo ne change pas.",
+            list_y + list_h + 4.0 * s + 10.0 * ds,
+            ds,
+            GREY,
+        );
         let visible = ((list_h - 4.0 * s) / row_h).floor() as usize;
         let mut chosen = None;
         for (i, w) in self
@@ -1492,8 +1533,51 @@ impl Game {
                 continue;
             }
             match &e {
+                // (v325) Le monde de construction où l'on entre : celui qu'on ouvre ou réveille
+                // est gardé, dès maintenant, par la copie où l'on joue.
+                Event::World(key) => {
+                    let relay = self.accounts.relay_hex();
+                    if let Some(h) = &self.hosting {
+                        online_copies::keep(&self.paths.root, &relay, key, &h.dir);
+                    }
+                    self.world_key = Some((relay, key.clone()));
+                }
+                // (v325) Monde pas ouvert (ou pas réveillé) : on n'y reste pas ; une copie
+                // toute neuve, où l'on n'a rien fait, est oubliée.
+                Event::HostRefused(m) => {
+                    if let Some(h) = self.hosting.take() {
+                        if self.session.as_ref().is_some_and(|s| s.dir == h.dir) {
+                            self.session = None;
+                            self.clear_meshes = true;
+                            self.current_room = None;
+                            self.world_key = None;
+                            self.screen = Screen::Servers(multiplayer::Kind::Build);
+                            self.accounts.refresh_servers(multiplayer::Kind::Build as u8);
+                        }
+                        if h.fresh && online_copies::is_copy(&self.paths.root, &h.dir) {
+                            let _ = std::fs::remove_dir_all(&h.dir);
+                        }
+                    }
+                    self.notify(m.clone());
+                }
                 Event::Hosted(room) => {
                     self.current_room = Some(*room);
+                    // (v325) Monde ouvert (ou réveillé) : sa météo (celle qu'un OP y a
+                    // imposée, gardée par le relais), et le monde pour ceux qui le rejoignent.
+                    if let Some(h) = self.hosting.take() {
+                        self.accounts.room(Cmd::ServerAdmin {
+                            action: minelib_net::proto::SERVER_WEATHER,
+                            pseudo: String::new(),
+                            reason: String::new(),
+                        });
+                        let (sig, name, bytes) = h.upload;
+                        self.accounts.room(Cmd::UploadMap {
+                            sig,
+                            name,
+                            bytes,
+                            fps: false,
+                        });
+                    }
                     if let Some((sig, name, Some(dir))) = self.searching.take() {
                         self.fps_status = None;
                         self.mark_shared(sig);
@@ -1711,8 +1795,13 @@ impl Game {
                     }
                 }
                 Event::Kicked(reason) => {
+                    let world = self.world_key.clone();
                     if self.session.as_ref().is_some_and(|s| s.build.is_some()) {
                         self.leave_world();
+                    }
+                    // (v325) Monde supprimé par son créateur : sa copie sur ce PC aussi.
+                    if let Some((relay, key)) = world.filter(|_| reason.contains("supprimé")) {
+                        online_copies::forget(&self.paths.root, &relay, &key);
                     }
                     self.notify(reason);
                 }
@@ -2714,22 +2803,153 @@ impl Game {
         }
     }
 
-    /// Ouvre un monde en construction en ligne (ce jeu en est le propriétaire).
-    fn host_build(&mut self, dir: PathBuf) {
+    /// Ouvre en ligne le monde solo `solo` (ce jeu en est le propriétaire). (v325) Un
+    /// nouveau serveur, joué dans une copie à part (`online_copies`) : le monde solo n'en
+    /// sait plus rien, et l'ouvrir de nouveau en ligne fait un autre serveur.
+    fn host_build(&mut self, solo: PathBuf) {
+        if self.accounts.link.is_none() {
+            self.notify("Connecte-toi d'abord à ton compte.".to_string());
+            return;
+        }
+        let name = save::list_worlds(&self.paths.saves)
+            .into_iter()
+            .find(|w| w.dir == solo)
+            .map_or_else(|| "Monde".into(), |w| w.meta.name);
+        let dir = match online_copies::fork(&self.paths.root, &solo) {
+            Ok(d) => d,
+            Err(e) => {
+                self.notify(format!("Copie du monde impossible : {e:#}"));
+                return;
+            }
+        };
+        self.host_online(dir, true, name, None);
+    }
+
+    /// (v325) Réveille le monde endormi `e` (son entrée dans la liste), joué dans sa copie :
+    /// celle que ce PC en garde, sinon (endormi avant la v325) là où il se jouait alors.
+    fn wake_world(&mut self, e: &minelib_net::proto::ServerEntry) {
+        if self.accounts.link.is_none() {
+            self.notify("Connecte-toi d'abord à ton compte.".to_string());
+            return;
+        }
+        let me = self.accounts.pseudo();
+        let creator = e.creator.eq_ignore_ascii_case(&me) || e.host.eq_ignore_ascii_case(&me);
+        let keeper = !e.keeper.is_empty() && e.keeper.eq_ignore_ascii_case(&me);
+        if e.elsewhere() {
+            self.notify("Ce monde dort sur un autre relais : réveille-le depuis ce relais.");
+            return;
+        }
+        if !creator && !keeper {
+            let who = if e.keeper.is_empty() || e.keeper.eq_ignore_ascii_case(&e.host) {
+                e.host.clone()
+            } else {
+                format!("{} ou {}", e.host, e.keeper)
+            };
+            self.notify(format!("Ce monde dort : seul {who} peut le réveiller."));
+            return;
+        }
+        // Son créateur, alors qu'un autre en garde le dernier état : sa copie à lui est plus
+        // ancienne. Un deuxième clic le confirme.
+        if !keeper && !e.keeper.is_empty() {
+            let again = self
+                .wake_confirm
+                .take()
+                .is_some_and(|(k, t)| k == e.world && self.time - t < 8.0);
+            if !again {
+                self.wake_confirm = Some((e.world.clone(), self.time));
+                self.notify(format!(
+                    "{} garde le dernier état de ce monde. « Réveiller » encore : avec ta \
+                     copie, plus ancienne.",
+                    e.keeper
+                ));
+                return;
+            }
+        }
+        let root = self.paths.root.clone();
+        let relay = self.accounts.relay_hex();
+        let found = online_copies::find(&root, &relay, &e.world)
+            .or_else(|| online_copies::before_v325(&root, &self.paths.saves, &e.map, creator));
+        let Some(src) = found else {
+            let who = if keeper { e.host.clone() } else { e.keeper.clone() };
+            self.notify(format!(
+                "Pas de copie de ce monde sur ce PC : {who} doit le réveiller depuis le sien."
+            ));
+            return;
+        };
+        // Sa copie à lui, ou une copie à part de là où il se jouait (jamais le monde solo ni
+        // la carte téléchargée eux-mêmes).
+        let (dir, fresh) = if online_copies::is_copy(&root, &src) {
+            (src, false)
+        } else {
+            match online_copies::fork(&root, &src) {
+                Ok(d) => (d, true),
+                Err(err) => {
+                    self.notify(format!("Copie du monde impossible : {err:#}"));
+                    return;
+                }
+            }
+        };
+        log::info!("réveil du monde {} depuis {}", e.world, dir.display());
+        self.host_online(dir, fresh, e.map.clone(), Some((e.name.clone(), e.world.clone())));
+    }
+
+    /// (v325) Propriétaire d'un monde en ligne qui s'en va : sa copie (`dir`) en garde le
+    /// dernier état. Jamais ouvert en ligne (le relais n'a pas répondu) : la copie où l'on a
+    /// joué devient un monde solo, plutôt que de rester où personne ne la verrait.
+    fn keep_online_copy(&mut self, dir: &std::path::Path) {
+        let root = self.paths.root.clone();
+        match self.world_key.clone() {
+            Some((relay, key)) => online_copies::keep(&root, &relay, &key, dir),
+            None if online_copies::is_copy(&root, dir) => {
+                match online_copies::to_solo(&root, &self.paths.saves, dir) {
+                    Ok(d) => log::info!("monde jamais ouvert en ligne : dans les mondes solo ({})", d.display()),
+                    Err(e) => log::warn!("copie d'un monde jamais ouvert en ligne : {e:#}"),
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// (v325) Ouvre en ligne le monde joué dans `dir` (sa copie en ligne ; `fresh` : faite
+    /// à l'instant), sous le nom de carte `map`. `wake` : le monde endormi qu'on réveille
+    /// (son nom dans la liste, sa clé) ; sans lui, un nouveau serveur.
+    fn host_online(
+        &mut self,
+        dir: PathBuf,
+        fresh: bool,
+        name: String,
+        wake: Option<(String, String)>,
+    ) {
+        // (Rien d'ouvert : une copie faite pour cette ouverture ne sert à rien.)
+        let drop_fresh = |root: &std::path::Path, dir: &std::path::Path| {
+            if fresh && online_copies::is_copy(root, dir) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        };
         let Some(link) = self.accounts.link.clone() else {
+            drop_fresh(&self.paths.root, &dir);
             self.notify("Connecte-toi d'abord à ton compte.".to_string());
             return;
         };
         let Ok(p) = fpsmap::package(&dir) else {
+            drop_fresh(&self.paths.root, &dir);
             self.notify("Monde illisible.".to_string());
             return;
         };
         let sig = p.signature();
-        let name = save::list_worlds(&self.paths.saves)
-            .into_iter()
-            .find(|w| w.dir == dir)
-            .map_or_else(|| "Monde".into(), |w| w.meta.name);
-        self.play_with(dir, true);
+        self.world_key = None;
+        self.wake_confirm = None;
+        self.play_with(dir.clone(), true);
+        if self.session.is_none() {
+            // (Monde illisible : rien n'est ouvert en ligne.)
+            drop_fresh(&self.paths.root, &dir);
+            return;
+        }
+        self.hosting = Some(Hosting {
+            dir,
+            fresh,
+            upload: (sig, name.clone(), p.to_bytes()),
+        });
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             if s.game.mode == save::GameMode::Fps {
@@ -2743,27 +2963,23 @@ impl Game {
             b.set_origin(s.world.origin_blocks());
             s.build = Some(b);
         }
-        self.accounts.room(minelib_net::client::Cmd::Host {
-            kind: 1,
-            name: format!("{name} ({pseudo})"),
-            map: name.clone(),
-            map_sig: sig,
-            max_players: 0,
+        self.accounts.room(match wake {
+            Some((title, world)) => minelib_net::client::Cmd::WakeWorld {
+                name: title,
+                map: name.clone(),
+                map_sig: sig,
+                world,
+            },
+            None => minelib_net::client::Cmd::Host {
+                kind: 1,
+                name: format!("{name} ({pseudo})"),
+                map: name.clone(),
+                map_sig: sig,
+                max_players: 0,
+            },
         });
-        // (v229) Météo du serveur (celle qu'un OP y a imposée la dernière fois, gardée par le
-        // relais) : le propriétaire la demande, comme l'apprennent ceux qui le rejoignent.
-        self.accounts.room(minelib_net::client::Cmd::ServerAdmin {
-            action: minelib_net::proto::SERVER_WEATHER,
-            pseudo: String::new(),
-            reason: String::new(),
-        });
-        // Monde de construction : pour ceux qui le rejoignent, pas pour la liste des cartes.
-        self.accounts.room(minelib_net::client::Cmd::UploadMap {
-            sig,
-            name,
-            bytes: p.to_bytes(),
-            fps: false,
-        });
+        // (v229) La météo du serveur, et le monde (pour ceux qui le rejoignent, pas pour la
+        // liste des cartes) : une fois ouvert (`Event::Hosted`).
     }
 
     /// Monde de construction rejoint.
@@ -2885,6 +3101,13 @@ impl Game {
                 active: e.active,
                 asleep: e.asleep,
                 keeper: e.keeper.clone(),
+                can_wake: {
+                    let me = self.accounts.pseudo();
+                    !me.is_empty()
+                        && (e.creator.eq_ignore_ascii_case(&me)
+                            || e.host.eq_ignore_ascii_case(&me)
+                            || e.keeper.eq_ignore_ascii_case(&me))
+                },
             })
             .collect();
         let time = self.time;
@@ -2901,7 +3124,10 @@ impl Game {
         match action {
             multiplayer::Action::Refresh => self.accounts.refresh_servers(kind as u8),
             multiplayer::Action::Join(i) => {
-                if let Some(e) = self.accounts.servers.get(i).cloned().filter(|e| !e.asleep) {
+                // (v325) Un monde endormi : « Réveiller ».
+                if let Some(e) = self.accounts.servers.get(i).cloned().filter(|e| e.asleep) {
+                    self.wake_world(&e);
+                } else if let Some(e) = self.accounts.servers.get(i).cloned() {
                     if e.elsewhere() {
                         self.accounts.join_elsewhere(&e);
                     } else {
@@ -5082,6 +5308,13 @@ impl GameLoop for Game {
             s.flush_reports();
             if let Err(e) = s.save() {
                 log::error!("sauvegarde impossible : {e:#}");
+            }
+            // (v325) Propriétaire d'un monde en ligne : sa copie le garde (fermé d'abord : elle
+            // peut changer de dossier).
+            if s.build.as_ref().is_some_and(|b| b.is_owner()) {
+                let dir = s.dir.clone();
+                drop(s);
+                self.keep_online_copy(&dir);
             }
         }
         // Relais intégré, ou monde repris tenu par la connexion de garant : ses mondes

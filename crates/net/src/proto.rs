@@ -76,6 +76,8 @@ use serde::{Deserialize, Serialize};
 /// (`Response::BuildMatch::origin`).
 /// (v323, toujours 75) Les couleurs des couches d'une pile de tapis posée en construction en
 /// ligne (`game::BuildMsg::CarpetPut`, `Carpet`, en fin d'énumération).
+/// (v325, toujours 75) `Host::wake`, `Hosted::world`, `Joined::world`, `ServerEntry::world`
+/// et `ServerEntry::creator`.
 pub const PROTOCOL: u32 = 75;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
@@ -333,6 +335,10 @@ pub enum Request {
         map_sig: [u8; 32],
         /// 0 : sans limite (construction).
         max_players: u16,
+        /// (v325) Clé du monde endormi à réveiller (`ServerEntry::world`), par son créateur
+        /// ou celui qui en garde le dernier état. Vide : un nouveau monde, même si ce monde
+        /// solo a déjà été ouvert en ligne (chaque monde en ligne a sa propre copie).
+        wake: String,
     },
     /// Mode FPS : cherche une partie en attente sur cette carte (compatible : personne
     /// qu'on a signalé, réputation proche) ; sans résultat, en ouvre une dont on est l'hôte.
@@ -1151,6 +1157,10 @@ pub struct ServerEntry {
     /// celui qui en garde le dernier état (`keeper`), ou son créateur, ne l'a pas rouvert.
     pub asleep: bool,
     pub keeper: String,
+    /// (v325) Clé du monde de construction (de quoi réveiller ce monde-là s'il dort), et
+    /// son créateur (ses propres mondes en tête de la liste).
+    pub world: String,
+    pub creator: String,
 }
 
 impl ServerEntry {
@@ -1245,14 +1255,18 @@ pub enum Response {
         list: Vec<ServerEntry>,
     },
     Pong,
+    /// (v325) `world` : clé du monde de construction (vide en FPS), pour que le jeu sache
+    /// quel monde il garde quand il en est le propriétaire.
     Hosted {
         room: u64,
+        world: String,
     },
     Joined {
         room: u64,
         host: String,
         map: String,
         map_sig: [u8; 32],
+        world: String,
     },
     Leaderboard {
         list: Vec<RankEntry>,

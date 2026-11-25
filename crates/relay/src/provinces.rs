@@ -2635,6 +2635,7 @@ pub(crate) fn begin(
     let Ok(root) = VerifyingKey::from_bytes(&root) else {
         return false;
     };
+    // (v325) Le monde du pays : sa clé (pas celle d'un monde neuf).
     let local = open_room(
         st,
         0,
@@ -2644,6 +2645,7 @@ pub(crate) fn begin(
         info.map.clone(),
         info.map_sig,
         0,
+        Some((info.creator.clone(), info.server.clone())),
     );
     let Some(mut room) = st.rooms.remove(&local) else {
         return false;

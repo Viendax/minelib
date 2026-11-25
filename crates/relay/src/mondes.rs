@@ -102,19 +102,35 @@ impl Store {
         Ok(())
     }
 
-    /// Le monde endormi que `pseudo` réveille en ouvrant un monde nommé `map` : le sien
-    /// (il en est le créateur), ou celui dont il garde le dernier état. Rend son créateur
-    /// et sa clé.
-    pub fn wakes(&self, pseudo: &str, map: &str) -> Option<(String, String)> {
+    /// (v325) `pseudo` réveille le monde endormi `key` (son entrée dans la liste) : il en
+    /// est le créateur, ou il en garde le dernier état. Rend son créateur. (La v311 le
+    /// retrouvait au nom de la carte ouverte : rouvrir le monde solo réveillait le monde
+    /// en ligne avec le contenu du solo.)
+    pub fn wake(&self, key: &str, pseudo: &str) -> Option<String> {
         self.worlds
-            .values()
-            .filter(|w| w.asleep.is_some() && w.map == map)
+            .get(key)
+            .filter(|w| w.asleep.is_some())
             .filter(|w| {
                 w.creator.eq_ignore_ascii_case(pseudo) || w.keeper.eq_ignore_ascii_case(pseudo)
             })
-            // (Le sien d'abord, sinon le plus récemment actif.)
-            .max_by_key(|w| (w.creator.eq_ignore_ascii_case(pseudo), w.active))
-            .map(|w| (w.creator.clone(), w.key.clone()))
+            .map(|w| w.creator.clone())
+    }
+
+    /// (v325) Clé d'un monde neuf : `base` (créateur/carte), ou `base#2`, `base#3`… si un
+    /// monde, endormi ou ouvert (`open`), la porte déjà. Rend aussi le numéro (1 : `base`).
+    pub fn fresh_key(&self, base: &str, open: &[String]) -> (String, u32) {
+        let taken = |k: &str| self.worlds.contains_key(k) || open.iter().any(|o| o == k);
+        if !taken(base) {
+            return (base.to_string(), 1);
+        }
+        let mut n = 2u32;
+        loop {
+            let k = format!("{base}#{n}");
+            if !taken(&k) {
+                return (k, n);
+            }
+            n += 1;
+        }
     }
 
     /// Le monde `key` vient d'être ouvert (ou réveillé).
@@ -187,8 +203,17 @@ impl Store {
 
     /// Mondes endormis, ceux qui ont eu le plus de joueurs d'abord.
     pub fn sleeping(&self) -> Vec<&World> {
-        let mut v: Vec<&World> = self.worlds.values().filter(|w| w.asleep.is_some()).collect();
-        v.sort_by(|a, b| b.peak.cmp(&a.peak).then(b.active.cmp(&a.active)).then(a.key.cmp(&b.key)));
+        let mut v: Vec<&World> = self
+            .worlds
+            .values()
+            .filter(|w| w.asleep.is_some())
+            .collect();
+        v.sort_by(|a, b| {
+            b.peak
+                .cmp(&a.peak)
+                .then(b.active.cmp(&a.active))
+                .then(a.key.cmp(&b.key))
+        });
         v
     }
 }
@@ -213,16 +238,23 @@ mod tests {
         s.seen("ana/ile", 7);
         s.seen("ana/ile", 2);
         assert_eq!(s.get("ana/ile").unwrap().peak, 7);
-        assert!(s.sleeping().is_empty() && s.wakes("Ana", "ile").is_none());
+        assert!(s.sleeping().is_empty() && s.wake("ana/ile", "Ana").is_none());
         s.asleep("ana/ile", "Bob");
         let path = s.path.clone();
         let s = Store::open(path);
         let w = s.get("ana/ile").unwrap();
         assert!(w.asleep.is_some() && w.keeper == "Bob" && w.peak == 7 && w.name == "L'île");
-        assert_eq!(s.wakes("bob", "ile"), Some(("Ana".into(), "ana/ile".into())));
-        assert_eq!(s.wakes("ANA", "ile"), Some(("Ana".into(), "ana/ile".into())));
-        assert_eq!(s.wakes("Zoe", "ile"), None);
-        assert_eq!(s.wakes("Bob", "autre"), None);
+        assert_eq!(s.wake("ana/ile", "bob"), Some("Ana".into()));
+        assert_eq!(s.wake("ana/ile", "ANA"), Some("Ana".into()));
+        assert_eq!(s.wake("ana/ile", "Zoe"), None);
+        assert_eq!(s.wake("ana/autre", "Bob"), None);
+        // (v325) Un monde neuf ne reprend jamais la clé d'un autre, endormi ou ouvert.
+        assert_eq!(s.fresh_key("ana/ile", &[]), ("ana/ile#2".into(), 2));
+        assert_eq!(s.fresh_key("zoe/ile", &[]), ("zoe/ile".into(), 1));
+        assert_eq!(
+            s.fresh_key("zoe/ile", &["zoe/ile".into()]),
+            ("zoe/ile#2".into(), 2)
+        );
     }
 
     /// Un monde ouvert quand le relais s'arrête dort à son redémarrage ; supprimé, il
@@ -256,8 +288,9 @@ mod tests {
 
     /// De bout en bout, avec de vrais jeux : un monde ouvert par Ana, où Bob entre, passe
     /// à Bob quand Ana s'en va, s'endort quand Bob s'en va (Bob en garde le dernier état),
-    /// reste dans la liste avec son record, se réveille quand Bob le rouvre, toujours
-    /// celui d'Ana ; Bob ne peut pas le supprimer, Ana oui, et tout le monde en sort.
+    /// reste dans la liste avec son record ; (v325) Ana qui rouvre son monde solo en fait un
+    /// autre serveur ; il se réveille par sa clé quand Bob le réveille, toujours celui d'Ana
+    /// (pas pour Zoe) ; Bob ne peut pas le supprimer, Ana oui, et tout le monde en sort.
     #[test]
     fn a_world_sleeps_wakes_for_its_keeper_and_only_its_creator_deletes_it() {
         use crate::{start, Config};
@@ -324,7 +357,10 @@ mod tests {
         wait(&bob, &|e| matches!(e, Event::Joined { .. }));
         // Ouvert, deux joueurs : en tête de liste, record 2.
         let l = list(&bob);
-        assert_eq!((l.len(), l[0].players, l[0].peak, l[0].asleep), (1, 2, 2, false));
+        assert_eq!(
+            (l.len(), l[0].players, l[0].peak, l[0].asleep),
+            (1, 2, 2, false)
+        );
         assert!(l[0].opened > 0 && l[0].active >= l[0].opened);
         // Ana s'en va : Bob devient le propriétaire. Bob s'en va : le monde s'endort.
         ana.send(Cmd::Leave);
@@ -338,17 +374,58 @@ mod tests {
         let l = list(&ana);
         assert_eq!(l.len(), 1, "le monde endormi reste dans la liste");
         assert!(l[0].asleep && l[0].id == 0 && l[0].peak == 2 && l[0].players == 0);
-        assert_eq!((l[0].keeper.as_str(), l[0].host.as_str()), ("BobMonde", "AnaMonde"));
-        // Un inconnu qui ouvre un monde du même nom n'a pas celui-là ; Bob, si.
+        assert_eq!(
+            (l[0].keeper.as_str(), l[0].host.as_str()),
+            ("BobMonde", "AnaMonde")
+        );
+        assert_eq!(l[0].world, "anamonde/ile");
+        // Un inconnu qui ouvre un monde du même nom n'a pas celui-là.
         let zoe = login("ZoeMonde");
         let other = host(&zoe);
         assert_eq!(h.state.lock().unwrap().rooms[&other].creator, "ZoeMonde");
         zoe.send(Cmd::Leave);
-        let rid = host(&bob);
+        // (v325) Ana rouvre son monde solo : c'est un autre serveur, l'endormi n'y est pour
+        // rien (il garde son contenu à lui).
+        let again = host(&ana);
+        {
+            let st = h.state.lock().unwrap();
+            let r = &st.rooms[&again];
+            assert_eq!(
+                (r.server.as_str(), r.name.as_str()),
+                ("anamonde/ile#2", "L'île 2")
+            );
+            assert!(st.worlds.get("anamonde/ile").unwrap().asleep.is_some());
+        }
+        ana.send(Cmd::Leave);
+        // Zoe ne réveille pas un monde qui n'est pas le sien ; Bob, qui en garde le dernier
+        // état, le réveille par sa clé.
+        let wake = |c: &Client, world: &str| {
+            c.send(Cmd::WakeWorld {
+                name: "L'île".into(),
+                map: "ile".into(),
+                map_sig: [5; 32],
+                world: world.into(),
+            });
+        };
+        wake(&zoe, "anamonde/ile");
+        match wait(&zoe, &|e| {
+            matches!(e, Event::HostRefused(_) | Event::Hosted(_))
+        }) {
+            Event::HostRefused(m) => assert!(m.contains("réveiller"), "{m}"),
+            e => panic!("{e:?}"),
+        }
+        wake(&bob, "anamonde/ile");
+        let rid = match wait(&bob, &|e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
         {
             let st = h.state.lock().unwrap();
             let r = &st.rooms[&rid];
-            assert_eq!((r.creator.as_str(), r.server.as_str()), ("AnaMonde", "anamonde/ile"));
+            assert_eq!(
+                (r.creator.as_str(), r.server.as_str()),
+                ("AnaMonde", "anamonde/ile")
+            );
             assert!(st.worlds.get("anamonde/ile").unwrap().asleep.is_none());
             // (Réveillé avec ses réglages : la liste blanche est restée ouverte.)
             assert!(!st.servers.whitelist_on("anamonde/ile"));
@@ -373,7 +450,93 @@ mod tests {
         assert!(st.worlds.get("anamonde/ile").is_none());
         assert!(st.servers.ops("anamonde/ile").is_empty());
         drop(st);
-        assert!(list(&zoe).iter().all(|e| e.map != "ile" || e.host == "ZoeMonde"));
+        assert!(list(&zoe).iter().all(|e| e.world != "anamonde/ile"));
+    }
+
+    /// (v325) Ses propres mondes en tête de la liste, ouverts ou endormis, le plus récemment
+    /// actif d'abord ; ses mondes endormis (créés ou gardés) y sont même au-delà de ceux
+    /// qu'on montre ; pour un autre, rien de tout ça.
+    #[test]
+    fn own_worlds_head_the_list_most_recently_active_first() {
+        use crate::{start, Config};
+        let dir = std::env::temp_dir().join(format!("minelib-mondes3-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir,
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let mut st = h.state.lock().unwrap();
+        // D'autres mondes endormis, plus qu'on n'en montre, tous avec un meilleur record.
+        for i in 0..SLEEPING_SHOWN + 5 {
+            let key = format!("zed{i}/m");
+            st.worlds.opened(&key, "M", "m", &format!("Zed{i}"), "x");
+            st.worlds.seen(&key, 9);
+            st.worlds.asleep(&key, "x");
+        }
+        // Deux mondes d'Ana, endormis, sans record : un ancien et un récent ; un monde que
+        // garde Ana (créé par Bob) ; et Ana a un monde ouvert, moins récent que le récent.
+        for (key, active) in [("ana/vieux", 1_000), ("ana/neuf", 3_000)] {
+            st.worlds.opened(key, key, key, "Ana", "Ana");
+            st.worlds.asleep(key, "Ana");
+            st.worlds.worlds.get_mut(key).unwrap().active = active;
+        }
+        st.worlds.opened("bob/garde", "G", "garde", "Bob", "Bob");
+        st.worlds.asleep("bob/garde", "Ana");
+        drop(st);
+        let c = minelib_net::client::Client::spawn(h.addr.to_string(), Some(h.public));
+        c.send(minelib_net::client::Cmd::Register {
+            pseudo: "Ana".into(),
+            password: "motdepasse".into(),
+        });
+        let t = Instant::now();
+        loop {
+            if let Some(minelib_net::client::Event::LoggedIn { .. }) = c.poll() {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(30), "délai dépassé");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        c.send(minelib_net::client::Cmd::Host {
+            kind: 1,
+            name: "Ouvert".into(),
+            map: "ouvert".into(),
+            map_sig: [1; 32],
+            max_players: 0,
+        });
+        let t = Instant::now();
+        loop {
+            if let Some(minelib_net::client::Event::Hosted(_)) = c.poll() {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(30), "délai dépassé");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut st = h.state.lock().unwrap();
+        st.worlds.worlds.get_mut("ana/ouvert").unwrap().active = 2_000;
+        let l = crate::local_servers(&st, 1, Some("ANA"));
+        let keys: Vec<&str> = l.iter().map(|e| e.world.as_str()).collect();
+        assert_eq!(&keys[..3], ["ana/neuf", "ana/ouvert", "ana/vieux"]);
+        assert!(l[0].creator == "Ana" && l[0].asleep && !l[1].asleep && l[1].players == 1);
+        assert!(
+            keys.contains(&"bob/garde"),
+            "le monde qu'Ana garde y est, même au-delà"
+        );
+        assert_eq!(
+            l.iter().filter(|e| e.creator.starts_with("Zed")).count(),
+            SLEEPING_SHOWN
+        );
+        // Pour un autre : les mondes d'Ana à leur place ordinaire (son monde ouvert d'abord,
+        // ses endormis sans record au-delà du nombre montré).
+        let l = crate::local_servers(&st, 1, Some("Zoe"));
+        assert_eq!(
+            (l.len(), l[0].world.as_str()),
+            (SLEEPING_SHOWN + 1, "ana/ouvert")
+        );
+        assert!(l[1..]
+            .iter()
+            .all(|e| e.creator.starts_with("Zed") && e.asleep));
     }
 
     /// Un créateur qui a la double authentification ne supprime son monde qu'avec un code
@@ -432,7 +595,13 @@ mod tests {
         let wrong = (totp::code(&secret, step + 1) + 1) % 1_000_000;
         ana.send(Cmd::DeleteWorld(Some(wrong)));
         wait(&ana, &|e| matches!(e, Event::DeleteWorldCode));
-        assert!(h.state.lock().unwrap().worlds.get("anacode/coffre").is_some());
+        assert!(h
+            .state
+            .lock()
+            .unwrap()
+            .worlds
+            .get("anacode/coffre")
+            .is_some());
         ana.send(Cmd::DeleteWorld(Some(totp::code(&secret, step + 1))));
         wait(&ana, &|e| matches!(e, Event::Kicked(_)));
         let st = h.state.lock().unwrap();

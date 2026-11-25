@@ -1428,9 +1428,13 @@ mod tests {
     }
 
     fn until(f: impl Fn() -> bool) {
+        until_within(Duration::from_secs(30), f);
+    }
+
+    fn until_within(limit: Duration, f: impl Fn() -> bool) {
         let t = Instant::now();
         while !f() {
-            assert!(t.elapsed() < Duration::from_secs(30), "délai dépassé");
+            assert!(t.elapsed() < limit, "délai dépassé");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -1591,9 +1595,11 @@ mod tests {
         assert_ne!(chains[0].1, chains[2].1, "un sceau par chaîne");
         assert_eq!(minelib_p2p::node_direct(relay_node.id()), Some(true));
         assert_eq!(relay_node.passeurs().routes(), 1, "le relais tient le bout hôte");
-        // La première connexion se ferme : le tunnel passe à la seconde.
+        // La première connexion se ferme : le tunnel passe à la seconde. (Sous la charge de
+        // tous les essais à la fois, la fermeture peut se perdre : le relais ne la voit alors
+        // qu'à l'expiration de la connexion, 30 s.)
         drop(first);
-        until(|| {
+        until_within(Duration::from_secs(60), || {
             let st = h.state.lock().unwrap();
             let mine = st
                 .conns

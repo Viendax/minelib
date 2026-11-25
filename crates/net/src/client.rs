@@ -167,6 +167,15 @@ pub enum Cmd {
     /// (v320) Silence complet du relais au-delà duquel on le tient pour perdu (lien par
     /// des passeurs : plus long).
     Patience(Duration),
+    /// (v325) Réveille le monde endormi `world` (son entrée dans la liste) : il garde son
+    /// créateur, ses OP, ses bannis, sa liste blanche ; son contenu est la copie en ligne
+    /// de ce jeu (`map_sig`), jamais une version solo.
+    WakeWorld {
+        name: String,
+        map: String,
+        map_sig: [u8; 32],
+        world: String,
+    },
     /// (v320) Passeur sans joueur (`minelib-relay --passeur`), à dire avant `Passeur(true)` :
     /// son adresse publique (un serveur la connaît, il n'a pas de box à interroger) et son
     /// port UDP (0 : n'importe lequel).
@@ -327,6 +336,11 @@ pub enum Event {
         key: [u8; 32],
     },
     Hosted(u64),
+    /// (v325) Clé du monde de construction où l'on vient d'entrer (avant `Hosted` ou
+    /// `Joined`).
+    World(String),
+    /// (v325) Le relais n'a pas ouvert (ou pas réveillé) ce monde de construction : pourquoi.
+    HostRefused(String),
     Joined {
         room: u64,
         host: String,
@@ -2059,9 +2073,39 @@ impl Worker {
                 map,
                 map_sig,
                 max_players,
+                wake: String::new(),
             })? {
-                Response::Hosted { room } => {
+                Response::Hosted { room, world } => {
+                    self.emit_world(world);
                     self.emit(Event::Hosted(room));
+                    Ok(())
+                }
+                Response::Error { code, message } if kind == 1 => {
+                    self.emit(Event::HostRefused(error_text(code, &message)));
+                    Ok(())
+                }
+                r => self.unexpected(r),
+            },
+            Cmd::WakeWorld {
+                name,
+                map,
+                map_sig,
+                world,
+            } => match self.request(&Request::Host {
+                kind: 1,
+                name,
+                map,
+                map_sig,
+                max_players: 0,
+                wake: world,
+            })? {
+                Response::Hosted { room, world } => {
+                    self.emit_world(world);
+                    self.emit(Event::Hosted(room));
+                    Ok(())
+                }
+                Response::Error { code, message } => {
+                    self.emit(Event::HostRefused(error_text(code, &message)));
                     Ok(())
                 }
                 r => self.unexpected(r),
@@ -2080,7 +2124,9 @@ impl Worker {
                     host,
                     map,
                     map_sig,
+                    world,
                 } => {
+                    self.emit_world(world);
                     self.emit(Event::Joined {
                         room,
                         host,
@@ -2106,7 +2152,9 @@ impl Worker {
                         host,
                         map,
                         map_sig,
+                        world,
                     } => {
+                        self.emit_world(world);
                         self.emit(Event::Joined {
                             room,
                             host,
@@ -2115,7 +2163,8 @@ impl Worker {
                         });
                         Ok(())
                     }
-                    Response::Hosted { room } => {
+                    Response::Hosted { room, world } => {
+                        self.emit_world(world);
                         self.emit(Event::Hosted(room));
                         Ok(())
                     }
@@ -2493,6 +2542,13 @@ impl Worker {
     }
 
     /// Envoi sans réponse attendue.
+    /// (v325) Clé du monde de construction où l'on entre (rien en FPS).
+    fn emit_world(&self, world: String) {
+        if !world.is_empty() {
+            self.emit(Event::World(world));
+        }
+    }
+
     fn oneway(&mut self, req: &Request) -> Result<()> {
         self.chan
             .as_mut()
@@ -2516,8 +2572,10 @@ impl Worker {
                 host,
                 map,
                 map_sig,
+                world,
             } => {
                 self.pseudo = cert.pseudo.clone();
+                self.emit_world(world);
                 self.emit(Event::Identity(key));
                 if let Some(c) = &self.chan {
                     self.emit(Event::Link(c.pusher()));

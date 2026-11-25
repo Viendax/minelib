@@ -42,6 +42,9 @@ pub struct ServerInfo {
     pub active: u64,
     pub asleep: bool,
     pub keeper: String,
+    /// (v325) Endormi, ce joueur peut le réveiller (il l'a créé, ou il en garde le dernier
+    /// état).
+    pub can_wake: bool,
 }
 
 /// (v311) « à l'instant », « il y a 5 min », « il y a 3 h », « il y a 12 j ».
@@ -379,10 +382,15 @@ pub fn list_screen(
     let cx = c.w / 2.0;
     let bw = 150.0;
     let half = (bw / 2.0 + 3.0) * s;
-    // (v311) Un monde endormi ne se rejoint pas : celui qui en garde le dernier état, ou
-    // son créateur, doit le rouvrir (« Ouvrir un monde », avec le même monde).
-    let awake = selected.is_some_and(|i| servers.get(i).is_some_and(|sv| !sv.asleep));
-    let join = c.button("Rejoindre", cx - half, by, bw, awake);
+    // (v325) Un monde endormi se réveille d'ici, par son créateur ou celui qui en garde le
+    // dernier état (« Ouvrir un monde » en fait un autre serveur).
+    let pick = selected.and_then(|i| servers.get(i));
+    let (label, can) = match pick {
+        Some(sv) if sv.asleep => ("Réveiller", sv.can_wake),
+        Some(_) => ("Rejoindre", true),
+        None => ("Rejoindre", false),
+    };
+    let join = c.button(label, cx - half, by, bw, can);
     let label = if kind == Kind::Build {
         "Ouvrir un monde"
     } else {
@@ -1274,6 +1282,7 @@ mod tests {
             active: 10_000,
             asleep: false,
             keeper: String::new(),
+            can_wake: false,
         };
         assert_eq!(detail(&sv, 10_030), "ile - Relais - record 9 - actif à l'instant");
         sv.players = 9;

@@ -455,6 +455,19 @@ pub enum Outcome {
     Leave,
 }
 
+/// (v325) Ses propres mondes (ceux que `me` a créés) en tête de la liste des serveurs, le
+/// plus récemment actif d'abord ; les autres gardent l'ordre du relais (le relais d'ici
+/// le fait déjà pour les siens : ici, ceux des relais fédérés aussi).
+pub fn own_first(list: &mut [ServerEntry], me: &str) {
+    let mine = |e: &ServerEntry| !me.is_empty() && e.creator.eq_ignore_ascii_case(me);
+    list.sort_by(|a, b| match (mine(a), mine(b)) {
+        (true, true) => b.active.cmp(&a.active),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => std::cmp::Ordering::Equal,
+    });
+}
+
 pub struct Accounts {
     client: Option<Client>,
     relay_addr: String,
@@ -1070,8 +1083,9 @@ impl Accounts {
                     }
                     self.info = Some("Double authentification désactivée.".into());
                 }
-                Event::Servers(list) => {
+                Event::Servers(mut list) => {
                     self.busy = None;
+                    own_first(&mut list, &self.pseudo());
                     self.servers = list;
                 }
                 // (v240) Clés d'accès : défi reçu (connexion), clé vérifiée par le relais
@@ -1303,6 +1317,8 @@ impl Accounts {
                     self.game_events.push(Event::PartyInvite(from));
                 }
                 e @ (Event::Hosted(_)
+                | Event::World(_)
+                | Event::HostRefused(_)
                 | Event::Reported(_)
                 | Event::Unreported(_)
                 | Event::BanDone(_)
@@ -1842,6 +1858,18 @@ impl Accounts {
 
     pub fn relay_dir(&self) -> PathBuf {
         self.relay_dir.clone()
+    }
+
+    /// (v325) Le relais du monde où l'on est (le relais de secours qui l'a repris, sinon
+    /// celui du compte), en hexadécimal : avec la clé du monde, ce qui désigne une copie en
+    /// ligne (`online_copies`). Vide s'il n'est pas connu.
+    pub fn relay_hex(&self) -> String {
+        self.world_at
+            .as_ref()
+            .map(|a| a.key)
+            .or(self.relay_at.as_ref().map(|r| r.1))
+            .or(self.relay_key)
+            .map_or_else(String::new, |k| crypto::hex(&k))
     }
 
     /// De quoi ouvrir une deuxième connexion du compte, de garant : relais joint,
@@ -2649,5 +2677,50 @@ mod rank_tests {
         assert!(rank_more(2 * page, 2 * page - 10, page));
         assert!(!rank_more(page + 37, page + 30, page), "fin du classement");
         assert!(!rank_more(0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    fn entry(name: &str, creator: &str, active: u64) -> ServerEntry {
+        ServerEntry {
+            id: 1,
+            host: creator.into(),
+            name: name.into(),
+            map: name.into(),
+            players: 0,
+            max_players: 0,
+            region: String::new(),
+            relay_node: [0; 32],
+            relay_key: [0; 32],
+            relay_addr: String::new(),
+            peak: 0,
+            active,
+            opened: 0,
+            asleep: false,
+            keeper: String::new(),
+            world: String::new(),
+            creator: creator.into(),
+        }
+    }
+
+    /// (v325) Ses propres mondes en tête de la liste, le plus récemment actif d'abord ; les
+    /// autres dans l'ordre du relais.
+    #[test]
+    fn own_worlds_come_first_most_recently_active_first() {
+        let mut l = vec![
+            entry("a", "Zoe", 50),
+            entry("vieux", "Ana", 10),
+            entry("b", "Bob", 90),
+            entry("neuf", "ana", 30),
+            entry("c", "Zed", 70),
+        ];
+        own_first(&mut l, "ANA");
+        let names: Vec<&str> = l.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["neuf", "vieux", "a", "b", "c"]);
+        own_first(&mut l, "");
+        assert_eq!(l[2].name, "a", "sans compte : rien ne bouge");
     }
 }

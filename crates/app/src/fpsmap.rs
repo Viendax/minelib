@@ -584,7 +584,7 @@ pub fn solo_copies(saves: &Path) -> Vec<[u8; 32]> {
 }
 
 /// Copie récursive d'un dossier (fichiers remplacés).
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for e in fs::read_dir(src)?.flatten() {
         let to = dst.join(e.file_name());

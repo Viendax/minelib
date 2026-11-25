@@ -2231,8 +2231,9 @@ fn leave_room(st: &mut State, id: u64) {
         let mut room = st.rooms.remove(&room_id).expect("partie");
         passeurs::room_gone(st, room_id);
         // (v311) Un monde de construction s'endort : son dernier propriétaire, dont le
-        // jeu l'enregistre en partant, en garde le dernier état.
-        if room.kind == 1 {
+        // jeu l'enregistre en partant, en garde le dernier état. (v325) Pas pour une
+        // province : son monde ne dort pas, il vit au relais de son pays.
+        if room.kind == 1 && room.province.is_none() {
             st.worlds.asleep(&room.server, &room.host_pseudo);
         }
         settle_absences(st, &mut room, &[]);
@@ -4502,6 +4503,17 @@ fn local_servers(st: &State, kind: u8, who: Option<&str>) -> Vec<proto::ServerEn
                 opened: w.map_or(0, |w| w.opened),
                 asleep: false,
                 keeper: String::new(),
+                world: if r.kind == 1 {
+                    r.server.clone()
+                } else {
+                    String::new()
+                },
+                // (Garant : jamais nommé aux joueurs, là non plus.)
+                creator: if r.garant_hosted {
+                    GARANT_NAME.to_string()
+                } else {
+                    r.creator.clone()
+                },
             }
         })
         .collect();
@@ -4514,15 +4526,26 @@ fn local_servers(st: &State, kind: u8, who: Option<&str>) -> Vec<proto::ServerEn
             .then(a.id.cmp(&b.id))
     });
     // (v311) En dessous, les mondes endormis (leur dernier joueur est parti), ceux qui
-    // ont eu le plus de joueurs d'abord. On n'y entre pas : `asleep`.
+    // ont eu le plus de joueurs d'abord. On n'y entre pas : `asleep`. (v325) Ceux de qui
+    // regarde (il les a créés, ou il en garde le dernier état) y sont tous, même au-delà
+    // de ceux qu'on montre.
+    let me = |p: &str| who.is_some_and(|w| p.eq_ignore_ascii_case(w));
     if kind == 1 {
-        for w in st.worlds.sleeping().into_iter().take(mondes::SLEEPING_SHOWN) {
+        let mut shown = 0;
+        for w in st.worlds.sleeping() {
+            let own = me(&w.creator) || me(&w.keeper);
+            if !own && shown >= mondes::SLEEPING_SHOWN {
+                continue;
+            }
             let hidden = match who {
                 Some(p) => st.servers.whitelisted_out(&w.key, &w.creator, p),
                 None => st.servers.whitelist_on(&w.key),
             };
             if hidden {
                 continue;
+            }
+            if !own {
+                shown += 1;
             }
             list.push(proto::ServerEntry {
                 id: 0,
@@ -4540,9 +4563,16 @@ fn local_servers(st: &State, kind: u8, who: Option<&str>) -> Vec<proto::ServerEn
                 opened: w.opened,
                 asleep: true,
                 keeper: w.keeper.clone(),
+                world: w.key.clone(),
+                creator: w.creator.clone(),
             });
         }
     }
+    // (v325) Ses propres mondes (ceux que qui regarde a créés), ouverts ou endormis, en
+    // tête : le plus récemment actif d'abord.
+    let (mut list, rest): (Vec<_>, Vec<_>) = list.into_iter().partition(|e| me(&e.creator));
+    list.sort_by(|a, b| b.active.cmp(&a.active).then(b.players.cmp(&a.players)));
+    list.extend(rest);
     list.truncate(200);
     list
 }
@@ -4950,6 +4980,7 @@ fn take_over_join(st: &mut State, id: u64, pseudo: &str, key: [u8; 32]) -> Respo
         return join_room(st, id, pseudo, rid);
     }
     let info = sb.info.clone();
+    // (v325) Le monde repris : sa clé (pas celle d'un monde neuf).
     let rid = open_room(
         st,
         id,
@@ -4959,6 +4990,7 @@ fn take_over_join(st: &mut State, id: u64, pseudo: &str, key: [u8; 32]) -> Respo
         info.map.clone(),
         info.map_sig,
         u16::try_from(info.max_players).unwrap_or(u16::MAX),
+        Some((info.creator.clone(), info.server.clone())),
     );
     let sb = st.standby.as_mut().expect("relais de secours");
     sb.resumed = Some(rid);
@@ -4984,6 +5016,7 @@ fn take_over_join(st: &mut State, id: u64, pseudo: &str, key: [u8; 32]) -> Respo
         host: pseudo.to_string(),
         map: info.map,
         map_sig: info.map_sig,
+        world: info.server,
     }
 }
 
@@ -6441,6 +6474,18 @@ fn try_apply_result(st: &mut State, room_id: u64) {
 
 /// Ouvre une partie hébergée par `id`.
 #[allow(clippy::too_many_arguments)]
+/// (v325) Clé du monde de construction de la partie `rid` (vide en FPS).
+fn world_of(st: &State, rid: u64) -> String {
+    st.rooms
+        .get(&rid)
+        .filter(|r| r.kind == 1)
+        .map(|r| r.server.clone())
+        .unwrap_or_default()
+}
+
+/// `ident` (v325) : créateur et clé d'un monde endormi qu'on réveille ; sans lui, un monde
+/// neuf (sa clé ne reprend jamais celle d'un autre monde, endormi ou ouvert).
+#[allow(clippy::too_many_arguments)]
 fn open_room(
     st: &mut State,
     id: u64,
@@ -6450,6 +6495,7 @@ fn open_room(
     map: String,
     map_sig: [u8; 32],
     max_players: u16,
+    ident: Option<(String, String)>,
 ) -> u64 {
     leave_room(st, id);
     let rid = st.next_id;
@@ -6457,16 +6503,24 @@ fn open_room(
     if kind == 0 {
         st.maps.mark_fps(map_sig);
     }
-    let name: String = name.chars().take(32).collect();
-    // (v311) Monde endormi que ce joueur réveille (il en est le créateur, ou il en garde
-    // le dernier état) : il garde son créateur, donc ses OP, ses bannis, sa liste blanche.
-    let woken = if kind == 1 {
-        st.worlds.wakes(pseudo, &map)
-    } else {
-        None
+    let mut name: String = name.chars().take(32).collect();
+    // (v311) Monde endormi que ce joueur réveille : il garde son créateur, donc ses OP, ses
+    // bannis, sa liste blanche. (v325) Sinon, un monde de construction neuf a sa propre clé :
+    // ouvrir de nouveau un monde solo déjà ouvert en ligne en fait un autre serveur (« 2 »,
+    // « 3 »…), sans toucher à celui d'avant.
+    let (creator, server) = match ident {
+        Some(x) => x,
+        None if kind == 1 => {
+            let base = servers::key(pseudo, &map);
+            let open: Vec<String> = st.rooms.values().map(|r| r.server.clone()).collect();
+            let (key, n) = st.worlds.fresh_key(&base, &open);
+            if n > 1 {
+                name = format!("{} {n}", name.chars().take(28).collect::<String>());
+            }
+            (pseudo.to_string(), key)
+        }
+        None => (pseudo.to_string(), servers::key(pseudo, &map)),
     };
-    let (creator, server) =
-        woken.unwrap_or_else(|| (pseudo.to_string(), servers::key(pseudo, &map)));
     // FPS : 10 joueurs ; construction : sans limite (0).
     let max_players = if kind == 0 {
         (max_players.clamp(2, proto::FPS_MAX_PLAYERS) & !1) as u32
@@ -6568,9 +6622,13 @@ fn open_room(
             room.build.set_page_dir(dir);
             room.name_player(id, pseudo);
         }
-        // (v311) Au registre des mondes : ouvert, ou réveillé.
-        let name = st.rooms.get(&rid).map(|r| r.name.clone()).unwrap_or_default();
-        st.worlds.opened(&server, &name, &map, &creator, pseudo);
+        // (v311) Au registre des mondes : ouvert, ou réveillé. (v325) Pas une province (que
+        // personne n'ouvre : son monde vit au relais de son pays, il n'est ni ouvert ni
+        // endormi ici).
+        if !pseudo.is_empty() {
+            let name = st.rooms.get(&rid).map(|r| r.name.clone()).unwrap_or_default();
+            st.worlds.opened(&server, &name, &map, &creator, pseudo);
+        }
     }
     log::info!("partie {rid} ouverte par « {pseudo} »");
     rid
@@ -6744,11 +6802,13 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
             transport::push(&tx, &Response::Standby { at: Some(at) });
         }
     }
+    let world = world_of(st, room);
     Response::Joined {
         room,
         host: host_pseudo,
         map,
         map_sig,
+        world,
     }
 }
 
@@ -7109,6 +7169,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             map,
             map_sig,
             max_players,
+            wake,
         } => {
             // (v311) Pas d'ouvertures en rafale (la liste des parties et des mondes ne se
             // remplit pas à la chaîne).
@@ -7118,8 +7179,29 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     format!("Trop de parties ouvertes coup sur coup : réessaie dans {wait} s."),
                 ));
             }
-            let rid = open_room(st, id, pseudo, kind, name, map, map_sig, max_players);
-            Response::Hosted { room: rid }
+            // (v325) Un monde endormi se réveille par sa clé (son entrée dans la liste), et
+            // seulement par son créateur ou celui qui en garde le dernier état. Sans clé,
+            // c'est un nouveau monde, même si ce monde solo a déjà été ouvert en ligne :
+            // chaque monde en ligne a sa propre copie, qui ne suit plus le monde solo.
+            let ident = if kind == 1 && !wake.is_empty() {
+                match st.worlds.wake(&wake, pseudo) {
+                    Some(creator) => Some((creator, wake)),
+                    None => {
+                        return Some(err(
+                            ErrorCode::Refused,
+                            "Ce monde ne dort plus (il a été rouvert, ou supprimé), ou ce n'est \
+                             pas à toi de le réveiller.",
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            let rid = open_room(st, id, pseudo, kind, name, map, map_sig, max_players, ident);
+            Response::Hosted {
+                room: rid,
+                world: world_of(st, rid),
+            }
         }
         Request::DeleteWorld { code } => {
             let room = st
@@ -7249,6 +7331,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         map.clone(),
                         map_sig,
                         players,
+                        None,
                     );
                     if let Some(r) = st.rooms.get_mut(&rid) {
                         r.garant_hosted = true;
@@ -7277,8 +7360,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         map.clone(),
                         map_sig,
                         players,
+                        None,
                     );
-                    Response::Hosted { room: rid }
+                    Response::Hosted {
+                        room: rid,
+                        world: String::new(),
+                    }
                 }
             };
             // Les autres joueurs du lobby suivent : leur place est gardée.
@@ -11586,16 +11673,17 @@ mod tests {
             }
             _ => unreachable!(),
         }
-        // Le monde fermé : l'invitation de Dave reste, sans partie ; rouvert, avec la nouvelle.
+        // Le monde fermé : l'invitation de Dave reste, sans partie ; réveillé, avec la
+        // nouvelle. (v325 : réveillé par sa clé ; rouvrir le monde solo ferait un autre
+        // serveur.)
         alice.send(Cmd::Leave);
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(friends(&dave).3, vec![invite(0, false)]);
-        alice.send(Cmd::Host {
-            kind: 1,
+        alice.send(Cmd::WakeWorld {
             name: "Château".into(),
             map: "monde".into(),
             map_sig: [6; 32],
-            max_players: 0,
+            world: "alice/monde".into(),
         });
         let room2 = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
             Event::Hosted(r) => r,
@@ -15280,9 +15368,10 @@ mod tests {
                 map: "monde".into(),
                 map_sig: [6; 32],
                 max_players: 0,
+                wake: String::new(),
             },
         ) {
-            Some(Response::Hosted { room }) => room,
+            Some(Response::Hosted { room, .. }) => room,
             r => panic!("{r:?}"),
         };
         (owner, room)
