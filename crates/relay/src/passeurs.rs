@@ -155,6 +155,14 @@ pub(crate) struct Fast {
     /// (v304) Connexions à qui on a dit s'il y a des passeurs, et ce qu'on a dit.
     told: std::collections::HashSet<u64>,
     said: bool,
+    /// (v307) Journaux réseau (`super::journaux`) : ce qu'on a dit aux connexions, lignes
+    /// reçues de chacune depuis une minute ; demandes refusées depuis le dernier relevé
+    /// (annonces de passeur, demandes de tunnel, lignes de journal), et connexions au
+    /// relevé d'avant.
+    pub(crate) logs_said: bool,
+    pub(crate) log_rate: HashMap<u64, (Instant, u16)>,
+    pub(crate) refused: [u32; 3],
+    pub(crate) conns_before: usize,
 }
 
 impl Fast {
@@ -244,6 +252,7 @@ pub(crate) fn offer(
         *t = (Instant::now(), 0);
     }
     if t.1 >= OFFERS_PER_MIN {
+        st.fast.refused[0] += 1;
         return;
     }
     t.1 += 1;
@@ -311,6 +320,7 @@ pub(crate) fn gone(st: &mut State, id: u64) {
     st.fast.tries.remove(&id);
     st.fast.asks.remove(&id);
     st.fast.told.remove(&id);
+    st.fast.log_rate.remove(&id);
     off(st, id);
     // (v301) Les relais qu'elle hébergeait ne sont plus là : leurs tunnels sont repris.
     st.fast.nodes.retain(|_, c| *c != id);
@@ -426,11 +436,28 @@ fn reassign(st: &mut State, id: u64) {
 
 /// (v304) Cette connexion vient d'entrer : on lui dit s'il y a des passeurs (une fois).
 pub(crate) fn greet(st: &mut State, id: u64) {
-    if st.fast.told.insert(id) && st.fast.said {
-        if let Some(c) = st.conns.get(&id) {
-            let n = st.fast.verified() as u32;
-            transport::push(&c.tx, &Response::PasseursKnown { n });
+    if st.fast.told.insert(id) {
+        if st.fast.said {
+            if let Some(c) = st.conns.get(&id) {
+                let n = st.fast.verified() as u32;
+                transport::push(&c.tx, &Response::PasseursKnown { n });
+            }
         }
+        super::journaux::tell(st, id);
+    }
+}
+
+/// (v307) À chaque battement : ceux qui sont entrés sans rien demander depuis sont
+/// accueillis aussi.
+pub(crate) fn greet_all(st: &mut State) {
+    let new: Vec<u64> = st
+        .conns
+        .iter()
+        .filter(|(id, c)| c.pseudo.is_some() && !st.fast.told.contains(id))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in new {
+        greet(st, id);
     }
 }
 
@@ -497,6 +524,7 @@ pub(crate) fn tunnel_want(st: &mut State, id: u64, node: [u8; 32]) {
         *a = (Instant::now(), 0);
     }
     if a.1 >= WANTS_PER_MIN {
+        st.fast.refused[1] += 1;
         return;
     }
     a.1 += 1;
@@ -1289,6 +1317,36 @@ mod tests {
         let t = st.fast.tunnels.values().next().unwrap();
         assert!(t.own);
         assert_eq!(st.fast.load(t.passeurs[0].0), 0);
+    }
+
+    /// (v307) Un joueur qui partage son journal réseau : ses lignes arrivent dans le
+    /// fichier du relais qui a demandé à les recevoir, sous un numéro, sans son pseudo ni
+    /// son adresse ; une ligne qui n'est pas une ligne réseau n'y arrive pas.
+    #[test]
+    fn shared_network_lines_reach_the_relay_file_without_names() {
+        let (h, login) = relay("journaux");
+        crate::journaux::set_receive_logs(true);
+        minelib_net::netlog::set_share(true);
+        let (_c, _) = login("JournalJoueur");
+        let file = h.state.lock().unwrap().cfg.dir.join(crate::journaux::FILE);
+        let t = Instant::now();
+        let text = loop {
+            // (D'autres essais tournent dans ce programme : leurs connexions peuvent
+            // prendre la ligne pour leur propre relais. On la redit jusqu'à la voir ici.)
+            minelib_net::netlog::offer("réseau (essai) : ligne partagée");
+            minelib_net::netlog::offer("compte : JournalJoueur depuis 127.0.0.1");
+            std::thread::sleep(Duration::from_millis(100));
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            if text.contains("ligne partagée") {
+                break text;
+            }
+            assert!(t.elapsed() < Duration::from_secs(30), "rien dans {file:?}");
+        };
+        minelib_net::netlog::set_share(false);
+        crate::journaux::set_receive_logs(false);
+        let line = text.lines().find(|l| l.contains("ligne partagée")).unwrap();
+        assert!(line.contains(" UTC [") && line.ends_with("] réseau (essai) : ligne partagée"));
+        assert!(!text.contains("JournalJoueur") && !text.contains("127.0.0.1"), "{text}");
     }
 
     /// (v304) Avec deux passeurs, le tunnel passe par les deux à la suite : le joueur

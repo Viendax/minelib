@@ -17,6 +17,7 @@ pub mod hw;
 pub mod items;
 pub mod lan;
 pub mod meteo;
+pub mod netlog;
 pub mod passkey;
 pub mod poses;
 pub mod proto;

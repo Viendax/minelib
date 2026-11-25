@@ -8769,6 +8769,23 @@ impl Session {
             return false;
         };
         match first.to_lowercase().as_str() {
+            // (v307) Signaler la carte de la partie FPS en cours.
+            "reportmap" | "signalercarte" => {
+                if self.net.is_none() {
+                    self.chat.say(
+                        "On ne signale une carte que pendant une partie FPS en ligne sur cette carte.",
+                        chat::RED,
+                    );
+                    return true;
+                }
+                self.relay_cmds.push(minelib_net::client::Cmd::MapReport);
+                self.chat.say(
+                    "Carte signalée (une fois par compte). Si un quart de ceux qui y ont joué \
+                     la signalent, elle ne compte plus pour le classement.",
+                    chat::GREY,
+                );
+                true
+            }
             "report" | "signaler" => {
                 let Some(target) = words.get(1) else {
                     self.chat.say(

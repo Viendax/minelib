@@ -12,6 +12,7 @@ mod contacts;
 mod guards;
 mod hardware;
 mod invites;
+mod journaux;
 mod limits;
 mod maps;
 mod passeurs;
@@ -42,6 +43,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::mpsc::Sender;
 
+pub use journaux::set_receive_logs;
 pub use registry::{Body, Registry};
 
 /// Réglages du relais.
@@ -1637,6 +1639,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
                         guards::upkeep(&mut st);
                         // (Passeurs de la voie rapide : sondes à refaire, passeurs muets.)
                         passeurs::upkeep(&mut st);
+                        passeurs::greet_all(&mut st);
+                        journaux::upkeep(&mut st);
                         health_report(&mut st);
                     }
                 });
@@ -6040,7 +6044,10 @@ fn try_apply_result(st: &mut State, room_id: u64) {
     let sig = room.map_sig;
     // Seules les parties à 5 contre 5 comptent pour le classement.
     let ranked = room.max_players == proto::FPS_PLAYERS as u32;
-    // Classement : seulement sur les 10 cartes les plus jouées.
+    // Classement : seulement sur les 10 cartes les plus jouées. (v307) Et seulement une
+    // carte jouée par assez de comptes différents et peu signalée (`maps::Store::rankable`).
+    let names: Vec<String> = summary.players.iter().map(|p| p.pseudo.clone()).collect();
+    st.maps.seen(&sig, &names);
     let ranked_map = st.maps.among_top(&room.map_sig, 10);
     let room = st.rooms.get_mut(&room_id).expect("partie");
     let roster = room.roster.clone();
@@ -6083,7 +6090,7 @@ fn try_apply_result(st: &mut State, room_id: u64) {
             log::warn!("« {} » : statistiques invraisemblables ({why})", p.pseudo);
         }
     }
-    st.maps.played(&sig);
+    st.maps.played(&sig, &names);
     log::info!(
         "partie {room_id} terminée {}-{} : classement mis à jour",
         summary.score[0],
@@ -8823,7 +8830,7 @@ fn health_report(st: &mut State) {
         _ => (f, b + 1),
     });
     let (offers, verified, carried) = st.fast.counts();
-    log::info!(
+    let line = format!(
         "relais (santé, {:.0} s) : {} connexions, {fps} parties FPS, {build} mondes ; {} demandes, \
          attente la plus longue {:.0} ms, traitement le plus long {:.0} ms ; {} positions \
          écartées ; {} connexions de compte (refusées {}, relais occupé {}) ; passeurs : \
@@ -8839,6 +8846,18 @@ fn health_report(st: &mut State) {
         h.logins_busy,
         st.fast.tunnels(),
     );
+    log::info!("{line}");
+    journaux::own(st, &line);
+    // (v307) Ce qui ressemble à une tentative de faire tomber le relais.
+    let refused = std::mem::take(&mut st.fast.refused);
+    let conns = (st.fast.conns_before, st.conns.len());
+    st.fast.conns_before = conns.1;
+    let alerts = journaux::alerts(h.logins_bad, h.logins_busy, h.pos_dropped, refused, conns);
+    if !alerts.is_empty() {
+        let line = format!("relais (alerte) : {}", alerts.join(" ; "));
+        log::warn!("{line}");
+        journaux::own(st, &line);
+    }
 }
 
 /// Traite une demande ; `prepared` : ce que `prepare` a calculé d'avance pour elle.
@@ -8970,9 +8989,29 @@ fn handle_locked(
             | Request::FastBad { .. }
             | Request::TunnelWant { .. }
             | Request::TunnelBad { .. }
+            | Request::NetLog { .. }
+            | Request::MapReport
     ) {
         if matches!(&*session, Session::LoggedIn { .. }) {
             match req {
+                // (v307) Signalement de la carte de la partie FPS en cours, par un compte
+                // à qui on peut se fier : elle ne compte plus pour le classement si un
+                // quart de ceux qui y ont joué la signalent (`maps::Store::rankable`).
+                Request::MapReport => {
+                    let me = st.conns.get(&id);
+                    let pseudo = me.and_then(|c| c.pseudo.clone());
+                    let sig = me
+                        .and_then(|c| c.room)
+                        .and_then(|r| st.rooms.get(&r))
+                        .filter(|r| r.kind == 0)
+                        .map(|r| r.map_sig);
+                    if let (Some(pseudo), Some(sig)) = (pseudo, sig) {
+                        if trusted(st, &pseudo) && st.maps.report(&sig, &pseudo) {
+                            log::info!("carte signalée par un joueur de la partie");
+                        }
+                    }
+                }
+                Request::NetLog { lines } => journaux::got(st, id, lines),
                 Request::TunnelWant { node } => passeurs::tunnel_want(st, id, node),
                 Request::TunnelBad { route } => passeurs::tunnel_bad(st, id, route),
                 Request::PasseurOffer { port, external } => {
@@ -13357,6 +13396,9 @@ mod tests {
             name: "essai".into(),
         })
         .unwrap();
+        // (v307) La carte de l'essai compte pour le classement (comme une carte déjà très
+        // jouée) : une carte neuve ne compte qu'après assez de joueurs différents.
+        h.state.lock().unwrap().maps.grandfather([9; 32]);
         let addr = h.addr.to_string();
         let login = |pseudo: &str| {
             let c = Client::spawn(addr.clone(), Some(h.public));

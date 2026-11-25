@@ -549,6 +549,9 @@ struct PasseurInner {
     probes: Mutex<Sender<u64>>,
     stop: AtomicBool,
     carried: AtomicU64,
+    /// (v307) Paquets refusés : route inconnue, sceau faux, trop pour une route, ou venus
+    /// d'ailleurs que du bout connu. Beaucoup d'un coup : quelqu'un arrose ce port.
+    refused: AtomicU64,
     /// Essais : un paquet sur tant est perdu (0 : aucun), et chaque paquet attend tant de
     /// millisecondes avant de repartir.
     lose: AtomicU64,
@@ -593,6 +596,7 @@ impl Passeur {
             probes: Mutex::new(probes),
             stop: AtomicBool::new(false),
             carried: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
             lose: AtomicU64::new(0),
             delay: AtomicU64::new(0),
         });
@@ -682,6 +686,11 @@ impl Passeur {
         self.inner.carried.load(Ordering::Relaxed)
     }
 
+    /// (v307) Paquets refusés depuis le début (voir `PasseurInner::refused`).
+    pub fn refused(&self) -> u64 {
+        self.inner.refused.load(Ordering::Relaxed)
+    }
+
     /// Essais : perd un paquet sur `n` (0 : aucun).
     #[doc(hidden)]
     pub fn lose_one_in(&self, n: u64) {
@@ -716,14 +725,17 @@ impl PasseurInner {
             let _ = self.probes.lock().unwrap().send(nonce);
             return;
         }
-        let Some(x) = parse(p) else { return };
+        let refuse = || {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+        };
+        let Some(x) = parse(p) else { return refuse() };
         let to = {
             let mut hops = self.hops.lock().unwrap();
             let Some(h) = hops.get_mut(&x.route) else {
-                return;
+                return refuse();
             };
             if !same(&hop_seal(&h.seal, x.head), x.seal) {
-                return;
+                return refuse();
             }
             if h.since.elapsed() >= Duration::from_secs(1) {
                 h.since = Instant::now();
@@ -733,14 +745,14 @@ impl PasseurInner {
             h.count += 1;
             h.bytes += p.len() as u32;
             if h.count > RATE_MAX || h.bytes > BYTES_MAX {
-                return;
+                return refuse();
             }
             let d = x.dir as usize;
             if h.fixed[d] {
                 // (L'autre passeur de la chaîne : reconnu à son adresse, pas au port d'où
                 // sa box fait sortir ses paquets.)
                 if h.ends[d].map(|a| a.ip()) != Some(from.ip()) {
-                    return;
+                    return refuse();
                 }
             } else {
                 if x.seq >= h.top[d] {
@@ -748,7 +760,7 @@ impl PasseurInner {
                     h.ends[d] = Some(from);
                 }
                 if h.ends[d] != Some(from) {
-                    return;
+                    return refuse();
                 }
             }
             h.ends[1 - d]

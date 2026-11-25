@@ -168,6 +168,8 @@ enum Screen {
     Controls,
     /// Paramètres → Son : sortie et micro, volumes.
     Sound,
+    /// (v307) Paramètres → Paramètres avancés : journal réseau (partage, réception).
+    Advanced,
     /// Conversion d'un monde Minecraft en cours (une image affichée avant de bloquer).
     Loading,
     Playing,
@@ -435,6 +437,10 @@ impl Game {
         let options = Options::load(&paths.options);
         minelib_p2p::set_hosts_direct(options.host_direct);
         account::set_invitation(&options.invitation);
+        // (v307) Journal réseau : partagé si le joueur l'a accepté ; reçu si ce PC, quand
+        // il est le relais, l'a demandé (paramètres avancés).
+        minelib_net::netlog::set_share(options.share_netlog == Some(true));
+        minelib_relay::set_receive_logs(options.receive_netlogs);
         jobs::set_uniform_sharing(options.cpu_uniform);
         crate::audio::set_output(&options.audio_out);
         crate::voice::set_input(&options.audio_in);
@@ -1082,6 +1088,33 @@ impl Game {
         if let Some(t) = &self.updater.status {
             c.ui.text(4.0 * s, c.h - 50.0 * s, ds, update::ORANGE, t.clone());
         }
+        // (v307) Une seule fois, en bas à gauche : partager son journal réseau ? La
+        // réponse se change ensuite dans Paramètres → Paramètres avancés.
+        let mut share_answer = None;
+        if self.options.share_netlog.is_none() {
+            let y0 = c.h - 110.0 * s;
+            c.ui.text(4.0 * s, y0, s, WHITE, "Aider à corriger le réseau du jeu ?");
+            c.ui.text(
+                4.0 * s,
+                y0 + 11.0 * s,
+                ds,
+                GREY,
+                "Partager des lignes sur l'état de ton réseau avec le relais :",
+            );
+            c.ui.text(
+                4.0 * s,
+                y0 + 11.0 * s + 7.0 * ds,
+                ds,
+                GREY,
+                "ni pseudo, ni adresse. Se change dans Paramètres avancés.",
+            );
+            if c.button("Oui", 4.0 * s + 33.0 * s, y0 + 26.0 * s, 66.0, true) {
+                share_answer = Some(true);
+            }
+            if c.button("Non", 4.0 * s + 105.0 * s, y0 + 26.0 * s, 66.0, true) {
+                share_answer = Some(false);
+            }
+        }
         let credit = "Textures : VoxelArt Libre (CC BY 4.0 / CC0) - voir CREDITS.txt";
         let tw = Ui::text_width(credit, ds);
         c.ui.text(
@@ -1091,6 +1124,13 @@ impl Game {
             GREY,
             credit,
         );
+        if let Some(yes) = share_answer {
+            self.options.share_netlog = Some(yes);
+            minelib_net::netlog::set_share(yes);
+            if let Err(e) = self.options.save(&self.paths.options) {
+                log::error!("options : {e:#}");
+            }
+        }
         if solo {
             self.refresh_worlds();
             self.screen = Screen::Solo;
@@ -3134,6 +3174,9 @@ impl Game {
         y += 24.0 * s;
         // Son : sortie, micro et volumes.
         let sound = c.button("Son", cx, y, 200.0, true);
+        y += 24.0 * s;
+        // (v307) Journal réseau : partage et réception.
+        let advanced = c.button("Paramètres avancés", cx, y, 200.0, true);
         y += 30.0 * s;
         let done = c.button("Terminé", cx, (c.h * 0.72).max(y), 200.0, true);
         // Skin : aperçu en 3D qui tourne, à droite, et le bouton pour en changer.
@@ -3188,6 +3231,9 @@ impl Game {
         if graphics {
             self.screen = Screen::Graphics;
         }
+        if advanced {
+            self.screen = Screen::Advanced;
+        }
         if sound {
             // (v215) Le dernier relevé tout de suite (le refaire prend jusqu'à une seconde
             // sous Windows : l'écran s'ouvrait après), et un neuf en arrière-plan.
@@ -3217,6 +3263,72 @@ impl Game {
                 log::error!("options : {e:#}");
             }
             self.screen = self.settings_return;
+        }
+    }
+
+    /// (v307) Paramètres → Paramètres avancés. Deux réglages du journal réseau : le
+    /// partager avec le relais (la question posée une fois au menu d'accueil), et, quand ce
+    /// PC est le relais, recevoir ceux des joueurs qui les partagent.
+    fn advanced_screen(&mut self, input: &Input, size: (u32, u32), over_game: bool) {
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        if over_game {
+            c.dim(0.7);
+        } else {
+            c.background();
+        }
+        let s = c.s;
+        let ds = (s / 2.0).floor().max(1.0);
+        c.text_center("Paramètres avancés", c.h * 0.18, s * 2.0, WHITE);
+        let cx = c.w / 2.0;
+        let mut y = c.h * 0.34;
+        let share = self.options.share_netlog == Some(true);
+        let label = if share {
+            "Partager mon journal réseau : oui"
+        } else {
+            "Partager mon journal réseau : non"
+        };
+        let flip_share = c.button(label, cx, y, 300.0, true);
+        y += 23.0 * s;
+        for line in [
+            "Des lignes sur l'état de ton réseau (débits, retards, tunnels), sans pseudo ni adresse,",
+            "envoyées au relais auquel tu es connecté, si son hôte a demandé à les recevoir.",
+        ] {
+            c.text_center(line, y, ds, GREY);
+            y += 7.0 * ds;
+        }
+        y += 12.0 * s;
+        let recv = self.options.receive_netlogs;
+        let label = if recv {
+            "Recevoir les journaux réseau des joueurs : oui"
+        } else {
+            "Recevoir les journaux réseau des joueurs : non"
+        };
+        let flip_recv = c.button(label, cx, y, 300.0, true);
+        y += 23.0 * s;
+        for line in [
+            "Quand ce PC est le relais : les journaux des joueurs qui les partagent, le relevé du relais",
+            "et ses alertes (tentatives de le faire tomber) sont rangés dans journaux_reseau.txt.",
+        ] {
+            c.text_center(line, y, ds, GREY);
+            y += 7.0 * ds;
+        }
+        y += 14.0 * s;
+        let done = c.button("Terminé", cx, (c.h * 0.72).max(y), 200.0, true);
+        if flip_share {
+            self.options.share_netlog = Some(!share);
+            minelib_net::netlog::set_share(!share);
+        }
+        if flip_recv {
+            self.options.receive_netlogs = !recv;
+            minelib_relay::set_receive_logs(!recv);
+        }
+        if flip_share || flip_recv || done || input.pressed(KeyCode::Escape) {
+            if let Err(e) = self.options.save(&self.paths.options) {
+                log::error!("options : {e:#}");
+            }
+        }
+        if done || input.pressed(KeyCode::Escape) {
+            self.screen = Screen::Settings;
         }
     }
 
@@ -4463,6 +4575,7 @@ impl GameLoop for Game {
                     | Screen::Lights
                     | Screen::Controls
                     | Screen::Sound
+                    | Screen::Advanced
             );
         if in_world {
             let active = self.screen == Screen::Playing;
@@ -4503,6 +4616,7 @@ impl GameLoop for Game {
                 Screen::Lights => self.lights_screen(input, size, true),
                 Screen::Controls => self.controls_screen(input, size, true),
                 Screen::Sound => self.sound_screen(input, size, true),
+                Screen::Advanced => self.advanced_screen(input, size, true),
                 _ => {}
             }
             // Monde ouvert dans les toutes premières secondes du jeu : les shaders lourds
@@ -4545,6 +4659,7 @@ impl GameLoop for Game {
                 Screen::Lights => self.lights_screen(input, size, false),
                 Screen::Controls => self.controls_screen(input, size, false),
                 Screen::Sound => self.sound_screen(input, size, false),
+                Screen::Advanced => self.advanced_screen(input, size, false),
                 Screen::Loading => self.loading_screen(input, size),
                 Screen::Multiplayer => self.multiplayer_screen(input, size),
                 Screen::Servers(kind) => self.servers_screen(input, size, kind),
@@ -4716,6 +4831,17 @@ struct Tee(Option<std::fs::File>, Option<std::fs::File>);
 impl std::io::Write for Tee {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _ = std::io::stderr().write_all(buf);
+        // (v307) Les lignes réseau du journal (sans pseudo ni adresse) sont aussi gardées
+        // pour le relais, si le joueur a accepté de les partager (`netlog`).
+        if minelib_net::netlog::sharing() {
+            if let Ok(text) = std::str::from_utf8(buf) {
+                for line in text.lines() {
+                    // (Après l'en-tête « [date NIVEAU module] ».)
+                    let msg = line.split_once("] ").map_or(line, |(_, m)| m);
+                    minelib_net::netlog::offer(msg);
+                }
+            }
+        }
         for f in [&mut self.0, &mut self.1].into_iter().flatten() {
             let _ = f.write_all(buf);
         }

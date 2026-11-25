@@ -932,6 +932,16 @@ pub enum Request {
     TunnelBad {
         route: u64,
     },
+    /// (v307) Lignes du journal réseau d'un joueur qui a accepté de les partager (voir
+    /// `crate::netlog`), au relais qui a dit les recevoir (`Response::NetLogWanted`).
+    /// Ni pseudo, ni adresse, ni nœud dans ces lignes.
+    NetLog {
+        lines: Vec<String>,
+    },
+    /// (v307) Pendant une partie FPS : ce joueur signale la carte (elle n'a rien d'une
+    /// carte FPS, ou elle est faite pour gonfler un classement). Une fois par compte et
+    /// par carte ; voir `maps::Store::rankable` côté relais.
+    MapReport,
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -1042,6 +1052,8 @@ impl Request {
                 | Request::NearbyClose { .. }
                 | Request::TunnelWant { .. }
                 | Request::TunnelBad { .. }
+                | Request::NetLog { .. }
+                | Request::MapReport
                 | Request::BulkEdit { .. }
                 | Request::Served { .. }
                 | Request::CheatFound { .. }
@@ -1858,6 +1870,11 @@ pub enum Response {
         addr: [u8; 4],
         port: u16,
     },
+    /// (v307) L'hôte de ce relais reçoit (ou ne reçoit plus) les journaux réseau des
+    /// joueurs qui ont accepté de les partager (`Request::NetLog`).
+    NetLogWanted {
+        on: bool,
+    },
 }
 
 /// Passeur d'une route de la voie rapide : où lui écrire (IPv4, port UDP) et la clé du
@@ -1947,6 +1964,10 @@ impl Response {
             self,
             Response::PeerJoined { .. }
                 | Response::PasseurTask { .. }
+                | Response::TunnelWay { .. }
+                | Response::PasseursKnown { .. }
+                | Response::PasseurLink { .. }
+                | Response::NetLogWanted { .. }
                 | Response::FastGuest { .. }
                 | Response::FastHost { .. }
                 | Response::PartyInvite { .. }
@@ -2461,5 +2482,43 @@ mod lookalike_tests {
         assert_eq!(suggested_player("Joueur « 1side » inconnu."), None);
         let m = unknown_player("lnes", Some("Ines"));
         assert!(m.ends_with("« Ines » (un I majuscule, pas un L minuscule) ?"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+
+    /// (v307) Ce que le relais envoie de lui-même pour les tunnels, les passeurs et les
+    /// journaux n'est jamais pris pour la réponse à une demande en cours. (Les v301 et
+    /// v304 l'avaient oublié : un jeu qui attendait une réponse recevait « réponse
+    /// inattendue ».)
+    #[test]
+    fn what_the_relay_sends_on_its_own_is_never_taken_for_a_reply() {
+        for r in [
+            Response::TunnelWay {
+                node: [1; 32],
+                route: 2,
+                host: false,
+                own: false,
+                passeurs: Vec::new(),
+            },
+            Response::PasseursKnown { n: 1 },
+            Response::PasseurLink {
+                lot: 1,
+                route: 1,
+                seal: [0; 32],
+                dir: 0,
+                addr: [1, 2, 3, 4],
+                port: 5,
+            },
+            Response::NetLogWanted { on: true },
+            Response::PasseurTask {
+                lot: 1,
+                routes: Vec::new(),
+            },
+        ] {
+            assert!(r.is_push(), "{r:?}");
+        }
     }
 }

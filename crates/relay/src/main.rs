@@ -15,6 +15,11 @@ fn main() -> Result<()> {
          quinn=warn,quinn_proto=warn,tracing=warn,portmapper=warn,netwatch=warn,pkarr=warn",
     ))
     .init();
+    // (v307) `--journaux` : recevoir les journaux réseau des joueurs qui les partagent, le
+    // relevé de santé et les alertes du relais, dans `journaux_reseau.txt`.
+    if std::env::args().any(|a| a == "--journaux") {
+        minelib_relay::set_receive_logs(true);
+    }
     let mut cfg = minelib_relay::Config {
         dir: "relay_data".into(),
         bind: format!("0.0.0.0:{}", minelib_net::DEFAULT_PORT),

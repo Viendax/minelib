@@ -141,6 +141,8 @@ pub enum Cmd {
         players: u8,
     },
     Report(String),
+    /// (v307) Signale la carte de la partie FPS en cours.
+    MapReport,
     Unreport(String),
     GarantAvailable(bool),
     /// Hôte d'une partie FPS : demande des passeurs pour ses joueurs (groupés par équipe).
@@ -781,6 +783,10 @@ struct Worker {
     passeur: Option<Passeur>,
     /// (v304) Le relais connecté a des passeurs vérifiés (`Response::PasseursKnown`).
     relay_passeurs: bool,
+    /// (v307) Le relais connecté reçoit les journaux réseau (`Response::NetLogWanted`),
+    /// et dernier envoi.
+    relay_logs: bool,
+    logs_at: Instant,
     /// (v301) Dernière demande de tunnel (`crate::fast::tunnel_want`) déjà envoyée.
     tunnel_seen: u64,
 }
@@ -798,6 +804,8 @@ struct Passeur {
     /// Dernière sonde du relais reçue (ou dernière annonce) : sans sonde depuis
     /// `PASSEUR_SILENCE`, le relais ne nous joint plus, on se réannonce.
     heard: Instant,
+    /// (v307) Dernier relevé au journal, et ce qu'il avait porté et refusé jusque-là.
+    logged: (Instant, u64, u64),
 }
 
 /// Le relais sonde ses passeurs toutes les 30 s : après ce temps sans aucune sonde, il ne
@@ -832,6 +840,11 @@ impl Worker {
             fast: None,
             passeur: None,
             relay_passeurs: false,
+            relay_logs: false,
+            // (Le premier envoi n'attend pas.)
+            logs_at: Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now),
             // (Les demandes d'avant cette connexion ne la regardent pas.)
             tunnel_seen: crate::fast::tunnel_wants(u64::MAX, "").1,
         }
@@ -915,6 +928,7 @@ impl Worker {
                 mapped: Some(mapped),
                 external: None,
                 heard: Instant::now(),
+                logged: (Instant::now(), 0, 0),
             });
         }
         let Some(ps) = self.passeur.as_mut() else {
@@ -942,6 +956,19 @@ impl Worker {
     fn tend_tunnels(&mut self) {
         if self.chan.is_none() {
             self.relay_passeurs = false;
+            self.relay_logs = false;
+        }
+        // (v307) Journal réseau partagé : quelques lignes toutes les 10 s, au relais qui
+        // les demande.
+        if self.relay_logs
+            && !self.pseudo.is_empty()
+            && self.logs_at.elapsed() >= Duration::from_secs(10)
+        {
+            self.logs_at = Instant::now();
+            let lines = crate::netlog::take(20);
+            if !lines.is_empty() {
+                let _ = self.oneway(&Request::NetLog { lines });
+            }
         }
         if self.relay_passeurs {
             crate::fast::note_passeurs();
@@ -967,6 +994,20 @@ impl Worker {
         let Some(ps) = self.passeur.as_mut() else {
             return;
         };
+        // (v307) Une ligne par minute quand il a servi, ou quand on lui a envoyé des
+        // paquets qu'il a refusés (route inconnue, sceau faux, débit dépassé) : un port
+        // arrosé se voit là.
+        if ps.logged.0.elapsed() >= Duration::from_secs(60) {
+            let (carried, refused) = (ps.p.carried(), ps.p.refused());
+            let (dc, dr) = (carried - ps.logged.1, refused - ps.logged.2);
+            ps.logged = (Instant::now(), carried, refused);
+            if dc > 0 || dr > 0 {
+                log::info!(
+                    "passeur (60 s) : {dc} paquets portés, {dr} refusés, {} routes",
+                    ps.p.routes()
+                );
+            }
+        }
         let mut offers = Vec::new();
         if let Some(rx) = &ps.mapped {
             match rx.try_recv() {
@@ -1171,6 +1212,10 @@ impl Worker {
                     },
                     own,
                 );
+                return;
+            }
+            Response::NetLogWanted { on } => {
+                self.relay_logs = on;
                 return;
             }
             Response::PasseursKnown { n } => {
@@ -1938,6 +1983,7 @@ impl Worker {
                     r => self.unexpected(r),
                 }
             }
+            Cmd::MapReport => self.oneway(&Request::MapReport),
             Cmd::Report(pseudo) => match self.request(&Request::Report {
                 pseudo: pseudo.clone(),
             })? {
