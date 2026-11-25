@@ -395,6 +395,9 @@ pub struct BuildNet {
     /// `ThorDenied`), pour la partie (`Session::update_thor`).
     thor_inbox: Vec<BuildMsg>,
     light_queue: Vec<(BuildMsg, f32)>,
+    /// (v323) Couleurs de piles de tapis posées, à envoyer après leur bloc (`send_carpet`), et
+    /// depuis combien de temps elles attendent leur arbitre.
+    carpet_queue: Vec<(BuildMsg, f32)>,
     /// (v227) Foules d'essai menées par d'autres joueurs (OP) : paquets reçus, par pseudo de
     /// celui qui la mène (voir `crowd::RemoteCrowd`).
     crowd_inbox: Vec<(String, Vec<u8>)>,
@@ -677,7 +680,9 @@ pub fn moved_msg(m: &BuildMsg, origin: [i32; 3], to_abs: bool) -> BuildMsg {
         BuildMsg::Item { at, .. } => *at = moved(*at, origin, to_abs),
         BuildMsg::ChestPut { pos, .. }
         | BuildMsg::ChestTake { pos, .. }
-        | BuildMsg::Slot { pos, .. } => *pos = moved_block(*pos, origin, to_abs),
+        | BuildMsg::Slot { pos, .. }
+        | BuildMsg::CarpetPut { pos, .. }
+        | BuildMsg::Carpet { pos, .. } => *pos = moved_block(*pos, origin, to_abs),
         BuildMsg::LightPut { chunk, light: t, .. } | BuildMsg::Light { chunk, light: t, .. } => {
             light(t);
             *chunk = moved_chunk(*chunk, origin, to_abs);
@@ -785,6 +790,7 @@ impl BuildNet {
             thor_asked: HashMap::new(),
             thor_inbox: Vec::new(),
             light_queue: Vec::new(),
+            carpet_queue: Vec::new(),
             crowd_inbox: Vec::new(),
             crowd_hits: Vec::new(),
             evide_inbox: Vec::new(),
@@ -1891,6 +1897,53 @@ impl BuildNet {
         }
     }
 
+    /// (v323) Les couleurs des couches de la pile de tapis que le joueur vient de poser en `pos`
+    /// (place de la partie ; de bas en haut, une sorte par couche) : elles partent à l'arbitre
+    /// de son chunk (le relais du monde, ou celui de sa province) après la modification de son
+    /// bloc, qui ne dit que la hauteur et la sorte du dessus ; il les publie aux autres joueurs
+    /// et les garde pour ceux qui arrivent. Avant, les autres voyaient toute la pile de la
+    /// couleur de son dessus.
+    pub fn send_carpet(&mut self, pos: [i32; 3], layers: Vec<u8>) {
+        if !game::carpet_sane(&layers) {
+            return;
+        }
+        let req = moved_msg(&BuildMsg::CarpetPut { pos, layers }, self.origin, true);
+        // (La même case une deuxième fois avant l'envoi : seulement les dernières.)
+        self.carpet_queue.retain(|(m, _)| {
+            !matches!((m, &req), (BuildMsg::CarpetPut { pos: a, .. }, BuildMsg::CarpetPut { pos: b, .. }) if a == b)
+        });
+        self.carpet_queue.push((req, 0.0));
+    }
+
+    /// (v323) Couleurs de piles de tapis à envoyer : à l'arbitre de leur chunk s'il est prêt ;
+    /// sinon elles attendent (`LIGHT_WAIT` s au plus, puis restent seulement chez nous).
+    fn flush_carpets(&mut self, dt: f32) {
+        if self.carpet_queue.is_empty() {
+            return;
+        }
+        let queue = std::mem::take(&mut self.carpet_queue);
+        for (req, age) in queue {
+            let Some(chunk) = minelib_net::items::chunk_of_msg(&req) else {
+                continue;
+            };
+            let ask = Request::ToZone {
+                chunk,
+                data: game::encode(&req),
+            };
+            match self.authority(chunk) {
+                Authority::Root => self.send(ask),
+                Authority::Province(l) => {
+                    transport::push(&l, &ask);
+                }
+                Authority::Waiting => {
+                    if age + dt < LIGHT_WAIT {
+                        self.carpet_queue.push((req, age + dt));
+                    }
+                }
+            }
+        }
+    }
+
     /// (v224) Demandes de lumières qui attendent leur arbitre : envoyées dès qu'il est prêt,
     /// dans l'ordre ; refusées ici après `LIGHT_WAIT` s.
     fn flush_lights(&mut self, dt: f32) {
@@ -2108,6 +2161,10 @@ impl BuildNet {
             p.age = 0.0;
             p.signed = signed.then_some((id.0, fluid));
             p.last = (id.0, fluid);
+        }
+        // (v323) Les couleurs des piles de tapis posées : après leur bloc.
+        if !self.paused {
+            self.flush_carpets(dt);
         }
         // Sans réponse du relais : la modification n'a pas eu lieu (en pause, on attend ;
         // de même dans une province dont le relais n'est pas prêt).
@@ -2538,10 +2595,22 @@ impl BuildNet {
         };
         match msg {
             // Les demandes ne vont qu'aux relais.
-            BuildMsg::Edit { .. } | BuildMsg::Signed(_) => Vec::new(),
+            BuildMsg::Edit { .. } | BuildMsg::Signed(_) | BuildMsg::CarpetPut { .. } => Vec::new(),
             BuildMsg::Set {
                 pos, block, seq, ..
             } => self.block_set(pos, block, seq, world),
+            // (v323) Couleurs des couches d'une pile de tapis, publiées par l'arbitre de son
+            // chunk (le relais du monde, ou celui d'une province ; jamais un joueur) : gardées
+            // pour sa case, prises si elles vont avec son bloc (`World::carpet_layers`, quel que
+            // soit l'ordre où arrivent le bloc et elles) ; son chunk est à remailler.
+            BuildMsg::Carpet { pos, layers } => {
+                if peer != 0 || !game::carpet_sane(&layers) {
+                    return Vec::new();
+                }
+                let l = world.local_block(pos);
+                world.set_carpet_layers(l, &layers);
+                vec![ChunkPos::containing(l[0], l[2])]
+            }
             // Blocs regroupés : comme autant de modifications.
             BuildMsg::Cells(packet) => {
                 let mut dirty = Vec::new();
@@ -4757,6 +4826,10 @@ mod tests {
         let mut items: Vec<Vec<BuildMsg>> = vec![Vec::new(); 3];
         let drop_at = place(13.0, zb + 21.0);
         let bolt_at = place(-10.0, zb + 9.0);
+        // (v323) Une pile de trois tapis (rouge, bleu, jaune), juste de l'autre côté de la
+        // limite, au-dessus des blocs changés au hasard.
+        let carpet_at = [proto::wrap_block(half as i64 + 3), 16, Z * 16 + 5];
+        let carpet_layers = vec![14u8, 11, 4];
         for step in 0..500 {
             let building = step < 250;
             for (i, b) in bots.iter_mut().enumerate() {
@@ -4815,9 +4888,32 @@ mod tests {
                 };
                 b.net.as_mut().unwrap().send_thor(&req);
             }
+            // (v323) Celui dont l'origine est sur la limite pose sa pile de tapis : le bloc
+            // (hauteur, sorte du dessus), puis les couleurs de ses couches.
+            if step == 260 {
+                let b = &mut bots[2];
+                let l = b.world.local_block(carpet_at);
+                let stack = minelib_world::registry::Layers::Carpet { n: 3, kind: 4 }
+                    .block()
+                    .expect("pile de trois tapis jaunes");
+                b.world.set(l[0], l[1], l[2], stack);
+                b.world.set_carpet_layers(l, &carpet_layers);
+                b.net.as_mut().unwrap().send_carpet(l, carpet_layers.clone());
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(edited.len() > 30, "assez de modifications : {}", edited.len());
+        // (v323) La pile de tapis : chez tous, de ses trois couleurs (avant, de celle du
+        // dessus).
+        for b in &bots {
+            let l = b.world.local_block(carpet_at);
+            assert_eq!(
+                b.world.carpet_layers(l),
+                Some(carpet_layers.clone()),
+                "{} : couleurs de la pile de tapis",
+                b.name
+            );
+        }
         for b in &bots {
             assert_eq!(b.net.as_ref().unwrap().pending(), 0, "{} : en attente", b.name);
         }

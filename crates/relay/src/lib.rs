@@ -3372,6 +3372,44 @@ pub(crate) fn light_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: 
     publish_items(st, rid, id, vec![out]);
 }
 
+/// (v323) Couleurs des couches d'une pile de tapis que le joueur vient de poser
+/// (`BuildMsg::CarpetPut`), à l'arbitre de son chunk (le relais du monde, ou le relais de sa
+/// province) : vérifiées comme une modification de bloc (bien formée, à portée de vue de son
+/// auteur, dans son budget de modifications) et sensées (`game::carpet_sane`), elles sont
+/// publiées comme l'état d'un objet (gardées dans l'historique de la zone, les dernières de
+/// chaque case ; remises aux joueurs proches et à qui arrive). Sinon, rien : chez les autres,
+/// la pile garde la couleur de son dessus. Le relais ne connaît pas les blocs : le jeu ne les
+/// prend que si elles vont avec celui de la case (`World::carpet_layers`).
+pub(crate) fn carpet_request(st: &mut State, rid: u64, id: u64, chunk: [i32; 2], m: &game::BuildMsg) {
+    let game::BuildMsg::CarpetPut { pos, layers } = m else {
+        return;
+    };
+    let well_formed =
+        [pos[0].div_euclid(16), pos[2].div_euclid(16)] == chunk && (0..256).contains(&pos[1]);
+    let near = st
+        .rooms
+        .get(&rid)
+        .and_then(|r| r.build.positions.get(&id))
+        .is_some_and(|h| proto::chunks_within(*h, chunk, zones::NEAR));
+    let calm = st
+        .conns
+        .get_mut(&id)
+        .is_some_and(|c| within_rate(&mut c.edit_rate, EDIT_RATE));
+    if !(well_formed && near && calm && game::carpet_sane(layers)) {
+        log::debug!("couleurs de tapis refusées en {pos:?}");
+        return;
+    }
+    publish_items(
+        st,
+        rid,
+        id,
+        vec![game::BuildMsg::Carpet {
+            pos: *pos,
+            layers: layers.clone(),
+        }],
+    );
+}
+
 /// (v229) Demande de foudre (`BuildMsg::ThorAsk` : `/thor`, Foudre de Zeus), à l'arbitre de
 /// son chunk (le relais du monde, ou le relais de sa province) : seulement d'un OP du
 /// serveur, pas plus de `THOR_RATE` par seconde, rien d'absurde (`game::thor_sane`), pas plus
@@ -8151,6 +8189,16 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 }
                 return None;
             }
+            // (v323) Couleurs d'une pile de tapis : comme les objets, à l'arbitre de son chunk
+            // (sans effet ici pour une province servie par un relais de province : le jeu les
+            // lui envoie).
+            if let Some(m @ game::BuildMsg::CarpetPut { .. }) = &msg {
+                let at = minelib_net::items::chunk_of_msg(m).unwrap_or(chunk);
+                if !provinces::delegated(st, rid, proto::region_of(at)) {
+                    carpet_request(st, rid, id, chunk, m);
+                }
+                return None;
+            }
             let room = st.rooms.get_mut(&rid).expect("partie");
             // Objets au sol et coffres : ce relais arbitre (une demande après l'autre),
             // publie le résultat aux joueurs proches, ou refuse au seul demandeur.
@@ -12787,6 +12835,138 @@ mod tests {
                 m => panic!("{m:?}"),
             }
         }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v323) Les couleurs des couches d'une pile de tapis posée en ligne : publiées par le
+    /// relais aux joueurs proches (posées par n'importe quel joueur, comme un bloc), gardées
+    /// dans l'historique de la zone (les dernières de chaque case : un joueur qui arrive reçoit
+    /// celles d'après) ; mal formées (une seule couche, plus de 16, hors du chunk dit), loin de
+    /// leur auteur : rien.
+    #[test]
+    fn carpet_colors_go_to_the_players_nearby_and_stay_for_newcomers() {
+        let dir = std::env::temp_dir().join(format!("minelib-tapis-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        // Prochaines couleurs de tapis reçues.
+        let next_carpet = |c: &Client| loop {
+            if let Event::FromZone { peer, data, .. } =
+                wait(c, |e| matches!(e, Event::FromZone { .. }))
+            {
+                assert_eq!(peer, 0, "publié par le relais");
+                if let Some(m @ game::BuildMsg::Carpet { .. }) = game::decode(&data) {
+                    return m;
+                }
+            }
+        };
+        let put = |pos: [i32; 3], layers: &[u8]| {
+            game::encode(&game::BuildMsg::CarpetPut {
+                pos,
+                layers: layers.to_vec(),
+            })
+        };
+        let (createur, clink) = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        transport::push(&clink, &Request::Position { chunk: [0, 0] });
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&elink, &Request::Position { chunk: [1, 0] });
+        std::thread::sleep(Duration::from_millis(100));
+        // Mal formées, ou hors du chunk dit : rien ; puis Eve (pas OP) pose une pile rouge,
+        // bleue, jaune, et la change : le créateur, tout près, reçoit chaque fois les siennes.
+        for (chunk, pos, layers) in [
+            ([1, 0], [20, 64, 3], &[14u8][..]),
+            ([1, 0], [20, 64, 3], &[1u8; 17][..]),
+            ([0, 0], [20, 64, 3], &[14u8, 11, 4][..]),
+        ] {
+            transport::push(
+                &elink,
+                &Request::ToZone {
+                    chunk,
+                    data: put(pos, layers),
+                },
+            );
+        }
+        for layers in [vec![14u8, 11, 4], vec![14, 11, 4, 0]] {
+            transport::push(
+                &elink,
+                &Request::ToZone {
+                    chunk: [1, 0],
+                    data: put([20, 64, 3], &layers),
+                },
+            );
+            assert_eq!(
+                next_carpet(&createur),
+                game::BuildMsg::Carpet {
+                    pos: [20, 64, 3],
+                    layers,
+                }
+            );
+        }
+        // Bob arrive : il reçoit les dernières couleurs de la case, pas les premières.
+        let (bob, blink) = login("Bob");
+        bob.send(Cmd::Join(room));
+        wait(&bob, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&blink, &Request::Position { chunk: [0, 1] });
+        assert_eq!(
+            next_carpet(&bob),
+            game::BuildMsg::Carpet {
+                pos: [20, 64, 3],
+                layers: vec![14, 11, 4, 0],
+            }
+        );
+        // Bob s'éloigne. À 13 chunks d'Eve, trop loin de son auteur : rien (Bob, tout près,
+        // l'aurait reçue en premier) ; à 11 chunks d'elle : Bob la reçoit.
+        transport::push(&blink, &Request::Position { chunk: [14, 0] });
+        std::thread::sleep(Duration::from_millis(100));
+        for (chunk, pos) in [([14, 1], [230, 70, 20]), ([12, 0], [200, 70, 5])] {
+            transport::push(
+                &elink,
+                &Request::ToZone {
+                    chunk,
+                    data: put(pos, &[3, 3, 7]),
+                },
+            );
+        }
+        assert_eq!(
+            next_carpet(&bob),
+            game::BuildMsg::Carpet {
+                pos: [200, 70, 5],
+                layers: vec![3, 3, 7],
+            }
+        );
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
     }

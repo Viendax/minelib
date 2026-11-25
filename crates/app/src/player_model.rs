@@ -2028,31 +2028,7 @@ pub(crate) fn emit_item(
     kind: RayBoxKind,
     light: [f32; 3],
 ) {
-    let mut rect = [0.0, 0.0, 1.0, 1.0];
-    let (color, layer, lit) = match kind {
-        RayBoxKind::Block { layer, uv, glow } => {
-            rect = uv;
-            ([1.0; 3], layer as i32, !glow)
-        }
-        RayBoxKind::Flat(c) => (
-            srgb((c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32),
-            -1,
-            true,
-        ),
-        RayBoxKind::Glow(c) => (
-            srgb((c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32),
-            -1,
-            false,
-        ),
-        // Flamme animée (voir entity.wgsl) : `uv.y` = hauteur dans le bloc de la torche,
-        // comme celle de la première personne (de 8 à 13 seizièmes).
-        RayBoxKind::Flame(c) => (
-            srgb((c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32),
-            minelib_render::ENTITY_FLAME,
-            false,
-        ),
-        _ => ([1.0; 3], -1, true),
-    };
+    let (color, layer, rect, lit) = item_style(kind);
     let (a, b) = (Vec3::from(min), Vec3::from(max));
     // (coin d'origine, axe u, axe v) de chaque face, en fractions du pavé.
     let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
@@ -2074,15 +2050,8 @@ pub(crate) fn emit_item(
         // Flamme : sans ombrage de face, comme à la première personne.
         let shade = if flame { 1.0 } else { face_shade(n) };
         let col = [0, 1, 2].map(|i| color[i] * shade);
-        // Lumineux par lui-même (flamme) : ni l'éclairage du lieu, ni les lumières. La
-        // flamme animée garde sa pleine couleur (×1, comme à la première personne).
-        let vl = if lit {
-            EntityVertex::light(light, true)
-        } else if flame {
-            EntityVertex::light([1.0; 3], false)
-        } else {
-            EntityVertex::light([0.5; 3], false)
-        };
+        // Lumineux par lui-même (flamme) : ni l'éclairage du lieu, ni les lumières.
+        let vl = item_light(lit, flame, light);
         for (u, v) in [
             (0.0, 0.0),
             (1.0, 0.0),
@@ -2434,7 +2403,9 @@ pub fn build_bitten(pose: &Pose, flesh: Option<&crate::flesh::Flesh>) -> Vec<Ent
 /// plan est dessinée à sa couleur : là où est la caméra, on voit la texture du morceau à cette
 /// hauteur, et tout le reste du corps autour. Elle est dans le corps : vue d'ailleurs (un
 /// miroir), il la cache. Vide quand le plan ne touche pas le corps (la caméra F5 loin de lui,
-/// comme d'habitude). Les cubes mangés par L'Évidé (`flesh`) n'ont pas de coupe.
+/// comme d'habitude). Les cubes mangés par L'Évidé (`flesh`) n'ont pas de coupe. (v323) Ce qu'il
+/// tient aussi : le bloc à sa texture à cet endroit, un objet uni à sa couleur
+/// (`emit_held_section`).
 pub fn cut(
     pose: &Pose,
     flesh: Option<&crate::flesh::Flesh>,
@@ -2495,29 +2466,10 @@ pub fn cut(
                         let o = lo + Vec3::new(x as f32, y as f32, z as f32) * step;
                         let w: [Vec3; 8] = std::array::from_fn(|j| m.transform_point3(o + unit(j) * step));
                         let s = w.map(side);
-                        if s.iter().all(|&v| v > 0.0) || s.iter().all(|&v| v < 0.0) {
+                        let pts = section(&w, &s, e1, e2);
+                        if pts.is_empty() {
                             continue;
                         }
-                        // Les points où le plan coupe les arêtes du cube.
-                        let mut pts: Vec<Vec3> = Vec::with_capacity(6);
-                        for a in 0..8 {
-                            for bit in [1, 2, 4] {
-                                let b = a | bit;
-                                if a & bit != 0 || (s[a] > 0.0) == (s[b] > 0.0) {
-                                    continue;
-                                }
-                                let p = w[a] + (w[b] - w[a]) * (s[a] / (s[a] - s[b]));
-                                if pts.iter().all(|q| q.distance_squared(p) > 1e-12) {
-                                    pts.push(p);
-                                }
-                            }
-                        }
-                        if pts.len() < 3 {
-                            continue;
-                        }
-                        let mid = pts.iter().copied().sum::<Vec3>() / pts.len() as f32;
-                        let angle = |p: &Vec3| (*p - mid).dot(e2).atan2((*p - mid).dot(e1));
-                        pts.sort_by(|p, q| angle(p).total_cmp(&angle(q)));
                         let color = solid_color(zone, part, tex, c, m);
                         for t in 1..pts.len() - 1 {
                             for p in [pts[0], pts[t], pts[t + 1]] {
@@ -2535,7 +2487,149 @@ pub fn cut(
             }
         }
     }
+    // (v323) Ce qu'il tient (un bloc, une torche, la baguette, la lampe torche) est plein aussi :
+    // la caméra F5 qui y entre en voyait l'intérieur creux. La coupe d'un morceau de bloc montre
+    // sa texture à cet endroit (comme la face du morceau la plus en face de la caméra), celle
+    // d'un objet uni sa couleur ; chaque morceau un rien plus loin que le précédent, après ceux
+    // du corps.
+    for (k, (xf, min, max, kind)) in held_parts(pose).into_iter().enumerate() {
+        let plane = at * (1.0 + (2 * all.len() + k) as f32 * 1e-4);
+        let (lo, hi) = (Vec3::from(min), Vec3::from(max));
+        let w: [Vec3; 8] = std::array::from_fn(|j| xf.transform_point3(lo + (hi - lo) * unit(j)));
+        let s = w.map(|p| (p - eye).dot(look) - plane);
+        let pts = section(&w, &s, e1, e2);
+        if !pts.is_empty() {
+            emit_held_section(&mut out, xf, lo, hi, kind, &pts, look, pose.light);
+        }
+    }
     out
+}
+
+/// (v305, v323) Le polygone où le plan coupe le pavé de coins `w` (`s` : distance signée de
+/// chaque coin au plan ; coins numérotés comme les bits x, y, z), ses coins rangés autour de leur
+/// milieu (`e1`, `e2` : deux directions du plan). Vide si le plan ne le coupe pas.
+fn section(w: &[Vec3; 8], s: &[f32; 8], e1: Vec3, e2: Vec3) -> Vec<Vec3> {
+    if s.iter().all(|&v| v > 0.0) || s.iter().all(|&v| v < 0.0) {
+        return Vec::new();
+    }
+    // Les points où le plan coupe les arêtes du pavé.
+    let mut pts: Vec<Vec3> = Vec::with_capacity(6);
+    for a in 0..8 {
+        for bit in [1, 2, 4] {
+            let b = a | bit;
+            if a & bit != 0 || (s[a] > 0.0) == (s[b] > 0.0) {
+                continue;
+            }
+            let p = w[a] + (w[b] - w[a]) * (s[a] / (s[a] - s[b]));
+            if pts.iter().all(|q| q.distance_squared(p) > 1e-12) {
+                pts.push(p);
+            }
+        }
+    }
+    if pts.len() < 3 {
+        return Vec::new();
+    }
+    let mid = pts.iter().copied().sum::<Vec3>() / pts.len() as f32;
+    let angle = |p: &Vec3| (*p - mid).dot(e2).atan2((*p - mid).dot(e1));
+    pts.sort_by(|p, q| angle(p).total_cmp(&angle(q)));
+    pts
+}
+
+/// (v323) Couleur, couche de texture (−1 : aucune), rectangle de la texture et éclairage d'un
+/// morceau de l'objet tenu (`emit_item`, et sa coupe par l'écran) : `lit`, éclairé par le lieu.
+fn item_style(kind: RayBoxKind) -> ([f32; 3], i32, [f32; 4], bool) {
+    let rgb = |c: [u8; 3]| srgb((c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32);
+    match kind {
+        RayBoxKind::Block { layer, uv, glow } => ([1.0; 3], layer as i32, uv, !glow),
+        RayBoxKind::Flat(c) => (rgb(c), -1, [0.0, 0.0, 1.0, 1.0], true),
+        RayBoxKind::Glow(c) => (rgb(c), -1, [0.0, 0.0, 1.0, 1.0], false),
+        // Flamme animée (voir entity.wgsl) : `uv.y` = hauteur dans le bloc de la torche,
+        // comme celle de la première personne (de 8 à 13 seizièmes).
+        RayBoxKind::Flame(c) => (rgb(c), minelib_render::ENTITY_FLAME, [0.0, 0.0, 1.0, 1.0], false),
+        _ => ([1.0; 3], -1, [0.0, 0.0, 1.0, 1.0], true),
+    }
+}
+
+/// (v323) Éclairage d'un sommet d'un morceau de l'objet tenu : celui du lieu (`lit`) ; sinon
+/// lumineux par lui-même (la flamme animée garde sa pleine couleur, ×1, comme à la première
+/// personne).
+fn item_light(lit: bool, flame: bool, light: [f32; 3]) -> [u8; 4] {
+    if lit {
+        EntityVertex::light(light, true)
+    } else if flame {
+        EntityVertex::light([1.0; 3], false)
+    } else {
+        EntityVertex::light([0.5; 3], false)
+    }
+}
+
+/// (v323) La coupe `pts` (dans le monde) du morceau `lo`..`hi` de l'objet tenu (repère `xf`) par
+/// l'écran qui regarde vers `look` : à la couleur du morceau, avec l'ombrage de sa face la plus en
+/// face de la caméra, et pour un morceau de bloc sa texture à cet endroit, dans le sens de cette
+/// face (de face ou de côté : comme ses côtés ; de dessus ou de dessous : comme son dessus).
+#[allow(clippy::too_many_arguments)]
+fn emit_held_section(
+    out: &mut Vec<EntityVertex>,
+    xf: Mat4,
+    lo: Vec3,
+    hi: Vec3,
+    kind: RayBoxKind,
+    pts: &[Vec3],
+    look: Vec3,
+    light: [f32; 3],
+) {
+    let (color, layer, rect, lit) = item_style(kind);
+    let flame = layer == minelib_render::ENTITY_FLAME;
+    let inv = xf.inverse();
+    // Vers la caméra, dans le repère du morceau : la face la plus en face d'elle.
+    let n = inv.transform_vector3(-look);
+    let axis = if n.z.abs() >= n.x.abs() && n.z.abs() >= n.y.abs() {
+        2
+    } else if n.x.abs() >= n.y.abs() {
+        0
+    } else {
+        1
+    };
+    let mut face = Vec3::ZERO;
+    face[axis] = if n[axis] < 0.0 { -1.0 } else { 1.0 };
+    let shade = if flame {
+        1.0
+    } else {
+        face_shade(xf.transform_vector3(face).normalize_or_zero())
+    };
+    let col = color.map(|c| c * shade);
+    let vl = item_light(lit, flame, light);
+    let size = (hi - lo).max(Vec3::splat(1e-6));
+    let uv = |p: Vec3| {
+        let f = ((inv.transform_point3(p) - lo) / size).clamp(Vec3::ZERO, Vec3::ONE);
+        if flame {
+            return [f.x, 0.5 + 0.3125 * f.y];
+        }
+        // (u, v) sur cette face, comme `emit_item` les y plaque (v vers le bas de la texture).
+        let (u, v) = match (axis, face[axis] > 0.0) {
+            (2, true) => (f.x, 1.0 - f.y),
+            (2, false) => (1.0 - f.x, 1.0 - f.y),
+            (0, true) => (1.0 - f.z, 1.0 - f.y),
+            (0, false) => (f.z, 1.0 - f.y),
+            (_, true) => (f.x, 1.0 - f.z),
+            (_, false) => (f.x, f.z),
+        };
+        [
+            rect[0] + (rect[2] - rect[0]) * u,
+            rect[1] + (rect[3] - rect[1]) * v,
+        ]
+    };
+    for t in 1..pts.len() - 1 {
+        for p in [pts[0], pts[t], pts[t + 1]] {
+            out.push(EntityVertex {
+                pos: p.to_array(),
+                color: col,
+                uv: uv(p),
+                layer,
+                light: vl,
+            });
+        }
+    }
 }
 
 /// (v305) Les coupes des genoux et des coudes, pleines (`solid_color`), pour le corps du
@@ -3411,6 +3505,113 @@ pub(crate) fn irm(
 mod tests {
     use super::*;
     use glam::Vec2;
+
+    /// (v323) La caméra F5 dans ce que le joueur tient : l'écran montre la coupe du bloc tenu,
+    /// à sa texture (sa couche, et au milieu du bloc le milieu de son image), dans le bloc, de
+    /// face, de côté et d'en haut ; celle de la baguette (unie) à sa couleur. Loin de lui, rien.
+    #[test]
+    fn the_cut_fills_what_the_player_holds() {
+        let mut pose = Pose {
+            feet: Vec3::new(-12.5, 64.0, 7.5),
+            yaw: -0.7,
+            pitch: 0.2,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: Some(Held::Block(BlockId::PLANKS)),
+            skin: None,
+            bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
+        };
+        let at = minelib_render::NEAR * 1.04;
+        // Les triangles de la coupe (de la couche `layer`) droit devant la caméra, et leurs
+        // coordonnées barycentriques en ce point.
+        let ahead_of = |cut: &[EntityVertex], eye: Vec3, look: Vec3, layer: i32| {
+            let p = eye + look * at;
+            cut.chunks(3)
+                .filter(|t| t[0].layer == layer)
+                .filter_map(|t| {
+                    let [a, b, c] = [t[0].pos, t[1].pos, t[2].pos].map(Vec3::from);
+                    let n = (b - a).cross(c - a);
+                    let area = n.length_squared();
+                    if area == 0.0 {
+                        return None;
+                    }
+                    // Le point ramené dans le plan du triangle.
+                    let q = p - n * ((p - a).dot(n) / area);
+                    let wa = (c - b).cross(q - b).dot(n) / area;
+                    let wb = (a - c).cross(q - c).dot(n) / area;
+                    let wc = 1.0 - wa - wb;
+                    (wa >= -1e-4 && wb >= -1e-4 && wc >= -1e-4).then(|| (t.to_vec(), [wa, wb, wc]))
+                })
+                .collect::<Vec<_>>()
+        };
+        let parts = held_parts(&pose);
+        assert_eq!(parts.len(), 1, "un bloc plein : un pavé");
+        let (xf, min, max, kind) = parts[0];
+        let RayBoxKind::Block { layer, .. } = kind else {
+            panic!("un bloc tenu a sa texture");
+        };
+        let layer = layer as i32;
+        let (lo, hi) = (Vec3::from(min), Vec3::from(max));
+        let mid = xf.transform_point3((lo + hi) * 0.5);
+        let inv = xf.inverse();
+        for look in [
+            Vec3::new(0.3, -0.2, -1.0),
+            Vec3::new(-1.0, 0.15, 0.2),
+            Vec3::new(0.1, -1.0, 0.15),
+        ] {
+            let look = look.normalize();
+            let eye = mid - look * at;
+            let cut = cut(&pose, None, eye, look, at);
+            let hits = ahead_of(&cut, eye, look, layer);
+            let (tri, w) = hits
+                .first()
+                .unwrap_or_else(|| panic!("regard {look} : la coupe du bloc couvre le milieu de l'écran"));
+            let uv = [0, 1].map(|k| tri[0].uv[k] * w[0] + tri[1].uv[k] * w[1] + tri[2].uv[k] * w[2]);
+            assert!(
+                (uv[0] - 0.5).abs() < 0.05 && (uv[1] - 0.5).abs() < 0.05,
+                "regard {look} : au milieu du bloc, le milieu de sa texture ({uv:?})"
+            );
+            for v in cut.iter().filter(|v| v.layer == layer) {
+                let q = inv.transform_point3(Vec3::from(v.pos));
+                assert!(
+                    (0..3).all(|k| q[k] >= lo[k] - 1e-3 && q[k] <= hi[k] + 1e-3),
+                    "coupe hors du bloc : {q}"
+                );
+                assert!(v.uv.iter().all(|c| (-1e-4..=1.0001).contains(c)), "{:?}", v.uv);
+            }
+        }
+        // La baguette, unie : à sa couleur (avec l'ombrage d'une face).
+        pose.held = Some(Held::Wand([200, 40, 40]));
+        let parts = held_parts(&pose);
+        let (xf, min, max, _) = parts[0];
+        let mid = xf.transform_point3((Vec3::from(min) + Vec3::from(max)) * 0.5);
+        let look = xf.transform_vector3(Vec3::Z).normalize();
+        let eye = mid - look * at;
+        let wand = cut(&pose, None, eye, look, at);
+        let want = srgb(0xc82828);
+        // (Le poing peut être coupé au même endroit : un des triangles est celui de la baguette.)
+        let colors: Vec<[f32; 3]> = ahead_of(&wand, eye, look, -1)
+            .iter()
+            .map(|(t, _)| t[0].color)
+            .collect();
+        assert!(
+            colors.iter().any(|c| {
+                let ratio = c[0] / want[0];
+                (0.4..=1.0).contains(&ratio) && (1..3).all(|k| (c[k] - want[k] * ratio).abs() < 1e-3)
+            }),
+            "la coupe de la baguette, à sa couleur : {colors:?}"
+        );
+        // Quatre blocs derrière lui : aucune coupe.
+        pose.held = Some(Held::Block(BlockId::PLANKS));
+        let look = Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos());
+        let eye = pose.feet + Vec3::Y * 1.6 - look * 4.0;
+        assert!(cut(&pose, None, eye, look, at).is_empty());
+    }
 
     /// (v305) Vu d'en dessous, depuis l'entrejambe (la caméra F5 descendue au sol) : par le
     /// rebord d'un millimètre et demi sous chaque cuisse (la moitié du bas d'un membre plié est

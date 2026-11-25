@@ -91,6 +91,10 @@ pub fn chunk_of_msg(m: &BuildMsg) -> Option<[i32; 2]> {
         | BuildMsg::Slot { pos, .. } => Some([pos[0].div_euclid(16), pos[2].div_euclid(16)]),
         // (v224) Les lumières de l'éditeur suivent le même chemin que les objets.
         BuildMsg::LightPut { chunk, .. } | BuildMsg::Light { chunk, .. } => Some(*chunk),
+        // (v323) Les couleurs des piles de tapis aussi.
+        BuildMsg::CarpetPut { pos, .. } | BuildMsg::Carpet { pos, .. } => {
+            Some([pos[0].div_euclid(16), pos[2].div_euclid(16)])
+        }
         _ => None,
     }
 }

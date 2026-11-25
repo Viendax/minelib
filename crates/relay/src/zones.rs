@@ -62,6 +62,8 @@ enum LogKey {
     Slot([i32; 3], u8),
     /// (v224) Lumière de l'éditeur : la dernière de chaque lumière dans cette zone.
     Light(u64),
+    /// (v323) Couleurs des couches d'une pile de tapis : les dernières de chaque case.
+    Carpet([i32; 3]),
 }
 
 /// Ce que décrit une entrée (la suivante de même clé la remplace).
@@ -72,6 +74,7 @@ fn key_of(data: &[u8]) -> Option<LogKey> {
         Some(BuildMsg::Item { id, .. }) => Some(LogKey::Item(id)),
         Some(BuildMsg::Slot { pos, slot, .. }) => Some(LogKey::Slot(pos, slot)),
         Some(BuildMsg::Light { uid, .. }) => Some(LogKey::Light(uid)),
+        Some(BuildMsg::Carpet { pos, .. }) => Some(LogKey::Carpet(pos)),
         _ => None,
     }
 }

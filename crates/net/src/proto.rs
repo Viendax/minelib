@@ -74,6 +74,8 @@ use serde::{Deserialize, Serialize};
 /// l'origine de sa carte (`fpsmap::match_origin`, chez l'hôte, ses invités, le garant, le
 /// vérificateur), la partie FPS d'un serveur de construction depuis celle du jeu de son hôte
 /// (`Response::BuildMatch::origin`).
+/// (v323, toujours 75) Les couleurs des couches d'une pile de tapis posée en construction en
+/// ligne (`game::BuildMsg::CarpetPut`, `Carpet`, en fin d'énumération).
 pub const PROTOCOL: u32 = 75;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre

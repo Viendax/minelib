@@ -726,6 +726,22 @@ pub enum BuildMsg {
         by: String,
         health: u8,
     },
+    /// (v323) Les sortes des couches (de bas en haut, `registry::CARPET_KINDS`) de la pile de
+    /// tapis posée en `pos` (place absolue) : demande de celui qui l'a posée, juste après la
+    /// modification de son bloc, à l'arbitre de son chunk (le relais du monde, ou le relais de
+    /// sa province, comme pour les objets). Le bloc ne dit que la hauteur et la sorte du
+    /// dessus. (En fin d'énumération : l'historique enregistré des zones se relit.)
+    CarpetPut { pos: [i32; 3], layers: Vec<u8> },
+    /// (v323) Publiée par l'arbitre : gardée dans l'historique de la zone (la dernière de chaque
+    /// case), remise aux joueurs proches et à qui y arrive. Le jeu ne la prend que si elle va
+    /// avec le bloc de la case (`World::carpet_layers`).
+    Carpet { pos: [i32; 3], layers: Vec<u8> },
+}
+
+/// (v323) Couches d'une pile de tapis acceptées dans `BuildMsg::CarpetPut` : de 2 à 16 (une
+/// pile est un bloc de 16 tapis au plus), chacune une sorte de tapis (moins de 64).
+pub fn carpet_sane(layers: &[u8]) -> bool {
+    (2..=16).contains(&layers.len()) && layers.iter().all(|&k| k < 64)
 }
 
 pub const THOR_NOT_OP: u8 = 0;

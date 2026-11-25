@@ -4416,6 +4416,12 @@ pub(crate) fn to_zone(
         super::zeus_zone_request(st, rid, id, pseudo, m);
         return;
     }
+    // (v323) Couleurs d'une pile de tapis posée dans la province : ce relais les publie (comme
+    // les objets de ses zones).
+    if let Some(m @ BuildMsg::CarpetPut { .. }) = &msg {
+        super::carpet_request(st, rid, id, chunk, m);
+        return;
+    }
     let sovereign = room.sov.get(&region).map(|sv| sv.primary);
     // Objets et coffres de la province (v139) : ce relais arbitre ; un joueur en survie
     // attend son sac (prêté par le relais du monde).

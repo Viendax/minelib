@@ -4949,6 +4949,12 @@ impl Session {
                             self.dirty.extend(self.world.set(p[0], p[1], p[2], id));
                             if let Some(l) = layers {
                                 self.world.set_carpet_layers(p, &l);
+                                // (v323) En construction en ligne, les autres joueurs voient
+                                // aussi la couleur de chaque couche (le bloc ne dit que celle
+                                // du dessus) : à l'arbitre de son chunk, après le bloc.
+                                if let Some(b) = self.build.as_mut() {
+                                    b.send_carpet(p, l);
+                                }
                             }
                             self.use_selected();
                         }
@@ -12683,7 +12689,7 @@ impl Session {
             // niveau de la caméra » : ce que l'écran coupe de son corps (la caméra descendue
             // au sol, dans ses jambes) est plein, à la couleur de son skin à cet endroit. La
             // coupe suit l'écran : à l'image d'avant, elle était à la même place devant la
-            // caméra d'avant.
+            // caméra d'avant. (v323) Ce qu'il tient aussi (le bloc, à sa texture).
             let cut = crate::player_model::cut(&pose, self.flesh.get(""), cam, cam_look, CUT_AT);
             let back = self.cut_view.replace(Some(view)).map(|v| v.inverse() * view);
             moved_prev.extend(cut.iter().map(|v| {
