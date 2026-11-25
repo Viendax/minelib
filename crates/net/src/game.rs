@@ -43,6 +43,9 @@ pub struct SimState {
 /// (v334) Position relative à celle du joueur qui reçoit (`you.pos` du même message), en
 /// `POSE_UNIT`es de bloc : 4 à 6 octets au lieu de 12 pour des joueurs à quelques dizaines
 /// de blocs, sans limite de distance ; cap sur 2 octets fixes (3 avant, le plus souvent).
+/// (v337) Regard en 4096e de tour (0,09° : pour voir où les autres regardent ; leurs
+/// coups, l'hôte les compte avec le regard exact) : de petits écarts d'un message à
+/// l'autre, pour les différences.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Pose {
     pub id: u64,
@@ -57,10 +60,16 @@ pub struct Pose {
 /// (v334) Finesse des positions de `Pose` : un 64e de bloc (moins d'un centimètre d'erreur).
 pub const POSE_UNIT: f32 = 64.0;
 
+/// (v337) Un tour, en unités du regard de `Pose`.
+pub const POSE_TURN: i64 = 4096;
+
 impl Pose {
     /// `anchor` : la position du joueur qui reçoit, telle qu'elle part dans le même message.
     pub fn of(p: &NetPlayer, anchor: [f32; 3]) -> Self {
-        let turn = |a: f32| (a / std::f32::consts::TAU * 65536.0).round() as i64 as i16;
+        let turn = |a: f32| {
+            let t = (a / std::f32::consts::TAU * POSE_TURN as f32).round() as i64;
+            ((t + POSE_TURN / 2).rem_euclid(POSE_TURN) - POSE_TURN / 2) as i16
+        };
         let q = |v: f32, a: f32| {
             ((f64::from(v) - f64::from(a)) * f64::from(POSE_UNIT))
                 .round()
@@ -82,7 +91,7 @@ impl Pose {
 
     /// Met `p` à cette position (`anchor` : la même que pour `of`).
     pub fn apply(&self, p: &mut NetPlayer, anchor: [f32; 3]) {
-        let angle = |a: i16| a as f32 / 65536.0 * std::f32::consts::TAU;
+        let angle = |a: i16| a as f32 / POSE_TURN as f32 * std::f32::consts::TAU;
         let back = |r: i32, a: f32| (f64::from(a) + f64::from(r) / f64::from(POSE_UNIT)) as f32;
         p.pos = [
             back(self.rel[0], anchor[0]),
@@ -597,6 +606,16 @@ pub enum ToHost {
     /// complets, 64).
     Rate {
         every: u8,
+    },
+    /// (v337) Une différence est arrivée sans le message d'avant sur lequel elle s'appuie :
+    /// les prochains partent entiers.
+    DeltaMiss,
+    /// (v337) Les mêmes que `Inputs`, serrées (`pack_inputs`) : chaque pas d'entrées par
+    /// différence avec le précédent (le plus souvent un ou deux octets au lieu de 15).
+    InputsPacked {
+        first_seq: u32,
+        data: Vec<u8>,
+        weapon: u8,
     },
 }
 
@@ -1118,6 +1137,18 @@ pub enum ToPeer {
     FastPing {
         tick: u32,
     },
+    /// (v337) Par le relais (qui remet tout, dans l'ordre) : des positions (`Moves`) ou un
+    /// état complet (`Snapshot`) écrits par différence avec celui du pas `base` envoyé
+    /// avant par le même chemin (`delta`, `undelta`). Sans lui, le joueur le dit
+    /// (`ToHost::DeltaMiss`) et reçoit de nouveau des messages entiers.
+    MovesDelta {
+        base: u32,
+        data: Vec<u8>,
+    },
+    SnapDelta {
+        base: u32,
+        data: Vec<u8>,
+    },
 }
 
 pub fn encode<T: Serialize>(m: &T) -> Vec<u8> {
@@ -1126,6 +1157,557 @@ pub fn encode<T: Serialize>(m: &T) -> Vec<u8> {
 
 pub fn decode<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Option<T> {
     postcard::from_bytes(b).ok()
+}
+
+// ───────────── (v337) Différences sur le chemin du relais ─────────────
+//
+// Sur le pire chemin (ni passeur ni TURN : tout par les serveurs relais d'iroh), ce que
+// l'hôte envoie à ses joueurs passe par une seule connexion, limitée (environ 120 Ko/s
+// mesurés). Positions et états complets y partent donc écrits par différence avec le
+// message du même genre envoyé juste avant par le même chemin : le relais remet tout, dans
+// l'ordre. Chaque champ est un mot de 32 bits (un flottant par ses bits : la différence se
+// défait exactement) ; seuls les mots qui changent partent, en « ou exclusif » avec le mot
+// d'avant (petit nombre, peu d'octets en varint), derrière un masque.
+
+fn put_var(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn get_var(inp: &mut &[u8]) -> Option<u64> {
+    let mut v = 0u64;
+    for shift in (0..64).step_by(7) {
+        let (&b, rest) = inp.split_first()?;
+        *inp = rest;
+        v |= u64::from(b & 0x7F) << shift;
+        if b < 0x80 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn zz(v: i64) -> u32 {
+    ((v << 1) ^ (v >> 63)) as u32
+}
+
+fn unzz(v: u32) -> i64 {
+    i64::from(v >> 1) ^ -i64::from(v & 1)
+}
+
+/// Les mots qui changent : leur masque, puis chacun par son écart avec l'ancien (sur 32
+/// bits, en zigzag : un petit écart, dans un sens ou dans l'autre, tient sur un octet ; pour
+/// un flottant, l'écart de ses bits est le nombre de pas de flottant entre les deux).
+fn put_words(out: &mut Vec<u8>, base: &[u32], new: &[u32]) {
+    let mut mask = 0u64;
+    for (i, (b, n)) in base.iter().zip(new).enumerate() {
+        if b != n {
+            mask |= 1 << i;
+        }
+    }
+    put_var(out, mask);
+    for (i, (b, n)) in base.iter().zip(new).enumerate() {
+        if mask >> i & 1 == 1 {
+            put_var(out, u64::from(zz(i64::from(n.wrapping_sub(*b) as i32))));
+        }
+    }
+}
+
+fn get_words(inp: &mut &[u8], base: &[u32]) -> Option<Vec<u32>> {
+    let mask = get_var(inp)?;
+    if base.len() < 64 && mask >> base.len() != 0 {
+        return None;
+    }
+    let mut w = base.to_vec();
+    for (i, x) in w.iter_mut().enumerate() {
+        if mask >> i & 1 == 1 {
+            let d = unzz(u32::try_from(get_var(inp)?).ok()?) as i32;
+            *x = x.wrapping_add(d as u32);
+        }
+    }
+    Some(w)
+}
+
+/// Octets d'un petit bloc (le HUD) : même longueur, ceux qui changent derrière un masque par
+/// paquet de 8 ; sinon le bloc entier.
+fn put_bytes(out: &mut Vec<u8>, base: &[u8], new: &[u8]) {
+    if base.len() != new.len() {
+        out.push(0);
+        put_var(out, new.len() as u64);
+        out.extend_from_slice(new);
+        return;
+    }
+    out.push(1);
+    for (b, n) in base.chunks(8).zip(new.chunks(8)) {
+        let mut mask = 0u8;
+        for (i, (x, y)) in b.iter().zip(n).enumerate() {
+            if x != y {
+                mask |= 1 << i;
+            }
+        }
+        out.push(mask);
+        for (i, y) in n.iter().enumerate() {
+            if mask >> i & 1 == 1 {
+                out.push(*y);
+            }
+        }
+    }
+}
+
+fn get_bytes(inp: &mut &[u8], base: &[u8]) -> Option<Vec<u8>> {
+    let (&kind, rest) = inp.split_first()?;
+    *inp = rest;
+    if kind == 0 {
+        let n = usize::try_from(get_var(inp)?).ok()?;
+        if inp.len() < n {
+            return None;
+        }
+        let (v, rest) = inp.split_at(n);
+        *inp = rest;
+        return Some(v.to_vec());
+    }
+    let mut v = base.to_vec();
+    for chunk in v.chunks_mut(8) {
+        let (&mask, rest) = inp.split_first()?;
+        *inp = rest;
+        for (i, x) in chunk.iter_mut().enumerate() {
+            if mask >> i & 1 == 1 {
+                let (&y, rest) = inp.split_first()?;
+                *inp = rest;
+                *x = y;
+            }
+        }
+    }
+    Some(v)
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_var(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn get_str(inp: &mut &[u8]) -> Option<String> {
+    let n = usize::try_from(get_var(inp)?).ok()?;
+    if inp.len() < n {
+        return None;
+    }
+    let (v, rest) = inp.split_at(n);
+    *inp = rest;
+    String::from_utf8(v.to_vec()).ok()
+}
+
+/// L'état de soi : ce qui change le plus d'abord (masque sur un octet le plus souvent).
+fn sim_words(s: &SimState) -> [u32; 13] {
+    [
+        s.pos[0].to_bits(),
+        s.pos[1].to_bits(),
+        s.pos[2].to_bits(),
+        s.vel[0].to_bits(),
+        s.vel[1].to_bits(),
+        s.vel[2].to_bits(),
+        s.stamina.to_bits(),
+        s.crouch.to_bits(),
+        s.jump_buffer.to_bits(),
+        s.duck_speed.to_bits(),
+        u32::from(s.on_ground),
+        u32::from(s.sneak_held),
+        u32::from(s.carry),
+    ]
+}
+
+fn sim_from(w: &[u32]) -> Option<SimState> {
+    let f = |i: usize| f32::from_bits(w[i]);
+    Some(SimState {
+        pos: [f(0), f(1), f(2)],
+        vel: [f(3), f(4), f(5)],
+        stamina: f(6),
+        crouch: f(7),
+        jump_buffer: f(8),
+        duck_speed: f(9),
+        on_ground: w[10] != 0,
+        sneak_held: w[11] != 0,
+        carry: u8::try_from(w[12]).ok()?,
+    })
+}
+
+/// (v337) La position de celui qui reçoit, arrondie en `POSE_UNIT`es : ajoutée aux
+/// positions relatives, elle donne des positions qui ne bougent que quand le joueur bouge
+/// (pas quand celui qui reçoit bouge). Calculée de la même façon des deux côtés, à partir
+/// des bits exacts de `you.pos`.
+fn pose_anchor(you: &SimState) -> [u32; 3] {
+    let q = |v: f32| (f64::from(v) * f64::from(POSE_UNIT)).round() as i64 as i32 as u32;
+    [q(you.pos[0]), q(you.pos[1]), q(you.pos[2])]
+}
+
+fn pose_words(p: &Pose, a: [u32; 3]) -> [u32; 7] {
+    [
+        (p.rel[0] as u32).wrapping_add(a[0]),
+        (p.rel[1] as u32).wrapping_add(a[1]),
+        (p.rel[2] as u32).wrapping_add(a[2]),
+        zz(i64::from(p.yaw)),
+        zz(i64::from(p.pitch)),
+        u32::from(p.crouch),
+        u32::from(p.speed),
+    ]
+}
+
+fn pose_from(id: u64, w: &[u32], a: [u32; 3]) -> Option<Pose> {
+    Some(Pose {
+        id,
+        rel: [
+            w[0].wrapping_sub(a[0]) as i32,
+            w[1].wrapping_sub(a[1]) as i32,
+            w[2].wrapping_sub(a[2]) as i32,
+        ],
+        yaw: i16::try_from(unzz(w[3])).ok()?,
+        pitch: i16::try_from(unzz(w[4])).ok()?,
+        crouch: u8::try_from(w[5]).ok()?,
+        speed: u8::try_from(w[6]).ok()?,
+    })
+}
+
+/// Un joueur d'un état complet, tel qu'il est sur le fil (angles, accroupi et vitesse
+/// arrondis comme le font `turn16fixed`, `turn16`, `unit8`, `tenth8`).
+fn player_words(p: &NetPlayer) -> [u32; 14] {
+    let turn = |a: f32| (a / std::f32::consts::TAU * 65536.0).round() as i64 as i16;
+    [
+        p.pos[0].to_bits(),
+        p.pos[1].to_bits(),
+        p.pos[2].to_bits(),
+        u32::from(turn(p.yaw) as u16),
+        zz(i64::from(turn(p.pitch))),
+        u32::from((p.speed * 10.0).clamp(0.0, 255.0).round() as u8),
+        u32::from((p.crouch.clamp(0.0, 1.0) * 255.0).round() as u8),
+        u32::from(p.hp),
+        u32::from(p.alive),
+        u32::from(p.weapon),
+        u32::from(p.kills),
+        u32::from(p.deaths),
+        u32::from(p.team),
+        u32::from(p.flags),
+    ]
+}
+
+fn player_from(id: u64, pseudo: String, w: &[u32]) -> Option<NetPlayer> {
+    let angle = |v: i16| v as f32 / 65536.0 * std::f32::consts::TAU;
+    let f = |i: usize| f32::from_bits(w[i]);
+    Some(NetPlayer {
+        id,
+        pseudo,
+        pos: [f(0), f(1), f(2)],
+        yaw: angle(u16::try_from(w[3]).ok()? as i16),
+        pitch: angle(i16::try_from(unzz(w[4])).ok()?),
+        speed: f32::from(u8::try_from(w[5]).ok()?) / 10.0,
+        crouch: f32::from(u8::try_from(w[6]).ok()?) / 255.0,
+        hp: u8::try_from(w[7]).ok()?,
+        alive: w[8] != 0,
+        weapon: u8::try_from(w[9]).ok()?,
+        kills: u16::try_from(w[10]).ok()?,
+        deaths: u16::try_from(w[11]).ok()?,
+        team: u8::try_from(w[12]).ok()?,
+        flags: u8::try_from(w[13]).ok()?,
+    })
+}
+
+/// Une liste de joueurs : chacun comparé à celui de même identifiant dans la liste
+/// d'avant (sa place, plus un), ou entier (0, puis son identifiant). (v337) Mêmes joueurs
+/// dans le même ordre (le plus souvent) : rien que les mots, sans les places. `base_words`
+/// et `words` : les mots d'un joueur de la liste d'avant et de la nouvelle.
+fn put_list<T, const N: usize>(
+    out: &mut Vec<u8>,
+    base: &[T],
+    new: &[T],
+    id: impl Fn(&T) -> u64,
+    base_words: impl Fn(&T) -> [u32; N],
+    words: impl Fn(&T) -> [u32; N],
+    extra: impl Fn(&mut Vec<u8>, Option<&T>, &T),
+) {
+    let same = base.len() == new.len() && base.iter().zip(new).all(|(b, n)| id(b) == id(n));
+    put_var(out, (new.len() as u64) << 1 | u64::from(same));
+    for (i, e) in new.iter().enumerate() {
+        let at = if same {
+            Some(i)
+        } else {
+            base.iter().position(|b| id(b) == id(e))
+        };
+        match at {
+            Some(j) => {
+                if !same {
+                    put_var(out, j as u64 + 1);
+                }
+                put_words(out, &base_words(&base[j]), &words(e));
+                extra(out, Some(&base[j]), e);
+            }
+            None => {
+                put_var(out, 0);
+                put_var(out, id(e));
+                put_words(out, &[0; N], &words(e));
+                extra(out, None, e);
+            }
+        }
+    }
+}
+
+/// La place, dans la liste d'avant, du joueur suivant de la liste lue (`put_list`) : `None`
+/// pour un nouveau.
+fn get_at(inp: &mut &[u8], same: bool, i: usize) -> Option<Option<usize>> {
+    if same {
+        return Some(Some(i));
+    }
+    let at = usize::try_from(get_var(inp)?).ok()?;
+    Some(at.checked_sub(1))
+}
+
+fn input_words(i: &NetInput) -> [u32; 6] {
+    [
+        i.yaw.to_bits(),
+        i.pitch.to_bits(),
+        u32::from(i.forward as u8),
+        u32::from(i.strafe as u8),
+        u32::from(i.jump)
+            | u32::from(i.jump_pressed) << 1
+            | u32::from(i.walk) << 2
+            | u32::from(i.duck) << 3,
+        u32::from(i.carry),
+    ]
+}
+
+/// (v337) Des pas d'entrées à la suite : le premier entier, chacun des suivants par
+/// différence avec celui d'avant (le regard, par les bits de ses flottants : exact).
+pub fn pack_inputs(inputs: &[NetInput]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + inputs.len() * 4);
+    put_var(&mut out, inputs.len() as u64);
+    let mut prev = [0u32; 6];
+    for i in inputs {
+        let w = input_words(i);
+        put_words(&mut out, &prev, &w);
+        prev = w;
+    }
+    out
+}
+
+pub fn unpack_inputs(data: &[u8]) -> Option<Vec<NetInput>> {
+    let mut inp = data;
+    let n = usize::try_from(get_var(&mut inp)?).ok()?;
+    if n > 4096 {
+        return None;
+    }
+    let mut v = Vec::with_capacity(n);
+    let mut prev = [0u32; 6];
+    for _ in 0..n {
+        let w = get_words(&mut inp, &prev)?;
+        if w[4] > 15 {
+            return None;
+        }
+        v.push(NetInput {
+            yaw: f32::from_bits(w[0]),
+            pitch: f32::from_bits(w[1]),
+            forward: u8::try_from(w[2]).ok()? as i8,
+            strafe: u8::try_from(w[3]).ok()? as i8,
+            jump: w[4] & 1 != 0,
+            jump_pressed: w[4] & 2 != 0,
+            walk: w[4] & 4 != 0,
+            duck: w[4] & 8 != 0,
+            carry: u8::try_from(w[5]).ok()?,
+        });
+        prev.copy_from_slice(&w);
+    }
+    inp.is_empty().then_some(v)
+}
+
+/// `base` sur le pas `tick` et `new` ensuite : la différence, ou rien si ce ne sont pas deux
+/// messages du même genre (positions, ou états complets).
+pub fn delta(base_tick: u32, base: &ToPeer, new: &ToPeer) -> Option<ToPeer> {
+    let mut out = Vec::new();
+    match (base, new) {
+        (
+            ToPeer::Moves {
+                tick: bt,
+                ack: ba,
+                you: by,
+                players: bp,
+            },
+            ToPeer::Moves {
+                tick,
+                ack,
+                you,
+                players,
+            },
+        ) => {
+            put_var(&mut out, u64::from(tick.wrapping_sub(*bt)));
+            put_var(&mut out, u64::from(zz(i64::from(*ack) - i64::from(*ba))));
+            put_words(&mut out, &sim_words(by), &sim_words(you));
+            let (ab, an) = (pose_anchor(by), pose_anchor(you));
+            put_list(
+                &mut out,
+                bp,
+                players,
+                |p| p.id,
+                |p| pose_words(p, ab),
+                |p| pose_words(p, an),
+                |_, _, _| {},
+            );
+            Some(ToPeer::MovesDelta {
+                base: base_tick,
+                data: out,
+            })
+        }
+        (
+            ToPeer::Snapshot {
+                tick: bt,
+                ack: ba,
+                you: by,
+                hp: bh,
+                alive: bl,
+                players: bp,
+                hud: bhud,
+            },
+            ToPeer::Snapshot {
+                tick,
+                ack,
+                you,
+                hp,
+                alive,
+                players,
+                hud,
+            },
+        ) => {
+            put_var(&mut out, u64::from(tick.wrapping_sub(*bt)));
+            put_var(&mut out, u64::from(zz(i64::from(*ack) - i64::from(*ba))));
+            put_words(&mut out, &sim_words(by), &sim_words(you));
+            put_words(
+                &mut out,
+                &[u32::from(*bh), u32::from(*bl)],
+                &[u32::from(*hp), u32::from(*alive)],
+            );
+            put_list(
+                &mut out,
+                bp,
+                players,
+                |p| p.id,
+                player_words,
+                player_words,
+                |out, b, p| match b {
+                    Some(b) if b.pseudo == p.pseudo => out.push(0),
+                    _ => {
+                        out.push(1);
+                        put_str(out, &p.pseudo);
+                    }
+                },
+            );
+            put_bytes(&mut out, &encode(bhud), &encode(hud));
+            Some(ToPeer::SnapDelta {
+                base: base_tick,
+                data: out,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Le message entier, à partir de `base` (le message du pas `base` de la différence) ;
+/// rien si `d` n'en est pas une, ne va pas avec `base`, ou est abîmée.
+pub fn undelta(base: &ToPeer, d: &ToPeer) -> Option<ToPeer> {
+    match (base, d) {
+        (
+            ToPeer::Moves {
+                tick: bt,
+                ack: ba,
+                you: by,
+                players: bp,
+            },
+            ToPeer::MovesDelta { data, .. },
+        ) => {
+            let mut inp = &data[..];
+            let tick = bt.wrapping_add(u32::try_from(get_var(&mut inp)?).ok()?);
+            let ack = u32::try_from(i64::from(*ba) + unzz(u32::try_from(get_var(&mut inp)?).ok()?))
+                .ok()?;
+            let you = sim_from(&get_words(&mut inp, &sim_words(by))?)?;
+            let (ab, an) = (pose_anchor(by), pose_anchor(&you));
+            let head = get_var(&mut inp)?;
+            let (n, same) = (usize::try_from(head >> 1).ok()?, head & 1 == 1);
+            if same && n != bp.len() {
+                return None;
+            }
+            let mut players = Vec::with_capacity(n.min(256));
+            for i in 0..n {
+                let p = match get_at(&mut inp, same, i)? {
+                    None => {
+                        let id = get_var(&mut inp)?;
+                        pose_from(id, &get_words(&mut inp, &[0; 7])?, an)?
+                    }
+                    Some(j) => {
+                        let b = bp.get(j)?;
+                        pose_from(b.id, &get_words(&mut inp, &pose_words(b, ab))?, an)?
+                    }
+                };
+                players.push(p);
+            }
+            inp.is_empty().then_some(ToPeer::Moves {
+                tick,
+                ack,
+                you,
+                players,
+            })
+        }
+        (
+            ToPeer::Snapshot {
+                tick: bt,
+                ack: ba,
+                you: by,
+                hp: bh,
+                alive: bl,
+                players: bp,
+                hud: bhud,
+            },
+            ToPeer::SnapDelta { data, .. },
+        ) => {
+            let mut inp = &data[..];
+            let tick = bt.wrapping_add(u32::try_from(get_var(&mut inp)?).ok()?);
+            let ack = u32::try_from(i64::from(*ba) + unzz(u32::try_from(get_var(&mut inp)?).ok()?))
+                .ok()?;
+            let you = sim_from(&get_words(&mut inp, &sim_words(by))?)?;
+            let vitals = get_words(&mut inp, &[u32::from(*bh), u32::from(*bl)])?;
+            let head = get_var(&mut inp)?;
+            let (n, same) = (usize::try_from(head >> 1).ok()?, head & 1 == 1);
+            if same && n != bp.len() {
+                return None;
+            }
+            let mut players = Vec::with_capacity(n.min(256));
+            for i in 0..n {
+                let (id, base_words, base_pseudo) = match get_at(&mut inp, same, i)? {
+                    None => (get_var(&mut inp)?, [0u32; 14], None),
+                    Some(j) => {
+                        let b = bp.get(j)?;
+                        (b.id, player_words(b), Some(&b.pseudo))
+                    }
+                };
+                let w = get_words(&mut inp, &base_words)?;
+                let (&changed, rest) = inp.split_first()?;
+                inp = rest;
+                let pseudo = match (changed, base_pseudo) {
+                    (0, Some(p)) => p.clone(),
+                    (1, _) => get_str(&mut inp)?,
+                    _ => return None,
+                };
+                players.push(player_from(id, pseudo, &w)?);
+            }
+            let hud = decode::<MatchHud>(&get_bytes(&mut inp, &encode(bhud))?)?;
+            inp.is_empty().then_some(ToPeer::Snapshot {
+                tick,
+                ack,
+                you,
+                hp: u8::try_from(vitals[0]).ok()?,
+                alive: vitals[1] != 0,
+                players,
+                hud,
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1212,6 +1794,240 @@ mod tests {
         eprintln!("10 joueurs : positions {m} octets, état complet {sn} octets");
         assert!(m <= 170, "positions : {m} octets (249 avant la v334)");
         assert!(sn <= 345, "état complet : {sn} octets");
+    }
+
+    /// (v337) Différences sur le chemin du relais : sur une partie simulée à 10 où tout le
+    /// monde court et tourne sans arrêt (le pire cas), au palier de 64 mises à jour par
+    /// seconde (un état complet tous les 16 pas, des positions tous les 4), chaque message
+    /// refait à partir de la différence est exactement celui qui serait parti entier, même
+    /// quand des joueurs disparaissent de la vue et reviennent, changent de pseudo, d'arme ou
+    /// meurent. Et ce que ça pèse, par joueur et par seconde, en-têtes du relais compris.
+    #[test]
+    fn differences_rebuild_the_exact_message_and_are_small() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f32 / (1u64 << 53) as f32
+        };
+        // 10 joueurs (0 : celui qui reçoit), loin du centre du monde.
+        let mut pos: Vec<[f32; 3]> = (0..10)
+            .map(|i| [1234.5 + i as f32 * 4.0, 70.0, -987.25 - i as f32 * 3.0])
+            .collect();
+        let mut dir: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let mut yaw: Vec<f32> = (0..10).map(|i| i as f32 * 0.6).collect();
+        let mut pitch = [0.05f32; 10];
+        let mut hp = [100u8; 10];
+        let mut kills = [0u16; 10];
+        let dt = 1.0 / 256.0;
+        let (mut full, mut sent) = (0usize, 0usize);
+        let (mut msgs, mut moves_n, mut snaps_n) = (0usize, 0usize, 0usize);
+        let mut bases: [Option<(u32, ToPeer)>; 2] = [None, None];
+        let wire = |m: &ToPeer| decode::<ToPeer>(&encode(m)).unwrap();
+        for tick in 0u32..256 * 8 {
+            // Tout le monde court (6,5 blocs par seconde), change de direction, tourne la tête
+            // (jusqu'à un demi-tour par seconde, et des coups de souris), saute parfois.
+            for i in 0..10 {
+                dir[i] += (rnd() - 0.5) * 0.2;
+                pos[i][0] += dir[i].cos() * 6.5 * dt;
+                pos[i][2] += dir[i].sin() * 6.5 * dt;
+                pos[i][1] = 70.0 + ((tick as f32 + i as f32 * 37.0) * dt * 3.0).sin().max(0.0);
+                yaw[i] += (rnd() - 0.5) * 0.05 + if rnd() < 0.002 { 1.5 } else { 0.0 };
+                pitch[i] = (pitch[i] + (rnd() - 0.5) * 0.01).clamp(-1.5, 1.5);
+                if rnd() < 0.001 {
+                    hp[i] = hp[i].saturating_sub(27);
+                }
+                if rnd() < 0.0005 {
+                    kills[i] += 1;
+                }
+            }
+            if tick % 4 != 0 {
+                continue;
+            }
+            let you = SimState {
+                pos: pos[0],
+                vel: [dir[0].cos() * 6.5, 0.0, dir[0].sin() * 6.5],
+                on_ground: tick % 300 > 20,
+                crouch: 0.0,
+                stamina: 1.0 - (tick % 512) as f32 / 1024.0,
+                duck_speed: 8.0,
+                jump_buffer: 0.0,
+                sneak_held: false,
+                carry: 250,
+            };
+            // Les joueurs 7 et 8 sortent de la vue un moment, puis reviennent.
+            let seen: Vec<usize> = (1..10)
+                .filter(|&i| !(i >= 7 && (tick / 256) % 3 == 1))
+                .collect();
+            let player = |i: usize| NetPlayer {
+                id: 40 + i as u64,
+                pseudo: if tick < 64 {
+                    format!("Joueur{i}")
+                } else {
+                    String::new()
+                },
+                pos: pos[i],
+                yaw: yaw[i],
+                pitch: pitch[i],
+                crouch: if (tick / 128 + i as u32).is_multiple_of(5) {
+                    1.0
+                } else {
+                    0.0
+                },
+                speed: 6.5,
+                hp: hp[i],
+                alive: hp[i] > 0,
+                weapon: if (tick / 512 + i as u32).is_multiple_of(2) {
+                    3
+                } else {
+                    7
+                },
+                kills: kills[i],
+                deaths: 0,
+                team: (i % 2) as u8,
+                flags: 0,
+            };
+            let msg = if tick % 16 == 0 {
+                ToPeer::Snapshot {
+                    tick: 100_000 + tick,
+                    ack: 99_000 + tick / 2,
+                    you,
+                    hp: hp[0],
+                    alive: true,
+                    players: seen.iter().map(|&i| player(i)).collect(),
+                    hud: MatchHud {
+                        money: 4200 + tick / 64,
+                        time: 115.0 - tick as f32 * dt,
+                        round: 7,
+                        ..Default::default()
+                    },
+                }
+            } else {
+                ToPeer::Moves {
+                    tick: 100_000 + tick,
+                    ack: 99_000 + tick / 2,
+                    you,
+                    players: seen
+                        .iter()
+                        .map(|&i| Pose::of(&player(i), you.pos))
+                        .collect(),
+                }
+            };
+            let k = usize::from(matches!(msg, ToPeer::Snapshot { .. }));
+            let whole = encode(&msg).len();
+            let back = match &bases[k] {
+                Some((bt, b)) => {
+                    let d = delta(*bt, b, &msg).expect("même genre");
+                    let wire_d = encode(&d);
+                    let got = undelta(b, &decode::<ToPeer>(&wire_d).unwrap()).expect("refait");
+                    assert_eq!(encode(&got), encode(&msg), "pas {tick}");
+                    full += whole;
+                    sent += wire_d.len();
+                    msgs += 1;
+                    if k == 0 {
+                        moves_n += 1;
+                    } else {
+                        snaps_n += 1;
+                    }
+                    got
+                }
+                None => wire(&msg),
+            };
+            bases[k] = Some((100_000 + tick, back));
+        }
+        // Une différence abîmée, ou appliquée au mauvais message : rien.
+        let (bt, b) = bases[0].clone().unwrap();
+        let (_, s) = bases[1].clone().unwrap();
+        if let Some(ToPeer::MovesDelta { base, mut data }) = delta(bt, &b, &b) {
+            assert!(undelta(
+                &s,
+                &ToPeer::MovesDelta {
+                    base,
+                    data: data.clone()
+                }
+            )
+            .is_none());
+            data.push(7);
+            assert!(undelta(&b, &ToPeer::MovesDelta { base, data }).is_none());
+        }
+        // Par seconde, au palier de 64 : 48 positions et 16 états complets, chacun avec
+        // l'en-tête du relais (trame, chiffrement, demande : 25 octets).
+        let per = |n: usize, total: usize| total as f32 / n as f32;
+        let avg_sent = per(msgs, sent);
+        let avg_full = per(msgs, full);
+        let rate = 64.0 * (avg_sent + 25.0) / 1024.0;
+        eprintln!(
+            "DIFFÉRENCES : {moves_n} positions et {snaps_n} états, {avg_sent:.0} octets en \
+             moyenne au lieu de {avg_full:.0} ; à 64 par seconde, {rate:.1} Ko/s par joueur \
+             ({:.1} avant), {:.0} Ko/s pour 9",
+            64.0 * (avg_full + 25.0) / 1024.0,
+            rate * 9.0
+        );
+        assert!(avg_sent < avg_full * 0.55, "{avg_sent} pour {avg_full}");
+    }
+
+    impl NetInput {
+        /// Ce pas, avec le regard de `self` (essais).
+        fn clone_with(&self, other: &NetInput) -> NetInput {
+            NetInput {
+                yaw: self.yaw,
+                pitch: self.pitch,
+                ..*other
+            }
+        }
+    }
+
+    /// (v337) Entrées serrées : exactement les mêmes une fois défaites, et bien plus courtes
+    /// (16 pas d'un joueur qui court en tournant la tête).
+    #[test]
+    fn packed_inputs_are_exact_and_short() {
+        let mut yaw = 1.234f32;
+        let inputs: Vec<NetInput> = (0..16)
+            .map(|k| {
+                yaw += 0.0071 * (k as f32 * 0.3).sin();
+                NetInput {
+                    forward: 1,
+                    strafe: if k < 8 { -1 } else { 1 },
+                    jump: k == 9,
+                    jump_pressed: k == 9,
+                    walk: false,
+                    duck: false,
+                    yaw,
+                    pitch: -0.12 + k as f32 * 0.0004,
+                    carry: 230,
+                }
+            })
+            .collect();
+        let packed = pack_inputs(&inputs);
+        assert_eq!(unpack_inputs(&packed), Some(inputs.clone()));
+        let whole = encode(&inputs).len();
+        // Le regard change à chaque pas (le pire cas) ; d'habitude il change à chaque image
+        // (4 pas à 64 images par seconde) : les pas d'une même image ne coûtent qu'un octet.
+        let held: Vec<NetInput> = inputs
+            .iter()
+            .enumerate()
+            .map(|(k, i)| inputs[k - k % 4].clone_with(i))
+            .collect();
+        let packed_held = pack_inputs(&held);
+        assert_eq!(unpack_inputs(&packed_held), Some(held));
+        eprintln!(
+            "ENTRÉES : 16 pas, {} octets serrés au lieu de {whole} ; regard par image : {}",
+            packed.len(),
+            packed_held.len()
+        );
+        assert!(
+            packed.len() * 10 < whole * 6,
+            "{} pour {whole}",
+            packed.len()
+        );
+        assert!(
+            packed_held.len() * 4 < whole,
+            "{} pour {whole}",
+            packed_held.len()
+        );
+        assert!(unpack_inputs(&packed[..packed.len() - 1]).is_none());
+        assert_eq!(unpack_inputs(&pack_inputs(&[])), Some(Vec::new()));
     }
 
     #[test]

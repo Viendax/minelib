@@ -972,9 +972,38 @@ mod tests {
                     }
                     let mut who = vec![0u8; head[4] as usize];
                     let _ = s.read_exact(&mut who);
+                    // (v337) `MINELIB_ESSAI_SENS=retour` : à chaque petite demande (5 octets),
+                    // une réponse de `MINELIB_ESSAI_OCTETS` (l'hôte envoie beaucoup, reçoit
+                    // peu : le relais du monde tenu par le jeu de l'hôte). Sinon, l'écho.
+                    let back = std::env::var("MINELIB_ESSAI_SENS").is_ok_and(|v| v == "retour");
+                    let size: usize = std::env::var("MINELIB_ESSAI_OCTETS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(5)
+                        .clamp(5, 1200);
+                    // Taille des demandes en sens « retour » (`MINELIB_ESSAI_DEMANDE`, 5 sans
+                    // la variable) : les entrées des joueurs vers l'hôte.
+                    let ask: usize = std::env::var("MINELIB_ESSAI_DEMANDE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(5)
+                        .clamp(5, 1200);
                     let mut b = [0u8; 5];
+                    // (Le premier, « debut », revient tel quel.)
+                    let mut first = true;
+                    let mut rest = vec![0u8; ask - 5];
                     while s.read_exact(&mut b).is_ok() {
-                        if s.write_all(&b).is_err() {
+                        let ok = if back && size > 5 && !std::mem::take(&mut first) {
+                            if s.read_exact(&mut rest).is_err() {
+                                break;
+                            }
+                            let mut m = vec![0u8; size];
+                            m[..5].copy_from_slice(&b);
+                            s.write_all(&m)
+                        } else {
+                            s.write_all(&b)
+                        };
+                        if ok.is_err() {
                             break;
                         }
                     }
@@ -1650,8 +1679,12 @@ mod tests {
                 .clamp(lo, hi)
         };
         let players = env("MINELIB_ESSAI_JOUEURS", 1, 1, 4);
-        let rate = env("MINELIB_ESSAI_PAR_S", 256, 16, 512) as u32;
+        let rate = env("MINELIB_ESSAI_PAR_S", 256, 16, 2048) as u32;
         let size = env("MINELIB_ESSAI_OCTETS", 5, 5, 1200);
+        // (v337) Sens « retour » : le joueur envoie 5 octets, l'hôte répond `size`.
+        let back = std::env::var("MINELIB_ESSAI_SENS").is_ok_and(|v| v == "retour");
+        let ask = env("MINELIB_ESSAI_DEMANDE", 5, 5, 1200);
+        let (up, down) = if back { (ask, size) } else { (size, size) };
         let host = Node::start_private().unwrap();
         host.serve(echo());
         std::thread::sleep(Duration::from_secs(4));
@@ -1677,7 +1710,7 @@ mod tests {
                     let reader = std::thread::spawn(move || {
                         // Chaque message porte son numéro : son temps d'aller-retour.
                         let mut times = Vec::with_capacity(n_msgs as usize);
-                        let mut b = vec![0u8; size];
+                        let mut b = vec![0u8; down];
                         for _ in 0..n_msgs {
                             if back.read_exact(&mut b).is_err() {
                                 break;
@@ -1693,7 +1726,7 @@ mod tests {
                         if let Some(wait) = due.checked_sub(started.elapsed()) {
                             std::thread::sleep(wait);
                         }
-                        let mut m = vec![0u8; size];
+                        let mut m = vec![0u8; up];
                         m[..4].copy_from_slice(&n.to_le_bytes());
                         if c.write_all(&m).is_err() {
                             break;
@@ -1716,7 +1749,7 @@ mod tests {
         times.sort();
         let at = |q: f64| times.get(((got as f64 - 1.0) * q) as usize).copied().unwrap_or_default();
         eprintln!(
-            "RESEAU {rate}/s de {size} o : {players} joueur(s), {} messages envoyés, {got} revenus, \
+            "RESEAU {rate}/s, {up} o vers l'hôte, {down} o en retour : {players} joueur(s), {} messages envoyés, {got} revenus, \
              en {longest:?} au plus ; aller-retour médian {:?}, 95 % sous {:?}, pire {:?}",
             n_msgs as usize * players,
             at(0.5),
