@@ -38,12 +38,19 @@
 //! ses passeurs, ou seul quand il n'y a pas de passeurs. Aucun des deux ne voit l'adresse
 //! IP de l'autre ; le serveur TURN les voit toutes deux, comme un passeur seul, sans rien
 //! lire.
+//!
+//! (v331) **La voie rapide des parties FPS aussi** : chaque route d'un joueur reçoit, en
+//! plus de ses chaînes de passeurs, un chemin par TURN entre l'adresse relayée de son jeu
+//! et celle de l'hôte (`fps_turn`), qui ne sert que quand aucun passeur ne passe (ou qu'il
+//! est nettement plus rapide). Sans assez de passeurs, ce chemin est la voie rapide : avant,
+//! tout passait alors par ce relais, par deux liens qui passent eux-mêmes par TURN quand il
+//! n'y a rien d'autre (quatre passages par le serveur TURN au lieu de deux).
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::Instant;
 
-use minelib_net::proto::{FastHop, FastWay, Request, Response};
+use minelib_net::proto::{FastHop, FastTurn, FastWay, Request, Response};
 use std::net::SocketAddr;
 use minelib_net::transport;
 
@@ -171,6 +178,10 @@ struct Assign {
     picked: Vec<Vec<u64>>,
     bad: Vec<u64>,
     at: Instant,
+    /// (v331) Routes données avec un chemin par TURN : le joueur, et ce chemin vu de lui.
+    /// Sans passeur (`passeurs` vide), ce sont les seules routes de la partie : redonnées
+    /// telles quelles tant qu'elles ne changent pas.
+    turned: Vec<(u64, FastTurn)>,
 }
 
 /// Passeurs connus du relais et parties servies.
@@ -274,6 +285,19 @@ impl Fast {
             self.turns.len() + self.own_turns.len(),
             self.tunnels.values().filter(|t| t.turn.is_some()).count(),
         )
+    }
+
+    /// (v331) Joueurs de parties FPS dont la route a un chemin par TURN, et ceux de ces
+    /// parties qui n'ont que lui (pas assez de passeurs) : relevé de santé, essais.
+    pub(crate) fn fps_turns(&self) -> (usize, usize) {
+        let all = self.rooms.values().map(|a| a.turned.len()).sum();
+        let only = self
+            .rooms
+            .values()
+            .filter(|a| a.passeurs.is_empty())
+            .map(|a| a.turned.len())
+            .sum();
+        (all, only)
     }
 
     /// (v320) Un passeur vérifié s'est-il annoncé sur ce port (essais) ?
@@ -578,6 +602,7 @@ pub(crate) fn turn_at(st: &mut State, id: u64, node: [u8; 32], turn: Option<Sock
     if st.fast.turns.get(&key).copied() == turn {
         return;
     }
+    let before = conn_turns(st, id);
     match turn {
         Some(a) => {
             let mine = st.fast.turns.keys().filter(|(c, _)| *c == id).count();
@@ -600,7 +625,35 @@ pub(crate) fn turn_at(st: &mut State, id: u64, node: [u8; 32], turn: Option<Sock
     for r in routes {
         tunnel_assign(st, r);
     }
+    // (v331) Les parties FPS où joue cette connexion (ou qu'elle héberge) reçoivent leurs
+    // routes de nouveau : avec ou sans chemin par TURN.
+    if conn_turns(st, id) != before {
+        let rooms: Vec<u64> = st
+            .fast
+            .rooms
+            .iter()
+            .filter(|(_, a)| a.host == id || a.groups.iter().flatten().any(|p| *p == id))
+            .map(|(r, _)| *r)
+            .collect();
+        for rid in rooms {
+            assign(st, rid);
+        }
+    }
     announce(st);
+}
+
+/// (v331) Adresses relayées que dit cette connexion (celles des nœuds de son jeu), dans
+/// l'ordre de leurs nœuds.
+fn conn_turns(st: &State, id: u64) -> Vec<SocketAddrV4> {
+    let mut v: Vec<([u8; 32], SocketAddrV4)> = st
+        .fast
+        .turns
+        .iter()
+        .filter(|((c, _), _)| *c == id)
+        .map(|((_, n), a)| (*n, *a))
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, a)| a).collect()
 }
 
 /// (v329) Le saut TURN du tunnel `route`, s'il y en a un : les deux bouts ont chacun une
@@ -1346,6 +1399,7 @@ pub(crate) fn want(st: &mut State, id: u64, groups: Vec<Vec<u64>>) {
             picked: Vec::new(),
             bad,
             at: Instant::now(),
+            turned: Vec::new(),
         },
     );
     assign(st, rid);
@@ -1437,8 +1491,57 @@ fn assign(st: &mut State, rid: u64) {
         bad.clear();
     };
     if per == 0 {
+        // (v331) Pas assez de passeurs : la voie rapide passe par TURN, de l'hôte à chaque
+        // joueur qui y a, comme lui, une adresse relayée (les autres passent par le relais).
+        // Rien ne change : rien n'est redit (la voie n'est pas interrompue).
+        let turned: Vec<(u64, (FastTurn, FastTurn))> = groups
+            .iter()
+            .flatten()
+            .filter_map(|&p| Some((p, fps_turn(st, p, old.host)?)))
+            .collect();
+        let mine: Vec<(u64, FastTurn)> = turned.iter().map(|(p, (g, _))| (*p, *g)).collect();
+        let same = old.passeurs.is_empty() && old.groups == groups && old.turned == mine;
+        if same && !mine.is_empty() {
+            st.fast.rooms.insert(rid, Assign { bad, ..old });
+            return;
+        }
+        if turned.is_empty() {
+            close(st, &old.groups, old.host);
+        } else {
+            let mut ways = Vec::new();
+            for p in groups.iter().flatten() {
+                let (route, key): (u64, [u8; 32]) = (rand::random(), rand::random());
+                let t = turned.iter().find(|(q, _)| q == p).map(|(_, t)| *t);
+                if let Some(c) = st.conns.get(p) {
+                    transport::push(
+                        &c.tx,
+                        &Response::FastGuest {
+                            route,
+                            key,
+                            passeurs: Vec::new(),
+                            turn: t.map(|t| t.0),
+                        },
+                    );
+                }
+                if let Some((_, h)) = t {
+                    ways.push(FastWay {
+                        peer: *p,
+                        route,
+                        key,
+                        passeurs: Vec::new(),
+                        turn: Some(h),
+                    });
+                }
+            }
+            if let Some(c) = st.conns.get(&old.host) {
+                transport::push(&c.tx, &Response::FastHost { ways });
+            }
+            log::info!(
+                "voie rapide : partie {rid}, pas assez de passeurs, {} joueur(s) par TURN",
+                turned.len()
+            );
+        }
         // La demande est gardée : dès qu'un passeur de plus est vérifié, on réessaie.
-        close(st, &old.groups, old.host);
         st.fast.rooms.insert(
             rid,
             Assign {
@@ -1449,6 +1552,7 @@ fn assign(st: &mut State, rid: u64) {
                 picked: Vec::new(),
                 bad,
                 at: Instant::now(),
+                turned: mine,
             },
         );
         return;
@@ -1462,6 +1566,7 @@ fn assign(st: &mut State, rid: u64) {
     let mut load: HashMap<u64, usize> = HashMap::new();
     let mut ways: Vec<FastWay> = Vec::new();
     let mut guests: Vec<(u64, Response)> = Vec::new();
+    let mut turned: Vec<(u64, FastTurn)> = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
         let mine = &picked[gi * per * 2..(gi + 1) * per * 2];
         for &peer in g {
@@ -1496,12 +1601,18 @@ fn assign(st: &mut State, rid: u64) {
                 to_guest.push(hop(first.1));
                 to_host.push(hop(second.1));
             }
+            // (v331) Et un chemin par TURN, de secours (ou plus rapide que les passeurs).
+            let turn = fps_turn(st, peer, old.host);
+            if let Some((g, _)) = turn {
+                turned.push((peer, g));
+            }
             guests.push((
                 peer,
                 Response::FastGuest {
                     route,
                     key,
                     passeurs: to_guest,
+                    turn: turn.map(|t| t.0),
                 },
             ));
             ways.push(FastWay {
@@ -1509,6 +1620,7 @@ fn assign(st: &mut State, rid: u64) {
                 route,
                 key,
                 passeurs: to_host,
+                turn: turn.map(|t| t.1),
             });
         }
     }
@@ -1521,8 +1633,10 @@ fn assign(st: &mut State, rid: u64) {
         transport::push(&c.tx, &Response::FastHost { ways });
     }
     log::info!(
-        "voie rapide : partie {rid}, {} équipe(s), {per} chaîne(s) de deux passeurs par équipe",
-        groups.len()
+        "voie rapide : partie {rid}, {} équipe(s), {per} chaîne(s) de deux passeurs par équipe, \
+         {} joueur(s) avec un chemin par TURN",
+        groups.len(),
+        turned.len()
     );
     st.fast.rooms.insert(
         rid,
@@ -1541,8 +1655,31 @@ fn assign(st: &mut State, rid: u64) {
                 .collect(),
             bad,
             at: Instant::now(),
+            turned,
         },
     );
+}
+
+/// (v331) Le chemin par TURN entre le joueur `guest` et l'hôte `host` d'une partie FPS :
+/// une adresse relayée de chacun (celles que leurs connexions disent, `TurnAt` : celles
+/// des nœuds de leur jeu), deux différentes. Ce qui va au joueur (la sienne d'abord), et ce
+/// qui va à l'hôte.
+fn fps_turn(st: &State, guest: u64, host: u64) -> Option<(FastTurn, FastTurn)> {
+    let (gs, hs) = (conn_turns(st, guest), conn_turns(st, host));
+    let (g, h) = gs
+        .iter()
+        .find_map(|g| hs.iter().find(|h| *h != g).map(|h| (*g, *h)))?;
+    let v4 = |a: SocketAddrV4| (a.ip().octets(), a.port());
+    Some((
+        FastTurn {
+            mine: v4(g),
+            peer: v4(h),
+        },
+        FastTurn {
+            mine: v4(h),
+            peer: v4(g),
+        },
+    ))
 }
 
 /// Passeurs retenus pour une partie, les meilleurs d'abord, et combien chaque équipe en
@@ -1621,6 +1758,7 @@ fn close(st: &State, groups: &[Vec<u64>], host: u64) {
                     route: 0,
                     key: [0; 32],
                     passeurs: Vec::new(),
+                    turn: None,
                 },
             );
         }
@@ -1675,6 +1813,147 @@ mod tests {
     }
 
     type Link = std::sync::mpsc::Sender<transport::Inbound>;
+
+    /// (v331) Les essais qui donnent des adresses relayées aux nœuds de ce programme : un
+    /// à la fois (les jeux d'essai disent au relais celles de tous les nœuds du programme).
+    static TURN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// (v331) Sans passeur, une partie FPS a quand même sa voie rapide : par TURN, de l'hôte
+    /// au joueur et retour, sans passer par le relais, et sans que l'un voie l'adresse de
+    /// l'autre. Deux passeurs arrivent : la route passe par eux, TURN reste en secours.
+    #[test]
+    fn without_passeurs_a_fps_game_gets_its_fast_way_through_turn() {
+        let _turn = TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = minelib_p2p::turn::essai::MiniTurn::start(rt.handle());
+        // Deux nœuds de ce programme ont une adresse relayée : les jeux d'essai (eux aussi
+        // dans ce programme) les disent au relais.
+        let nodes: Vec<minelib_p2p::Node> = (0..2)
+            .map(|_| {
+                let n = minelib_p2p::Node::start_offline().unwrap();
+                n.passeurs().start_turn(vec![server.source()]);
+                n
+            })
+            .collect();
+        until(|| nodes.iter().all(|n| n.passeurs().turn_addr().is_some()));
+        let dir = std::env::temp_dir().join(format!("minelib-fpsturn-{}", rand::random::<u32>()));
+        {
+            let mut st = stats::Store::open(dir.join("stats")).unwrap();
+            for g in ["PasT1", "PasT2"] {
+                st.get_mut(g).games = 5;
+                st.save(g);
+            }
+        }
+        crate::ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir,
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let host = login("HoteT");
+        host.send(Cmd::Search {
+            map_sig: [6; 32],
+            map: "carte".into(),
+            players: 10,
+        });
+        wait(&host, |e| matches!(e, Event::Hosted(_)));
+        let a = login("AliceT");
+        a.send(Cmd::Search {
+            map_sig: [6; 32],
+            map: "carte".into(),
+            players: 10,
+        });
+        wait(&a, |e| matches!(e, Event::Joined { .. }));
+        let a_id = match wait(&host, |e| matches!(e, Event::PeerJoined { .. })) {
+            Event::PeerJoined { peer, .. } => peer,
+            _ => unreachable!(),
+        };
+        until(|| {
+            let st = h.state.lock().unwrap();
+            st.rooms
+                .values()
+                .find(|r| r.kind == 0 && r.members.contains(&a_id))
+                .is_some_and(|r| {
+                    conn_turns(&st, r.host).len() >= 2 && conn_turns(&st, a_id).len() >= 2
+                })
+        });
+        host.send(Cmd::FastWant(vec![vec![a_id]]));
+        let eh = fast(&host).expect("voie rapide de l'hôte");
+        let ea = fast(&a).expect("voie rapide du joueur");
+        assert!(
+            eh.vias(a_id).is_empty() && ea.vias(0).is_empty(),
+            "aucun passeur"
+        );
+        let relayed: Vec<std::net::SocketAddr> = nodes
+            .iter()
+            .map(|n| std::net::SocketAddr::V4(n.passeurs().turn_addr().unwrap()))
+            .collect();
+        let (to_a, to_h) = (eh.turn_peer(a_id).unwrap(), ea.turn_peer(0).unwrap());
+        assert!(relayed.contains(&to_a) && relayed.contains(&to_h) && to_a != to_h);
+        assert_eq!(h.state.lock().unwrap().fast.fps_turns(), (1, 1));
+        until(|| {
+            ea.send_all(0, b"ouvre");
+            eh.open(a_id) && ea.open(0)
+        });
+        while a.poll().is_some() {}
+        while host.poll().is_some() {}
+        for i in 0..100u8 {
+            assert!(eh.send_one(a_id, &[0xEE, i]));
+            assert!(ea.send_all(0, &[0xDD, i]));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut got = (0, 0);
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) && got != (100, 100) {
+            while let Some(e) = a.poll() {
+                if matches!(&e, Event::FromHost(d) if d.first() == Some(&0xEE)) {
+                    got.0 += 1;
+                }
+            }
+            while let Some(e) = host.poll() {
+                if matches!(&e, Event::FromPeer { peer, data } if *peer == a_id && data.first() == Some(&0xDD))
+                {
+                    got.1 += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(got, (100, 100), "par TURN : (vers le joueur, vers l'hôte)");
+        // Deux passeurs : la route passe par eux (une chaîne), TURN reste en secours.
+        let ps: Vec<Client> = ["PasT1", "PasT2"]
+            .iter()
+            .map(|p| {
+                let c = login(p);
+                c.send(Cmd::Passeur(true));
+                c
+            })
+            .collect();
+        until(|| h.state.lock().unwrap().fast.verified() == 2);
+        let eh = fast(&host).expect("voie rapide de l'hôte");
+        let ea = fast(&a).expect("voie rapide du joueur");
+        assert_eq!((eh.vias(a_id).len(), ea.vias(0).len()), (1, 1));
+        assert!(eh.turn_peer(a_id).is_some() && ea.turn_peer(0).is_some());
+        assert_eq!(h.state.lock().unwrap().fast.fps_turns(), (1, 0));
+        until(|| eh.stats(a_id).is_some_and(|s| s.heard == 3));
+        assert!(!eh.on_turn(a_id), "les passeurs d'abord");
+        drop(ps);
+    }
 
     /// Un relais d'essai, de quoi y entrer, et un petit relais TCP qui renvoie ce qu'il
     /// reçoit (après le préambule du tunnel).
@@ -2017,6 +2296,7 @@ mod tests {
     /// reprise.
     #[test]
     fn without_passeurs_a_tunnel_goes_through_a_turn_server() {
+        let _turn = TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -2392,6 +2672,8 @@ mod tests {
     /// fermer la voie rapide.
     #[test]
     fn a_passeur_reported_by_the_host_is_replaced() {
+        // (v331) Pas pendant qu'un essai donne des adresses relayées aux nœuds du programme.
+        let _turn = TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("minelib-passeurs-{}", rand::random::<u32>()));
         {
             let mut st = stats::Store::open(dir.join("stats")).unwrap();
@@ -2499,6 +2781,8 @@ mod tests {
     /// changé) n'est plus retenu : sa partie reçoit une autre attribution, sans lui.
     #[test]
     fn a_passeur_that_stops_answering_is_dropped() {
+        // (v331) Pas pendant qu'un essai donne des adresses relayées aux nœuds du programme.
+        let _turn = TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("minelib-passeurs-{}", rand::random::<u32>()));
         {
             let mut st = stats::Store::open(dir.join("stats")).unwrap();
@@ -2594,6 +2878,8 @@ mod tests {
     /// et quand il n'en reste qu'un, la voie est fermée pour tout le monde.
     #[test]
     fn two_passeurs_per_team_then_fewer_then_none() {
+        // (v331) Pas pendant qu'un essai donne des adresses relayées aux nœuds du programme.
+        let _turn = TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("minelib-passeurs-{}", rand::random::<u32>()));
         {
             let mut st = stats::Store::open(dir.join("stats")).unwrap();

@@ -49,8 +49,14 @@
 //! | 26..   | charge scellée de bout en bout (ChaCha20-Poly1305, l'en-tête authentifié) |
 //!
 //! La charge commence par un octet : par quels passeurs celui qui écrit vient de recevoir
-//! (bits 0 et 1), `FLAG_SLOW` s'il reçoit plus vite par le relais, et `FLAG_KEEP` pour un
+//! (bits 0 et 1 ; (v331) bits 0 à 2 avec le chemin par TURN, qui vient après les
+//! passeurs), `FLAG_SLOW` s'il reçoit plus vite par le relais, et `FLAG_KEEP` pour un
 //! paquet d'entretien sans message.
+//!
+//! (v331) Une route peut aussi avoir un **chemin par TURN** : l'hôte et le joueur s'écrivent
+//! par leurs adresses relayées chez un serveur TURN (voir `TurnLink`), sans relais au milieu
+//! ni passeur. Il ne sert que quand aucun passeur ne passe, ou qu'il est nettement plus
+//! rapide qu'eux : c'est le seul chemin qui coûte (quota mensuel du serveur).
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
@@ -95,6 +101,17 @@ const PING_EVERY: Duration = Duration::from_millis(500);
 const PREFER_MS: f32 = 4.0;
 /// Un passeur par lequel rien n'est arrivé depuis ce temps ne compte plus.
 const FRESH: Duration = Duration::from_millis(300);
+/// (v331) Le chemin par TURN, quand il ne sert pas, n'est entretenu que par les mesures
+/// d'aller-retour (une toutes les `PING_EVERY`, pas de paquet d'entretien toutes les
+/// `KEEP` : chacun compte dans le quota) : il ne compte plus après deux mesures perdues.
+const FRESH_TURN: Duration = Duration::from_millis(1200);
+/// (v331) Le chemin par TURN est pris quand il est plus rapide que le meilleur passeur de
+/// la route d'au moins cet écart d'aller-retour (ms) ; sinon seulement quand aucun passeur
+/// ne passe.
+const TURN_PREFER_MS: f32 = 25.0;
+/// (v331) Bits de l'octet de tête qui disent par quels chemins on reçoit : les passeurs
+/// (`VIAS` au plus), puis le chemin par TURN.
+const HEARD: u8 = (1 << (VIAS + 1)) - 1;
 /// Sans rien d'autre à envoyer par un passeur, un paquet d'entretien tous les…
 const KEEP: Duration = Duration::from_millis(100);
 /// Paquets par seconde qu'un passeur accepte pour une route (256 positions et quelques
@@ -392,6 +409,64 @@ pub type TurnAddrList = Vec<([u8; 32], Option<SocketAddrV4>)>;
 pub fn turn_addrs(seen: u64) -> Option<(u64, TurnAddrList)> {
     let t = TURN_ADDRS.lock().unwrap();
     (t.version != seen && t.version > 0).then(|| (t.version, t.nodes.clone()))
+}
+
+// ─────────────────── (v331) Voie rapide des parties FPS par TURN ───────────────────
+//
+// Sans assez de passeurs, tout passait par le relais : l'hôte vers le relais, le relais
+// vers le joueur, deux liens qui passent chacun par TURN quand il n'y a rien d'autre,
+// soit quatre passages par le serveur TURN pour chaque paquet (deux allocations par
+// lien). L'hôte et chaque joueur ont déjà une adresse relayée chez lui (celle de leur
+// nœud iroh) : le relais leur donne celle de l'autre (`Way::turn`), et la route a un
+// chemin par TURN de l'un à l'autre, sans relais au milieu : deux passages, et moins de
+// délai. Aucun des deux ne voit l'adresse IP de l'autre.
+//
+// Ce chemin ne sert que quand aucun passeur de la route ne passe, ou qu'il est nettement
+// plus rapide qu'eux (`TURN_PREFER_MS`) : chaque octet par TURN compte dans le quota du
+// mois, les passeurs ne coûtent rien.
+
+/// Un client TURN de ce programme (`minelib_p2p::turn`), vu de la voie rapide.
+pub trait TurnLink: Send + Sync {
+    /// Un paquet vers l'adresse relayée `to` (celle de l'autre bout), par notre allocation.
+    fn send(&self, to: SocketAddr, packet: &[u8]);
+}
+
+/// Le client TURN de ce programme dont l'adresse relayée est celle-ci.
+pub type TurnFind = fn(SocketAddrV4) -> Option<Arc<dyn TurnLink>>;
+
+static TURN_FIND: OnceLock<TurnFind> = OnceLock::new();
+
+/// Fourni une fois par le nœud iroh du jeu (ce module ne connaît pas son client TURN).
+pub fn set_turn_find(f: TurnFind) {
+    let _ = TURN_FIND.set(f);
+}
+
+/// Bouts de la voie rapide dont une route a un chemin par TURN : (route, sens des paquets
+/// qu'ils y reçoivent) → le bout. (Dans les essais, l'hôte et le joueur d'une même route
+/// vivent dans un même programme : c'est le sens qui les distingue.)
+type TurnEnds = Vec<((u64, u8), std::sync::Weak<EndInner>)>;
+static TURN_ENDS: Mutex<TurnEnds> = Mutex::new(Vec::new());
+
+/// Un paquet venu par un client TURN de ce programme, de l'adresse relayée `from` : vrai
+/// s'il était pour la voie rapide (il y est remis) ; sinon, à l'appelant de voir (les
+/// tunnels iroh ont les mêmes en-têtes, mais d'autres numéros de route).
+pub fn turn_received(from: SocketAddr, p: &[u8]) -> bool {
+    let Some(x) = parse(p) else {
+        return false;
+    };
+    let end = {
+        let ends = TURN_ENDS.lock().unwrap();
+        ends.iter()
+            .find(|(k, _)| *k == (x.route, x.dir))
+            .and_then(|(_, w)| w.upgrade())
+    };
+    match end {
+        Some(e) => {
+            e.on_packet(p, from, true);
+            true
+        }
+        None => false,
+    }
 }
 
 
@@ -908,14 +983,24 @@ pub struct Via {
     pub seal: [u8; 32],
 }
 
+/// (v331) Chemin par TURN d'une route : notre adresse relayée (le client TURN de ce
+/// programme qui envoie) et celle de l'autre bout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnPair {
+    pub mine: SocketAddrV4,
+    pub peer: SocketAddrV4,
+}
+
 /// Route vers `peer` (0 : l'hôte, pour un invité) : son numéro, la clé qui scelle de bout
-/// en bout, ses passeurs (dans le même ordre aux deux bouts).
+/// en bout, ses passeurs (dans le même ordre aux deux bouts), et (v331) son chemin par
+/// TURN, s'il y en a un.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Way {
     pub peer: u64,
     pub route: u64,
     pub key: [u8; 32],
     pub vias: Vec<Via>,
+    pub turn: Option<TurnPair>,
 }
 
 /// État d'une route, pour l'affichage et les essais.
@@ -927,7 +1012,8 @@ pub struct Stats {
     pub got: u64,
     /// Paquets arrivés en double ou rejoués, jetés.
     pub dup: u64,
-    /// Passeurs par lesquels l'autre bout dit recevoir en ce moment (bits 0 et 1).
+    /// Chemins par lesquels l'autre bout dit recevoir en ce moment (bits 0 et 1 : les
+    /// passeurs ; (v331) le chemin par TURN vient après eux).
     pub heard: u8,
 }
 
@@ -941,14 +1027,69 @@ struct LiveVia {
     ping: (u8, Option<Instant>),
     ping_wait: bool,
     rtt: Option<f32>,
+    /// (v331) Chemin par TURN (`addr` : l'adresse relayée de l'autre bout) : notre adresse
+    /// relayée, notre client TURN une fois trouvé, et la dernière fois qu'on l'a cherché.
+    turn: Option<SocketAddrV4>,
+    link: Option<std::sync::Weak<dyn TurnLink>>,
+    sought: Option<Instant>,
 }
 
-/// Un passeur d'une route, vu d'un bout : l'autre bout reçoit-il par lui, et le temps
-/// d'aller-retour par lui (ms), s'il a été mesuré.
+impl LiveVia {
+    fn new(addr: SocketAddr, seal: [u8; 32], turn: Option<SocketAddrV4>) -> Self {
+        LiveVia {
+            addr,
+            seal,
+            rx_at: None,
+            tx_at: None,
+            ping: (0, None),
+            ping_wait: false,
+            rtt: None,
+            turn,
+            link: None,
+            sought: None,
+        }
+    }
+
+    /// Reçu par ce chemin il y a peu. (v331) Le chemin par TURN, en secours, n'est
+    /// entretenu que par les mesures : on lui laisse `FRESH_TURN` ; quand il sert
+    /// (`busy`), il est entretenu comme un passeur, et compte de la même façon.
+    fn fresh(&self, now: Instant, busy: bool) -> bool {
+        let keep = if self.turn.is_some() && !busy {
+            FRESH_TURN
+        } else {
+            FRESH
+        };
+        self.rx_at.is_some_and(|t| now.duration_since(t) < keep)
+    }
+
+    /// (v331) Notre client TURN pour ce chemin (cherché au plus deux fois par seconde
+    /// quand il manque : allocation pas encore là, ou perdue).
+    fn turn_link(&mut self, now: Instant) -> Option<Arc<dyn TurnLink>> {
+        let mine = self.turn?;
+        if let Some(l) = self.link.as_ref().and_then(|w| w.upgrade()) {
+            return Some(l);
+        }
+        if self
+            .sought
+            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(500))
+        {
+            return None;
+        }
+        self.sought = Some(now);
+        let l = TURN_FIND.get()?(mine)?;
+        self.link = Some(Arc::downgrade(&l));
+        Some(l)
+    }
+}
+
+/// Un chemin d'une route, vu d'un bout : l'autre bout reçoit-il par lui, le temps
+/// d'aller-retour par lui (ms), s'il a été mesuré, et (v331) est-ce le chemin par TURN
+/// (sinon un passeur) ?
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PathInfo {
     pub open: bool,
     pub rtt_ms: Option<f32>,
+    pub turn: bool,
 }
 
 struct Live {
@@ -969,13 +1110,63 @@ struct Live {
 }
 
 impl Live {
-    /// Passeurs par lesquels on vient de recevoir (à dire à l'autre bout).
+    /// Chemins par lesquels on vient de recevoir (à dire à l'autre bout).
     fn mask(&self, now: Instant) -> u8 {
+        let busy = self.turn_now(self.open(now)).is_some_and(|(_, take)| take);
         self.vias
             .iter()
             .enumerate()
-            .filter(|(_, v)| v.rx_at.is_some_and(|t| now.duration_since(t) < FRESH))
+            .filter(|(_, v)| v.fresh(now, busy))
             .fold(0, |m, (i, _)| m | (1 << i))
+    }
+
+    /// (v331) Le chemin par TURN, s'il y en a un : son rang, et s'il faut le prendre en ce
+    /// moment (`open` : les chemins par lesquels l'autre bout reçoit) plutôt que les
+    /// passeurs : aucun passeur ne passe, ou il passe lui aussi et il est plus rapide que
+    /// le meilleur d'entre eux d'au moins `TURN_PREFER_MS`.
+    fn turn_now(&self, open: u8) -> Option<(usize, bool)> {
+        let t = self.vias.iter().position(|v| v.turn.is_some())?;
+        let passeurs = (0..self.vias.len()).filter(|&i| i != t && open & (1 << i) != 0);
+        let mut any = false;
+        let mut best: Option<f32> = None;
+        for i in passeurs {
+            any = true;
+            if let Some(ms) = self.vias[i].rtt {
+                best = Some(best.map_or(ms, |b: f32| b.min(ms)));
+            }
+        }
+        let faster = open & (1 << t) != 0
+            && matches!(
+                (self.vias[t].rtt, best),
+                (Some(turn), Some(best)) if turn + TURN_PREFER_MS < best
+            );
+        Some((t, !any || faster))
+    }
+
+    /// Le chemin d'un message qui part par un seul (`send_one`) : parmi ceux par lesquels
+    /// l'autre bout reçoit. (v331) Le chemin par TURN quand il le faut (`turn_now`) ;
+    /// sinon les passeurs, en alternant, ou le nettement plus rapide.
+    fn pick(&mut self, open: u8) -> Option<usize> {
+        let n = self.vias.len();
+        let turn = self.turn_now(open);
+        if let Some((t, true)) = turn {
+            return (open & (1 << t) != 0).then_some(t);
+        }
+        let skip = turn.map(|(t, _)| t);
+        let ok = |i: usize| open & (1 << i) != 0 && Some(i) != skip;
+        let next = (1..=n).map(|k| (self.alt + k) % n).find(|&i| ok(i))?;
+        // Un passeur nettement plus rapide que les autres est pris à chaque fois ; sinon
+        // on alterne (deux chemins valent mieux qu'un quand l'un perd des paquets).
+        let fastest = (0..n)
+            .filter(|&i| ok(i))
+            .filter_map(|i| Some((i, self.vias[i].rtt?)))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let i = match (fastest, self.vias[next].rtt) {
+            (Some((best, ms)), Some(mine)) if mine > ms + PREFER_MS => best,
+            _ => next,
+        };
+        self.alt = i;
+        Some(i)
     }
 
     /// Passeurs par lesquels l'autre bout reçoit en ce moment.
@@ -1009,6 +1200,19 @@ impl Live {
             &self.vias[i].seal,
             &body,
         )
+    }
+
+    /// Un paquet par le chemin `i` : la socket de ce bout vers un passeur, ou (v331) notre
+    /// client TURN vers l'adresse relayée de l'autre bout.
+    fn out(&mut self, sock: &UdpSocket, i: usize, p: &[u8], now: Instant) {
+        let v = &mut self.vias[i];
+        if v.turn.is_some() {
+            if let Some(l) = v.turn_link(now) {
+                l.send(v.addr, p);
+            }
+            return;
+        }
+        let _ = sock.send_to(p, v.addr);
     }
 }
 
@@ -1067,7 +1271,7 @@ impl Endpoint {
                         break;
                     }
                     if let Some((n, from)) = read(&me.sock, &mut buf) {
-                        me.on_packet(&buf[..n], from);
+                        me.on_packet(&buf[..n], from, false);
                     }
                     me.keep();
                 }
@@ -1080,27 +1284,43 @@ impl Endpoint {
         let mut st = self.inner.st.lock().unwrap();
         st.ways.clear();
         st.by_route.clear();
+        // (v331) Les routes qui ont un chemin par TURN : ce qui en vient nous est remis
+        // par le client TURN du nœud iroh du jeu (`turn_received`).
+        let back = if self.inner.dir == TO_HOST {
+            TO_GUEST
+        } else {
+            TO_HOST
+        };
+        let me = Arc::downgrade(&self.inner);
+        let turned: Vec<u64> = ways
+            .iter()
+            .filter(|w| w.turn.is_some())
+            .map(|w| w.route)
+            .collect();
+        {
+            let mut ends = TURN_ENDS.lock().unwrap();
+            ends.retain(|(_, w)| w.strong_count() > 0 && !w.ptr_eq(&me));
+            ends.extend(turned.into_iter().map(|r| ((r, back), me.clone())));
+        }
         for w in ways {
             st.by_route.insert(w.route, w.peer);
+            let mut vias: Vec<LiveVia> = w
+                .vias
+                .iter()
+                .take(VIAS)
+                .map(|v| LiveVia::new(v.addr, v.seal, None))
+                .collect();
+            // (v331) Le chemin par TURN, après les passeurs (même rang aux deux bouts).
+            // Aucun passeur ne vérifie son sceau : la clé n'a pas d'importance.
+            if let Some(t) = w.turn {
+                vias.push(LiveVia::new(SocketAddr::V4(t.peer), [0; 32], Some(t.mine)));
+            }
             st.ways.insert(
                 w.peer,
                 Live {
                     route: w.route,
                     cipher: cipher(&w.key),
-                    vias: w
-                        .vias
-                        .iter()
-                        .take(VIAS)
-                        .map(|v| LiveVia {
-                            addr: v.addr,
-                            seal: v.seal,
-                            rx_at: None,
-                            tx_at: None,
-                            ping: (0, None),
-                            ping_wait: false,
-                            rtt: None,
-                        })
-                        .collect(),
+                    vias,
                     seq: 0,
                     win: Window::default(),
                     alt: 0,
@@ -1114,8 +1334,9 @@ impl Endpoint {
         }
     }
 
-    /// Le message part par tous les passeurs de la route (le premier arrivé compte). Faux
-    /// si rien n'est parti (aucune route, message trop long).
+    /// Le message part par tous les passeurs de la route (le premier arrivé compte), et
+    /// (v331) par le chemin par TURN quand aucun passeur ne passe ou qu'il est nettement
+    /// plus rapide. Faux si rien n'est parti (aucune route, message trop long).
     pub fn send_all(&self, peer: u64, msg: &[u8]) -> bool {
         if msg.len() > MAX_MSG {
             return false;
@@ -1128,18 +1349,24 @@ impl Endpoint {
         if l.vias.is_empty() {
             return false;
         }
+        let open = l.open(now);
+        let turn = l.turn_now(open);
         let seq = l.seq;
         l.seq += 1;
         for i in 0..l.vias.len() {
+            if turn.is_some_and(|(t, take)| t == i && !take) {
+                continue;
+            }
             let p = l.packet(self.inner.dir, i, seq, 0, msg, now);
-            let _ = self.inner.sock.send_to(&p, l.vias[i].addr);
+            l.out(&self.inner.sock, i, &p, now);
         }
         true
     }
 
     /// Le message part par un seul passeur, en alternant entre ceux par lesquels l'autre
-    /// bout reçoit. Faux si la voie est fermée, ou si l'autre bout reçoit plus vite par le
-    /// relais : à l'appelant de passer par le relais.
+    /// bout reçoit (v331 : ou par le chemin par TURN, voir `send_all`). Faux si la voie est
+    /// fermée, ou si l'autre bout reçoit plus vite par le relais : à l'appelant de passer
+    /// par le relais.
     pub fn send_one(&self, peer: u64, msg: &[u8]) -> bool {
         self.send_alt(peer, msg, false)
     }
@@ -1163,29 +1390,25 @@ impl Endpoint {
         if l.slow_in && !even_slow {
             return false;
         }
-        let n = l.vias.len();
-        let Some(next) = (1..=n)
-            .map(|k| (l.alt + k) % n)
-            .find(|i| open & (1 << i) != 0)
-        else {
+        let Some(i) = l.pick(open) else {
             return false;
         };
-        // Un passeur nettement plus rapide que les autres est pris à chaque fois ; sinon
-        // on alterne (deux chemins valent mieux qu'un quand l'un perd des paquets).
-        let fastest = (0..n)
-            .filter(|i| open & (1 << i) != 0)
-            .filter_map(|i| Some((i, l.vias[i].rtt?)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        let i = match (fastest, l.vias[next].rtt) {
-            (Some((best, ms)), Some(mine)) if mine > ms + PREFER_MS => best,
-            _ => next,
-        };
-        l.alt = i;
         let seq = l.seq;
         l.seq += 1;
         let p = l.packet(self.inner.dir, i, seq, 0, msg, now);
-        let _ = self.inner.sock.send_to(&p, l.vias[i].addr);
+        l.out(&self.inner.sock, i, &p, now);
         true
+    }
+
+    /// (v331) Les messages vers `peer` partent-ils en ce moment par le chemin par TURN ?
+    /// (Le jeu en redit moins dans chaque paquet : chaque octet compte dans le quota.)
+    pub fn on_turn(&self, peer: u64) -> bool {
+        let st = self.inner.st.lock().unwrap();
+        st.ways.get(&peer).is_some_and(|l| {
+            let open = l.open(Instant::now());
+            l.turn_now(open)
+                .is_some_and(|(t, take)| take && open & (1 << t) != 0)
+        })
     }
 
     /// La voie vers `peer` est ouverte : l'autre bout dit recevoir par au moins un passeur.
@@ -1220,7 +1443,8 @@ impl Endpoint {
         })
     }
 
-    /// État de chaque passeur de la route vers `peer`, dans l'ordre de l'attribution.
+    /// État de chaque chemin de la route vers `peer`, dans l'ordre de l'attribution : ses
+    /// passeurs, puis (v331) son chemin par TURN.
     pub fn paths(&self, peer: u64) -> Vec<PathInfo> {
         let st = self.inner.st.lock().unwrap();
         let Some(l) = st.ways.get(&peer) else {
@@ -1233,17 +1457,32 @@ impl Endpoint {
             .map(|(i, v)| PathInfo {
                 open: open & (1 << i) != 0,
                 rtt_ms: v.rtt,
+                turn: v.turn.is_some(),
             })
             .collect()
     }
 
-    /// Adresses des passeurs de la route vers `peer`.
+    /// Adresses des passeurs de la route vers `peer` (sans le chemin par TURN).
     pub fn vias(&self, peer: u64) -> Vec<SocketAddr> {
         let st = self.inner.st.lock().unwrap();
         st.ways
             .get(&peer)
-            .map(|l| l.vias.iter().map(|v| v.addr).collect())
+            .map(|l| {
+                l.vias
+                    .iter()
+                    .filter(|v| v.turn.is_none())
+                    .map(|v| v.addr)
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// (v331) L'adresse relayée de l'autre bout, si la route vers `peer` a un chemin par
+    /// TURN (essais, journal).
+    pub fn turn_peer(&self, peer: u64) -> Option<SocketAddr> {
+        let st = self.inner.st.lock().unwrap();
+        let l = st.ways.get(&peer)?;
+        l.vias.iter().find(|v| v.turn.is_some()).map(|v| v.addr)
     }
 
     /// Routes en place.
@@ -1259,7 +1498,9 @@ impl Endpoint {
 }
 
 impl EndInner {
-    fn on_packet(&self, p: &[u8], from: SocketAddr) {
+    /// Un paquet venu de `from` : par la socket de ce bout (un passeur), ou (v331, `turn`)
+    /// par un client TURN de ce programme (`from` : l'adresse relayée de l'autre bout).
+    fn on_packet(&self, p: &[u8], from: SocketAddr, turn: bool) {
         let Some(x) = parse(p) else { return };
         // Seuls les paquets de l'autre sens nous sont destinés.
         if x.dir == self.dir {
@@ -1274,8 +1515,12 @@ impl EndInner {
             let Some(l) = st.ways.get_mut(&peer) else {
                 return;
             };
-            // Il ne peut venir que d'un passeur de la route.
-            let Some(i) = l.vias.iter().position(|v| v.addr == from) else {
+            // Il ne peut venir que d'un chemin de la route.
+            let Some(i) = l
+                .vias
+                .iter()
+                .position(|v| v.addr == from && v.turn.is_some() == turn)
+            else {
                 return;
             };
             let Ok(body) = l.cipher.decrypt(
@@ -1295,17 +1540,17 @@ impl EndInner {
             let Some((&flags, msg)) = body.split_first() else {
                 return;
             };
-            l.heard = flags & ((1 << VIAS) - 1);
+            l.heard = flags & HEARD;
             l.heard_at = Some(now);
             l.slow_in = flags & FLAG_SLOW != 0;
-            // Mesure d'aller-retour : on renvoie le numéro par le même passeur ; au
+            // Mesure d'aller-retour : on renvoie le numéro par le même chemin ; au
             // retour du nôtre, le temps écoulé (lissé).
             if flags & FLAG_PING != 0 {
                 let id = msg.first().copied().unwrap_or(0);
                 let seq = l.seq;
                 l.seq += 1;
                 let p = l.packet(self.dir, i, seq, FLAG_KEEP | FLAG_PONG, &[id], now);
-                let _ = self.sock.send_to(&p, l.vias[i].addr);
+                l.out(&self.sock, i, &p, now);
             }
             if flags & FLAG_PONG != 0 {
                 let v = &mut l.vias[i];
@@ -1328,13 +1573,18 @@ impl EndInner {
 
     /// Paquets d'entretien : par chaque passeur resté sans envoi depuis `KEEP`. Ils ouvrent
     /// le chemin (le passeur apprend d'où l'on parle) et disent à l'autre bout par où l'on
-    /// reçoit, même quand il n'y a rien d'autre à envoyer.
+    /// reçoit, même quand il n'y a rien d'autre à envoyer. (v331) Par le chemin par TURN,
+    /// quand il attend en secours, seulement les mesures d'aller-retour : l'autre bout le
+    /// tient pour ouvert plus longtemps (`FRESH_TURN`), et ce qu'on reçoit lui est dit dans
+    /// chaque paquet, par n'importe quel chemin. Quand c'est lui qui sert, il est entretenu
+    /// comme un passeur.
     fn keep(&self) {
         let now = Instant::now();
         let mut st = self.st.lock().unwrap();
         for l in st.ways.values_mut() {
+            let turn_used = l.turn_now(l.open(now)).is_some_and(|(_, take)| take);
             for i in 0..l.vias.len() {
-                // Mesure d'aller-retour par ce passeur, de temps en temps (elle vaut
+                // Mesure d'aller-retour par ce chemin, de temps en temps (elle vaut
                 // aussi paquet d'entretien). Une mesure restée sans réponse est refaite.
                 let due = l.vias[i]
                     .ping
@@ -1347,19 +1597,20 @@ impl EndInner {
                     let seq = l.seq;
                     l.seq += 1;
                     let p = l.packet(self.dir, i, seq, FLAG_KEEP | FLAG_PING, &[id], now);
-                    let _ = self.sock.send_to(&p, l.vias[i].addr);
+                    l.out(&self.sock, i, &p, now);
                     continue;
                 }
-                if l.vias[i]
-                    .tx_at
-                    .is_some_and(|t| now.duration_since(t) < KEEP)
+                if (l.vias[i].turn.is_some() && !turn_used)
+                    || l.vias[i]
+                        .tx_at
+                        .is_some_and(|t| now.duration_since(t) < KEEP)
                 {
                     continue;
                 }
                 let seq = l.seq;
                 l.seq += 1;
                 let p = l.packet(self.dir, i, seq, FLAG_KEEP, &[], now);
-                let _ = self.sock.send_to(&p, l.vias[i].addr);
+                l.out(&self.sock, i, &p, now);
             }
         }
     }
@@ -1420,12 +1671,14 @@ mod tests {
             route: 42,
             key: key(1),
             vias: vias.clone(),
+            turn: None,
         }]);
         host.set_ways(vec![Way {
             peer: 7,
             route: 42,
             key: key(1),
             vias,
+            turn: None,
         }]);
         (guest, grx, host, hrx)
     }
@@ -1654,6 +1907,7 @@ mod tests {
                 addr: local(p.port()),
                 seal: key(10),
             }],
+            turn: None,
         }]);
         // (Ses numéros repartent de zéro : le passeur ne lui donne même pas l'adresse.)
         assert!(bad.send_all(0, b"faux"));
@@ -1886,5 +2140,240 @@ mod tests {
         assert_eq!(p.routes(), 2);
         p.clear();
         assert_eq!(p.routes(), 0);
+    }
+
+    // ─────────────── (v331) Chemin par TURN, avec un serveur TURN pour rire ───────────────
+
+    /// Une allocation chez un faux serveur TURN : ce qu'on lui confie arrive à l'autre bout
+    /// (`turn_received`) comme si le serveur l'avait relayé, depuis notre adresse relayée,
+    /// dans un fil à part (comme un vrai serveur : jamais pendant l'envoi). Elle peut tout
+    /// perdre, ou tout retenir quelques millisecondes ; elle compte ce qu'elle porte.
+    struct FakeTurn {
+        mine: SocketAddrV4,
+        tx: Mutex<std::sync::mpsc::Sender<(SocketAddr, Vec<u8>, Instant)>>,
+        lose: AtomicBool,
+        delay_ms: AtomicU64,
+        carried: AtomicU64,
+    }
+
+    impl TurnLink for FakeTurn {
+        fn send(&self, _to: SocketAddr, packet: &[u8]) {
+            if self.lose.load(Ordering::Relaxed) {
+                return;
+            }
+            self.carried.fetch_add(1, Ordering::Relaxed);
+            let at = Instant::now() + Duration::from_millis(self.delay_ms.load(Ordering::Relaxed));
+            let _ = self
+                .tx
+                .lock()
+                .unwrap()
+                .send((SocketAddr::V4(self.mine), packet.to_vec(), at));
+        }
+    }
+
+    static FAKES: Mutex<Vec<Arc<FakeTurn>>> = Mutex::new(Vec::new());
+
+    fn fake_find(mine: SocketAddrV4) -> Option<Arc<dyn TurnLink>> {
+        let all = FAKES.lock().unwrap();
+        let f = all.iter().find(|f| f.mine == mine)?.clone();
+        Some(f as Arc<dyn TurnLink>)
+    }
+
+    /// Une allocation neuve, à une adresse relayée que personne d'autre n'a.
+    fn fake_turn() -> Arc<FakeTurn> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        set_turn_find(fake_find);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mine = SocketAddrV4::new([104, 31, 0, n as u8].into(), 30_000 + n as u16);
+        let (tx, rx) = std::sync::mpsc::channel::<(SocketAddr, Vec<u8>, Instant)>();
+        std::thread::spawn(move || {
+            while let Ok((from, p, at)) = rx.recv() {
+                let wait = at.saturating_duration_since(Instant::now());
+                if !wait.is_zero() {
+                    std::thread::sleep(wait);
+                }
+                turn_received(from, &p);
+            }
+        });
+        let f = Arc::new(FakeTurn {
+            mine,
+            tx: Mutex::new(tx),
+            lose: AtomicBool::new(false),
+            delay_ms: AtomicU64::new(0),
+            carried: AtomicU64::new(0),
+        });
+        FAKES.lock().unwrap().push(f.clone());
+        f
+    }
+
+    /// Une partie à un invité (7 chez l'hôte) par ces passeurs et par TURN (chacun son
+    /// allocation), sur une route à elle.
+    fn link_turn(
+        ps: &[&Passeur],
+    ) -> (
+        Endpoint,
+        Inbox,
+        Endpoint,
+        Inbox,
+        Arc<FakeTurn>,
+        Arc<FakeTurn>,
+    ) {
+        let route: u64 = 0x7000_0000 + u64::from(rand_u16());
+        let (guest, grx) = end(TO_HOST);
+        let (host, hrx) = end(TO_GUEST);
+        let (tg, th) = (fake_turn(), fake_turn());
+        let vias: Vec<Via> = ps
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                p.set_lot(route, &[(route, key(20 + i as u8))]);
+                Via {
+                    addr: local(p.port()),
+                    seal: key(20 + i as u8),
+                }
+            })
+            .collect();
+        guest.set_ways(vec![Way {
+            peer: 0,
+            route,
+            key: key(2),
+            vias: vias.clone(),
+            turn: Some(TurnPair {
+                mine: tg.mine,
+                peer: th.mine,
+            }),
+        }]);
+        host.set_ways(vec![Way {
+            peer: 7,
+            route,
+            key: key(2),
+            vias,
+            turn: Some(TurnPair {
+                mine: th.mine,
+                peer: tg.mine,
+            }),
+        }]);
+        (guest, grx, host, hrx, tg, th)
+    }
+
+    fn rand_u16() -> u16 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(unix_ms());
+        h.finish() as u16
+    }
+
+    fn drain(rx: &Inbox) -> usize {
+        let mut got = 0;
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {
+            got += 1;
+        }
+        got
+    }
+
+    /// (v331) Sans passeur, la voie rapide passe par TURN, de l'invité à l'hôte et retour,
+    /// sans relais au milieu : chacun par sa propre allocation, vers celle de l'autre.
+    #[test]
+    fn without_passeurs_the_fast_way_goes_through_turn() {
+        let (guest, grx, host, hrx, tg, th) = link_turn(&[]);
+        // Les entrées partent tout de suite (rien n'est encore ouvert : on essaie).
+        assert!(guest.send_all(0, b"premier"));
+        assert!(
+            wait(|| host.open(7) && guest.open(0)),
+            "ouverte par les mesures"
+        );
+        assert!(host.on_turn(7) && guest.on_turn(0));
+        // Rien d'autre à dire pendant une seconde : elle reste ouverte (seul chemin, il est
+        // entretenu comme un passeur).
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(host.open(7) && guest.open(0), "fermée sans rien à envoyer");
+        }
+        for i in 0..50u8 {
+            assert!(host.send_one(7, &[i]));
+            assert!(guest.send_all(0, &[i]));
+        }
+        assert_eq!(drain(&grx), 50);
+        assert_eq!(drain(&hrx), 51);
+        let paths = host.paths(7);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].turn && paths[0].open && paths[0].rtt_ms.is_some());
+        assert_eq!(host.turn_peer(7), Some(SocketAddr::V4(tg.mine)));
+        assert!(host.vias(7).is_empty(), "aucun passeur");
+        assert!(
+            tg.carried.load(Ordering::Relaxed) >= 51 && th.carried.load(Ordering::Relaxed) >= 50
+        );
+        // L'allocation de l'hôte ne passe plus rien : la voie se ferme, au relais de
+        // reprendre.
+        th.lose.store(true, Ordering::Relaxed);
+        assert!(wait(|| !guest.open(0)), "fermée côté invité");
+        assert!(
+            wait(|| !host.open(7)),
+            "fermée côté hôte (ses paquets ne passent plus)"
+        );
+        assert!(!host.send_one(7, b"x"), "au relais de reprendre");
+    }
+
+    /// (v331) Quand un passeur porte la route, TURN ne sert pas (seulement ses mesures,
+    /// deux par seconde) ; le passeur se tait : les positions passent par TURN dans la
+    /// demi-seconde ; il revient : on le reprend.
+    #[test]
+    fn turn_stands_by_while_a_passeur_carries_and_takes_over_when_it_falls() {
+        let (p, _probes) = passeur();
+        let (guest, grx, host, _hrx, tg, th) = link_turn(&[&p]);
+        assert!(
+            wait(|| host.stats(7).is_some_and(|s| s.heard == 3)),
+            "les deux chemins répondent"
+        );
+        assert!(!host.on_turn(7), "le passeur d'abord");
+        let before = th.carried.load(Ordering::Relaxed);
+        for i in 0..200u8 {
+            assert!(host.send_one(7, &[i]));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(drain(&grx), 200);
+        let by_turn = th.carried.load(Ordering::Relaxed) - before;
+        assert!(
+            by_turn < 10,
+            "{by_turn} paquets par TURN pendant que le passeur porte"
+        );
+        // Le passeur perd tout.
+        p.lose_one_in(1);
+        assert!(wait(|| host.on_turn(7)), "TURN prend le relais");
+        let before = th.carried.load(Ordering::Relaxed);
+        for i in 0..100u8 {
+            assert!(host.send_one(7, &[i]));
+        }
+        assert_eq!(drain(&grx), 100);
+        assert!(th.carried.load(Ordering::Relaxed) - before >= 100);
+        // Les entrées aussi passent par TURN (et toujours par le passeur, qui ne coûte rien).
+        let before = tg.carried.load(Ordering::Relaxed);
+        assert!(guest.send_all(0, b"entrees"));
+        assert!(tg.carried.load(Ordering::Relaxed) > before);
+        // Il revient.
+        p.lose_one_in(0);
+        assert!(wait(|| !host.on_turn(7)), "retour au passeur");
+    }
+
+    /// (v331) Un passeur bien plus lent que TURN (80 ms de plus sur l'aller-retour) : TURN
+    /// est pris ; un écart faible ne suffit pas.
+    #[test]
+    fn turn_is_taken_when_it_is_much_faster_than_the_passeurs() {
+        let (p, _probes) = passeur();
+        let (_guest, grx, host, _hrx, _tg, _th) = link_turn(&[&p]);
+        assert!(wait(|| host.stats(7).is_some_and(|s| s.heard == 3)));
+        // (Le passeur d'essai retient chaque paquet dans son seul fil : 3 ms par paquet,
+        // un peu plus de 6 ms sur l'aller-retour.)
+        p.delay_ms(3);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!host.on_turn(7), "quelques ms d'écart : le passeur reste");
+        p.delay_ms(40);
+        let end = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < end && !host.on_turn(7) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(host.on_turn(7), "40 ms d'écart : TURN");
+        assert!(host.send_one(7, b"vite"));
+        assert!(drain(&grx) >= 1);
     }
 }

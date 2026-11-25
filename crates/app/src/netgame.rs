@@ -37,6 +37,16 @@ const SCOREBOARD_EVERY: u32 = 128;
 /// Voie rapide (`minelib_net::fast`) : pas d'entrées répétés dans chaque paquet (les
 /// derniers, déjà partis par le relais). Un paquet perdu est ainsi couvert par le suivant.
 const FAST_INPUTS: usize = 8;
+/// (v331) Les mêmes, quand la voie rapide passe par TURN : chaque octet y compte dans le
+/// quota du mois, et un serveur TURN perd bien moins de paquets qu'un passeur chez un
+/// particulier (ce qui manque arrive de toute façon par le relais).
+const FAST_INPUTS_TURN: usize = 4;
+/// (v331) Voie rapide en bon état vers un joueur : les états complets (64 par seconde) lui
+/// arrivent par elle ; par le relais, plus qu'un sur quatre (`RELAY_SNAPSHOT_EVERY` pas),
+/// de quoi garder une référence sûre et comparer les deux chemins (`Guest::fast_vote`).
+/// Le relais en porte quatre fois moins, et le serveur TURN aussi quand ses liens passent
+/// par lui.
+const RELAY_SNAPSHOT_EVERY: u32 = 16;
 /// Voie rapide : messages venus des passeurs que l'invité regarde avant de dire s'il
 /// reçoit plus vite par eux ou par le relais (`Guest::fast_vote`).
 const FAST_VOTES: u8 = 32;
@@ -3228,7 +3238,10 @@ impl Host {
     fn fast_check(&mut self) {
         let Some(f) = &self.fast else { return };
         for &id in self.peers.keys() {
-            let paths = f.paths(id);
+            // (v331) Seuls les passeurs sont comparés et signalés : le chemin par TURN,
+            // après eux, ne se remplace pas.
+            let mut paths = f.paths(id);
+            paths.retain(|p| !p.turn);
             let best = paths
                 .iter()
                 .filter(|p| p.open)
@@ -4583,12 +4596,17 @@ impl Host {
                 players,
                 hud: self.m.hud(id, Some(r.player.pos)),
             };
-            self.send_to(id, &state);
             // (v274) Aussi par un passeur quand la voie rapide est ouverte : le premier
             // arrivé compte (un canal du relais qui cale ne fige plus la vie, l'arme et le
             // tableau de bord). Trop long pour un paquet : il ne part que par le relais.
-            if let Some(f) = &self.fast {
-                f.send_one(id, &game::encode(&state));
+            let fast = self
+                .fast
+                .as_ref()
+                .is_some_and(|f| f.send_one(id, &game::encode(&state)));
+            // (v331) Parti par la voie rapide (elle est ouverte, et pas plus lente que le
+            // relais) : par le relais, seulement un sur quatre.
+            if !fast || self.tick.is_multiple_of(RELAY_SNAPSHOT_EVERY) {
+                self.send_to(id, &state);
             }
         }
     }
@@ -4710,7 +4728,12 @@ impl Guest {
     /// le relais) par chaque passeur. L'hôte n'en garde que ce qui lui manque.
     fn fast_inputs(&self, weapon: u8) {
         let Some(f) = &self.fast else { return };
-        let k = FAST_INPUTS.min(self.pending.len());
+        let most = if f.on_turn(0) {
+            FAST_INPUTS_TURN
+        } else {
+            FAST_INPUTS
+        };
+        let k = most.min(self.pending.len());
         if k == 0 {
             return;
         }
@@ -4740,10 +4763,17 @@ impl Guest {
                     let p: Vec<String> = f
                         .paths(0)
                         .iter()
-                        .map(|p| match (p.open, p.rtt_ms) {
-                            (true, Some(ms)) => format!("{ms:.0} ms"),
-                            (true, None) => "ouvert".to_string(),
-                            (false, _) => "fermé".to_string(),
+                        .map(|p| {
+                            let state = match (p.open, p.rtt_ms) {
+                                (true, Some(ms)) => format!("{ms:.0} ms"),
+                                (true, None) => "ouvert".to_string(),
+                                (false, _) => "fermé".to_string(),
+                            };
+                            if p.turn {
+                                format!("TURN {state}")
+                            } else {
+                                state
+                            }
                         })
                         .collect();
                     if p.is_empty() {
@@ -4796,6 +4826,12 @@ impl Guest {
     fn fast_vote(&mut self, tick: u32, ping: bool) {
         // (En temps normal ce sont les positions qui votent ; au relais, les sondes.)
         if self.fast.is_none() || ping != self.fast_slow {
+            return;
+        }
+        // (v331) Les états complets ne viennent plus par le relais qu'aux pas multiples de
+        // `RELAY_SNAPSHOT_EVERY` : seules votent les positions des trois pas qui précèdent
+        // (celles qu'un relais plus rapide devance, comme avant d'un état sur quatre).
+        if !ping && tick % RELAY_SNAPSHOT_EVERY < RELAY_SNAPSHOT_EVERY - SNAPSHOT_EVERY + 1 {
             return;
         }
         self.fast_votes += 1;
@@ -5478,7 +5514,16 @@ mod tests {
         came_back: bool,
         /// Retard (pas) du dernier état complet pris par l'invité, en pleine course.
         snap_behind: f32,
+        /// (v331) États complets reçus par l'invité (par les deux chemins) pendant le
+        /// retard, pour combien d'états envoyés.
+        snaps_got: u32,
+        snaps_sent: u32,
     }
+
+    /// (v331) Les essais de voie rapide qui ont des passeurs et ceux qui passent par TURN,
+    /// un à la fois : les jeux d'essai disent au relais les adresses relayées de tous les
+    /// nœuds du programme.
+    static FAST_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Voie rapide (`minelib_net::fast`) : une partie à deux par un vrai relais, avec deux
     /// passeurs. Une fois la voie ouverte et la manche lancée :
@@ -5495,7 +5540,34 @@ mod tests {
     /// `div` : 1 pour 4 pas par image (64 images par seconde), 4 pour un pas par image (256
     /// images par seconde).
     fn fast_match_at(passeurs_lag: bool, div: u32) -> FastRun {
+        fast_match_with(passeurs_lag, div, false)
+    }
+
+    /// (v331) `turn` : aucun passeur, la voie rapide passe par un serveur TURN (deux nœuds
+    /// de ce programme y ont une adresse relayée : l'une pour l'hôte, l'autre pour
+    /// l'invité).
+    fn fast_match_with(passeurs_lag: bool, div: u32, turn: bool) -> FastRun {
         const LAG: usize = 40;
+        let _serial = FAST_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (server, _engine) = minelib_p2p::turn::essai::MiniTurn::start_alone();
+        let turn_nodes: Vec<minelib_p2p::Node> = (0..if turn { 2 } else { 0 })
+            .map(|_| {
+                let n = minelib_p2p::Node::start_offline().unwrap();
+                n.passeurs().start_turn(vec![server.source()]);
+                n
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        while turn_nodes
+            .iter()
+            .any(|n| n.passeurs().turn_addr().is_none())
+        {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(10),
+                "pas d'adresse relayée"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let dir = std::env::temp_dir().join(format!("minelib-net-rapide-{}", rand_u32()));
         for p in ["Pas1", "Pas2", "Pas3", "Pas4"] {
             minelib_relay::test_seed_games(&dir, p, 5);
@@ -5522,8 +5594,13 @@ mod tests {
             (c, link)
         };
         // Quatre joueurs sans lien avec la partie prêtent leur port : deux voies, chacune une
-        // chaîne de deux passeurs (v308).
-        let passeurs: Vec<Client> = ["Pas1", "Pas2", "Pas3", "Pas4"]
+        // chaîne de deux passeurs (v308). (v331) Ou aucun : par TURN.
+        let names: &[&str] = if turn {
+            &[]
+        } else {
+            &["Pas1", "Pas2", "Pas3", "Pas4"]
+        };
+        let passeurs: Vec<Client> = names
             .iter()
             .map(|p| {
                 let (c, _) = login(p);
@@ -5577,6 +5654,7 @@ mod tests {
         // États complets déjà vus passer : ils viennent par le relais et par les passeurs,
         // la première copie de chaque pas est celle qui n'a pas de retard.
         let mut snaps_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let (mut snaps_got, mut snaps_sent) = (0u32, 0u32);
         let mut done = false;
         for frame in 0..8000 * div as usize {
             // Depuis combien d'images le retard est en place, et sur quel chemin.
@@ -5640,6 +5718,12 @@ mod tests {
                     now.push(late_g.pop_front().unwrap().1);
                 }
                 while let Some(e) = gc.poll() {
+                    if since.is_some()
+                        && matches!(&e, Event::FromHost(d)
+                            if matches!(game::decode::<ToPeer>(d), Some(ToPeer::Snapshot { .. })))
+                    {
+                        snaps_got += 1;
+                    }
                     let fast = match &e {
                         Event::FromHost(data) => match game::decode::<ToPeer>(data) {
                             Some(ToPeer::Moves { .. }) => !via_relay,
@@ -5708,6 +5792,11 @@ mod tests {
             for _ in 0..ticks {
                 host_p.update(&world, &idle, dt);
                 host.on_tick(&world, &host_p, &idle, dt);
+                if since.is_some()
+                    && matches!(&host, NetGame::Host(hs) if hs.tick.is_multiple_of(SNAPSHOT_EVERY))
+                {
+                    snaps_sent += 1;
+                }
                 if let Some(g) = &mut guest {
                     guest_p.yaw = 0.0;
                     guest_p.update(&world, &m, dt);
@@ -5770,8 +5859,11 @@ mod tests {
             behind,
             came_back: !gs.fast_slow && !hfast.as_ref().is_some_and(|f| f.slow(peer)),
             snap_behind,
+            snaps_got,
+            snaps_sent,
         };
         drop(passeurs);
+        drop(turn_nodes);
         let _ = std::fs::remove_dir_all(dir);
         run
     }
@@ -5803,6 +5895,13 @@ mod tests {
         // (v274) Les états complets viennent aussi par les passeurs : la vie, l'arme et le
         // tableau de bord ne sont pas figés par le retard du relais (160 pas).
         assert!(r.snap_behind < 24.0, "dernier état complet vieux de {} pas", r.snap_behind);
+        // (v331) Par le relais, plus qu'un sur quatre : 1,25 copie par état envoyé (avant : 2).
+        assert!(
+            r.snaps_got * 4 < r.snaps_sent * 6,
+            "{} états reçus pour {} envoyés",
+            r.snaps_got,
+            r.snaps_sent
+        );
         // (v286) À 64 images par seconde (4 pas par image), un message d'entrées par image
         // par le relais, comme avant.
         assert!(r.relay_inputs.abs_diff(r.all_frames) <= 2, "{} pour {}", r.relay_inputs, r.all_frames);
@@ -5838,6 +5937,47 @@ mod tests {
         assert!(r.mid_gap < 1.0, "en pleine course, l'hôte suit l'invité à {} bloc", r.mid_gap);
         assert!(r.end_gap < 0.05, "prédiction de l'invité = hôte (écart {})", r.end_gap);
         assert!(r.came_back, "les passeurs redevenus rapides, on y revient");
+    }
+
+    /// (v331) Aucun passeur : la voie rapide passe par TURN, de l'hôte à l'invité, sans le
+    /// relais. Le relais cale : l'hôte suit quand même l'invité de près, l'invité se corrige
+    /// sur l'hôte, et ses états complets lui viennent par TURN (par le relais, un sur quatre).
+    #[test]
+    fn without_passeurs_the_fast_way_goes_through_turn_when_the_relay_lags() {
+        let r = fast_match_with(false, 1, true);
+        eprintln!(
+            "VOIE RAPIDE PAR TURN : {} images bloquées sur {}, {} états reçus pour {} envoyés",
+            r.stalled, r.frames, r.snaps_got, r.snaps_sent
+        );
+        assert_eq!(r.stats.heard, 1, "le seul chemin : TURN");
+        assert!(
+            r.mid_gap < 1.0,
+            "en pleine course, l'hôte suit l'invité à {} bloc",
+            r.mid_gap
+        );
+        assert!(r.by_fast > 100, "entrées venues par TURN : {}", r.by_fast);
+        assert!(
+            r.end_gap < 0.05,
+            "prédiction de l'invité = hôte (écart {})",
+            r.end_gap
+        );
+        assert!(
+            r.snap_behind < 24.0,
+            "dernier état complet vieux de {} pas",
+            r.snap_behind
+        );
+        assert!(
+            r.snaps_got * 4 < r.snaps_sent * 6,
+            "{} pour {}",
+            r.snaps_got,
+            r.snaps_sent
+        );
+        assert!(
+            r.stalled * 10 < r.frames.max(1),
+            "{} sur {}",
+            r.stalled,
+            r.frames
+        );
     }
 
     #[test]

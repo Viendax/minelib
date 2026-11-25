@@ -1008,7 +1008,7 @@ impl Worker {
     /// qui en arrivent sont remis au jeu comme ceux du relais.
     fn set_fast(&mut self, dir: u8, ways: Vec<crate::fast::Way>) {
         use crate::fast::{Endpoint, TO_HOST};
-        if ways.iter().all(|w| w.vias.is_empty()) {
+        if ways.iter().all(|w| w.vias.is_empty() && w.turn.is_none()) {
             self.close_fast();
             return;
         }
@@ -1036,7 +1036,11 @@ impl Worker {
                 }
             }
         };
-        log::info!("voie rapide : {} route(s)", ways.len());
+        let turned = ways.iter().filter(|w| w.turn.is_some()).count();
+        log::info!(
+            "voie rapide : {} route(s), {turned} avec un chemin par TURN",
+            ways.len()
+        );
         end.set_ways(ways);
         self.fast = Some((dir, end.clone()));
         self.emit(Event::Fast(Some(end)));
@@ -1380,12 +1384,14 @@ impl Worker {
                 route,
                 key,
                 passeurs,
+                turn,
             } => {
                 let way = crate::proto::FastWay {
                     peer: 0,
                     route,
                     key,
                     passeurs,
+                    turn,
                 };
                 self.set_fast(crate::fast::TO_HOST, vec![way.way()]);
                 return;

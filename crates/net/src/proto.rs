@@ -85,6 +85,7 @@ use serde::{Deserialize, Serialize};
 /// (v330, toujours 75) La graine d'un monde de construction n'est plus dans sa carte, et ses
 /// joueurs qui ne sont pas OP ne la reçoivent plus : `Request::Host::seed` et `terrain`,
 /// `Response::Hosted::terrain`, `Response::Joined::terrain`, `Response::SeedLock::seed`.
+/// (v331, toujours 75) `FastGuest::turn` et `FastWay::turn` (`FastTurn`).
 pub const PROTOCOL: u32 = 75;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
@@ -1964,11 +1965,13 @@ pub enum Response {
     },
     /// Voie rapide, à un joueur d'une partie FPS : sa route vers l'hôte (clé qui scelle de
     /// bout en bout, passeurs de son équipe). Aucun passeur : voie fermée, tout passe par
-    /// le relais comme avant.
+    /// le relais comme avant. (v331) `turn` : un chemin de plus, par TURN (aucun passeur :
+    /// le seul).
     FastGuest {
         route: u64,
         key: [u8; 32],
         passeurs: Vec<FastHop>,
+        turn: Option<FastTurn>,
     },
     /// Voie rapide, à l'hôte : les routes de ses joueurs (elles remplacent les précédentes).
     FastHost {
@@ -2023,13 +2026,22 @@ pub struct FastHop {
     pub seal: [u8; 32],
 }
 
-/// Route de la voie rapide entre l'hôte et le joueur `peer`.
+/// Route de la voie rapide entre l'hôte et le joueur `peer`, et (v331) son chemin par TURN.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FastWay {
     pub peer: u64,
     pub route: u64,
     pub key: [u8; 32],
     pub passeurs: Vec<FastHop>,
+    pub turn: Option<FastTurn>,
+}
+
+/// (v331) Chemin par TURN d'une route de la voie rapide : l'adresse relayée par laquelle
+/// envoyer (celle d'un nœud de ce jeu) et celle de l'autre bout (IPv4, port).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastTurn {
+    pub mine: ([u8; 4], u16),
+    pub peer: ([u8; 4], u16),
 }
 
 impl FastHop {
@@ -2043,11 +2055,16 @@ impl FastHop {
 
 impl FastWay {
     pub fn way(&self) -> crate::fast::Way {
+        let v4 = |(ip, port): ([u8; 4], u16)| std::net::SocketAddrV4::new(ip.into(), port);
         crate::fast::Way {
             peer: self.peer,
             route: self.route,
             key: self.key,
             vias: self.passeurs.iter().map(FastHop::via).collect(),
+            turn: self.turn.map(|t| crate::fast::TurnPair {
+                mine: v4(t.mine),
+                peer: v4(t.peer),
+            }),
         }
     }
 }

@@ -1187,6 +1187,111 @@ mod tests {
         for i in 0..200u32 {
             assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
         }
+        // (v331) Le passeur porte de nouveau la route : on y revient, sans attendre que TURN
+        // se taise (il compte dans le quota du mois).
+        let seal = [p.port() as u8; 32];
+        p.set_lot(0x62, &[(0x62, seal)]);
+        let back = std::time::Instant::now();
+        while guest.passeurs().via_turn(0x62) || host.passeurs().via_turn(0x62) {
+            assert!(
+                back.elapsed() < Duration::from_secs(15),
+                "toujours par TURN"
+            );
+            assert!(said_back(&mut c, b"retou"));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("TUNNEL : retour au passeur en {:?}", back.elapsed());
+        let (sent, _) = guest.passeurs().turn_counts();
+        for i in 0..200u32 {
+            assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
+        }
+        let (after, _) = guest.passeurs().turn_counts();
+        assert!(
+            after - sent < 30,
+            "{} paquets encore par TURN",
+            after - sent
+        );
+    }
+
+    /// (v331) La voie rapide d'une partie FPS passe par les mêmes clients TURN que les
+    /// tunnels des nœuds du jeu : chaque bout envoie par son adresse relayée à celle de
+    /// l'autre, et ce qui revient est remis à la voie rapide ou au tunnel selon la route.
+    #[test]
+    fn the_fast_way_of_a_fps_game_shares_the_turn_clients_with_the_tunnels() {
+        use minelib_net::fast::{Endpoint, TurnPair, Way, TO_GUEST, TO_HOST};
+        let _serial = serial();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = turn::essai::MiniTurn::start(rt.handle());
+        let (host, guest) = turn_nodes(&server);
+        give_turn(&host, &guest, 0x64, &[]);
+        let t = guest.tunnel(host.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        assert!(said_back(&mut c, b"tunne"));
+        let (ha, ga) = (
+            host.passeurs().turn_addr().unwrap(),
+            guest.passeurs().turn_addr().unwrap(),
+        );
+        let (gtx, grx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (htx, hrx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (gtx, htx) = (std::sync::Mutex::new(gtx), std::sync::Mutex::new(htx));
+        let g_end = Endpoint::start(
+            TO_HOST,
+            Box::new(move |_, m| {
+                let _ = gtx.lock().unwrap().send(m);
+            }),
+        )
+        .unwrap();
+        let h_end = Endpoint::start(
+            TO_GUEST,
+            Box::new(move |_, m| {
+                let _ = htx.lock().unwrap().send(m);
+            }),
+        )
+        .unwrap();
+        let way = |peer, mine, other| Way {
+            peer,
+            route: 0x65,
+            key: [9; 32],
+            vias: Vec::new(),
+            turn: Some(TurnPair { mine, peer: other }),
+        };
+        g_end.set_ways(vec![way(0, ga, ha)]);
+        h_end.set_ways(vec![way(3, ha, ga)]);
+        let start = std::time::Instant::now();
+        while !(g_end.open(0) && h_end.open(3)) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "voie rapide fermée"
+            );
+            g_end.send_all(0, b"bonjour");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while hrx.try_recv().is_ok() {}
+        for i in 0..300u16 {
+            assert!(h_end.send_one(3, &i.to_le_bytes()));
+            assert!(g_end.send_all(0, &i.to_le_bytes()));
+            if i % 50 == 0 {
+                assert!(said_back(&mut c, &[i as u8; 5]), "le tunnel passe toujours");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let count = |rx: &std::sync::mpsc::Receiver<Vec<u8>>| {
+            let mut n = 0;
+            while rx.recv_timeout(Duration::from_millis(500)).is_ok() {
+                n += 1;
+            }
+            n
+        };
+        let (to_guest, to_host) = (count(&grx), count(&hrx));
+        eprintln!("VOIE RAPIDE PAR TURN : {to_guest}/300 vers l'invité, {to_host}/300 vers l'hôte");
+        assert!(to_guest >= 290 && to_host >= 290);
+        assert!(h_end.paths(3)[0].rtt_ms.is_some(), "aller-retour mesuré");
+        assert!(said_back(&mut c, b"fin!!"));
     }
 
     /// (v301) Le premier passeur d'un tunnel tombe : le tunnel continue par le second,

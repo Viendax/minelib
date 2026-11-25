@@ -44,6 +44,9 @@ const SILENT: Duration = Duration::from_secs(2);
 
 /// Une route muette est redite au relais à ce rythme, tant qu'elle le reste.
 const REPORT_EVERY: Duration = Duration::from_secs(5);
+/// (v331) Une route passée par TURN revient à un passeur qui répond de nouveau depuis ce
+/// temps (sans attendre que TURN se taise : il compte dans le quota du mois).
+const BACK: Duration = Duration::from_secs(3);
 
 /// Adresse, sur ce transport, du pair au bout de la route `route`.
 pub fn addr(route: u64) -> CustomAddr {
@@ -60,8 +63,10 @@ struct Hop {
     addr: SocketAddr,
     /// Clé du sceau de la route pour ce saut.
     seal: [u8; 32],
-    /// Dernier paquet de l'autre bout venu par lui.
+    /// Dernier paquet de l'autre bout venu par lui, et (v331) depuis quand il en vient sans
+    /// s'être tu.
     heard: Option<Instant>,
+    since: Option<Instant>,
     turn: bool,
 }
 
@@ -79,18 +84,38 @@ struct Route {
 
 impl Route {
     /// Le saut à employer : celui en cours tant qu'il donne signe de vie, sinon celui
-    /// dont on a eu des nouvelles le plus récemment.
+    /// dont on a eu des nouvelles le plus récemment. (v331) Un passeur avant TURN : quand
+    /// le saut en cours se tait, un passeur qui répond est pris avant TURN ; et sur TURN,
+    /// on revient à un passeur qui répond de nouveau depuis `BACK`.
     fn pick(&mut self, now: Instant) -> usize {
         let alive = |h: Option<Instant>| h.is_some_and(|t| now.duration_since(t) < SILENT);
+        if self.vias[self.via].turn {
+            let back = self
+                .vias
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| !v.turn && alive(v.heard))
+                .filter(|(_, v)| v.since.is_some_and(|s| now.duration_since(s) >= BACK))
+                .max_by_key(|(_, v)| v.heard);
+            if let Some((i, _)) = back {
+                log::info!("tunnel : un passeur répond de nouveau, la route quitte TURN");
+                self.via = i;
+                return self.via;
+            }
+        }
         if !alive(self.vias[self.via].heard) {
-            if let Some((i, _)) = self
+            if let Some((i, v)) = self
                 .vias
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| alive(v.heard))
-                .max_by_key(|(_, v)| v.heard)
+                .max_by_key(|(_, v)| (!v.turn, v.heard))
             {
-                log::info!("tunnel : un passeur se tait, la route passe par l'autre");
+                if v.turn {
+                    log::info!("tunnel : plus aucun passeur ne répond, la route passe par TURN");
+                } else {
+                    log::info!("tunnel : un passeur se tait, la route passe par l'autre");
+                }
                 self.via = i;
             }
         }
@@ -100,6 +125,28 @@ impl Route {
 
 /// Transports des nœuds de ce jeu (pour leur donner les routes venues du relais).
 static NODES: Mutex<Vec<([u8; 32], std::sync::Weak<Inner>)>> = Mutex::new(Vec::new());
+
+/// (v331) La voie rapide des parties FPS envoie par le client TURN d'un de nos nœuds.
+impl fast::TurnLink for crate::turn::TurnClient {
+    fn send(&self, to: SocketAddr, packet: &[u8]) {
+        crate::turn::TurnClient::send(self, to, packet);
+    }
+}
+
+/// (v331) Le client TURN d'un nœud de ce jeu dont l'adresse relayée est `mine` (la voie
+/// rapide d'une partie FPS envoie par lui : c'est cette adresse que l'autre bout connaît).
+fn turn_find(mine: SocketAddrV4) -> Option<Arc<dyn fast::TurnLink>> {
+    let nodes: Vec<Arc<Inner>> = NODES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(_, w)| w.upgrade())
+        .collect();
+    nodes.iter().find_map(|i| {
+        let t = i.turn.lock().unwrap().clone()?;
+        (t.relayed() == Some(mine)).then_some(t as Arc<dyn fast::TurnLink>)
+    })
+}
 
 /// Une route est donnée, changée ou reprise par le relais (`fast::tunnel_given`) : les
 /// nœuds qui la portent déjà la mettent à jour ; celle d'un joueur vers un de nos nœuds
@@ -259,7 +306,11 @@ impl Inner {
             return None;
         }
         if let Some(v) = r.vias.iter_mut().find(|v| v.addr == from && v.turn == turn) {
-            v.heard = Some(Instant::now());
+            let now = Instant::now();
+            if v.heard.is_none_or(|t| now.duration_since(t) >= SILENT) {
+                v.since = Some(now);
+            }
+            v.heard = Some(now);
         }
         // (v304) L'autre bout s'assure que la route passe : on lui répond par le même saut.
         if kind == fast::RAW_PING {
@@ -270,8 +321,18 @@ impl Inner {
         (kind == fast::RAW_DATA).then_some((route, body))
     }
 
-    /// (v329) Reçu par notre client TURN : gardé pour la prochaine lecture d'iroh.
+    /// (v329) Reçu par notre client TURN : gardé pour la prochaine lecture d'iroh. (v331)
+    /// Sauf ce qui est pour la voie rapide d'une partie FPS (mêmes en-têtes, d'autres
+    /// numéros de route) : remis à son bout.
     fn turn_in(&self, from: SocketAddr, p: &[u8]) {
+        let ours = p
+            .get(1..9)
+            .and_then(|r| r.try_into().ok())
+            .map(u64::from_le_bytes)
+            .is_some_and(|r| self.routes.lock().unwrap().contains_key(&r));
+        if !ours && fast::turn_received(from, p) {
+            return;
+        }
         {
             let mut q = self.turn_in.lock().unwrap();
             if q.len() >= TURN_QUEUE {
@@ -322,6 +383,7 @@ impl PasseurTransport {
     /// (`fast::tunnel_given`) y arrivent.
     pub(crate) fn register(&self, node: [u8; 32]) {
         fast::set_tunnel_hook(on_route);
+        fast::set_turn_find(turn_find);
         NODES.lock().unwrap().push((node, Arc::downgrade(&self.0)));
         let _ = self.0.node.set(node);
         // (v329) Une adresse chez un serveur TURN, si ce programme en veut (`enable_turn`)
@@ -397,17 +459,16 @@ impl PasseurTransport {
             // (Un saut gardé garde ce qu'on sait de lui.)
             let vias: Vec<Hop> = hops
                 .map(|(addr, seal, turn)| {
-                    let heard = old
-                        .and_then(|r| {
-                            r.vias
-                                .iter()
-                                .find(|v| v.addr == addr && v.seal == seal && v.turn == turn)
-                        })
-                        .and_then(|v| v.heard);
+                    let kept = old.and_then(|r| {
+                        r.vias
+                            .iter()
+                            .find(|v| v.addr == addr && v.seal == seal && v.turn == turn)
+                    });
                     Hop {
                         addr,
                         seal,
-                        heard,
+                        heard: kept.and_then(|v| v.heard),
+                        since: kept.and_then(|v| v.since),
                         turn,
                     }
                 })

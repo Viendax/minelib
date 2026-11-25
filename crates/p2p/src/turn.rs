@@ -1141,6 +1141,18 @@ pub mod essai {
                 pass: MINI_PASS.into(),
             }
         }
+
+        /// (v331) Le même, dans son propre moteur (pour les paquets qui n'ont pas tokio) :
+        /// il vit tant qu'on garde ce qui est rendu.
+        pub fn start_alone() -> (MiniTurn, impl Drop) {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("moteur du serveur TURN d'essai");
+            let server = MiniTurn::start(rt.handle());
+            (server, rt)
+        }
     }
 }
 

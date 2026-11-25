@@ -9502,12 +9502,14 @@ fn health_report(st: &mut State) {
     });
     let (offers, verified, carried) = st.fast.counts();
     let (turn_nodes, turn_tunnels) = st.fast.turn_counts();
+    let (fps_turn, fps_turn_only) = st.fast.fps_turns();
     let line = format!(
         "relais (santé, {:.0} s) : {} connexions, {fps} parties FPS, {build} mondes ; {} demandes, \
          attente la plus longue {:.0} ms, traitement le plus long {:.0} ms ; {} positions \
          écartées ; {} connexions de compte (refusées {}, relais occupé {}) ; passeurs : \
          {offers} annoncés, {verified} vérifiés, {carried} parties portées, {} tunnels portés ; \
-         TURN : {turn_nodes} nœuds, {turn_tunnels} tunnels",
+         TURN : {turn_nodes} nœuds, {turn_tunnels} tunnels, {fps_turn} joueurs FPS (dont \
+         {fps_turn_only} sans passeur)",
         since.elapsed().as_secs_f32(),
         st.conns.len(),
         h.requests,
