@@ -53,7 +53,8 @@ pub struct DebugInfo<'a> {
     /// (v309) Tours de la carte bouclée du joueur (`laps`) : une ligne de plus s'il en a fait.
     pub laps: crate::laps::Laps,
     pub hit: Option<Hit>,
-    pub seed: u32,
+    /// (v328) `None` : la graine du monde est verrouillée par les OP du serveur (`/seed lock`).
+    pub seed: Option<u32>,
     pub chunks_loaded: usize,
     pub stats: FrameStats,
     pub held: String,
@@ -248,7 +249,9 @@ pub fn build(d: &DebugInfo) -> Overlay {
     left.push(Line::new(
         format!(
             "Monde « {} »   graine {}   FOV {:.0}°",
-            e.world_name, d.seed, e.fov
+            e.world_name,
+            d.seed.map_or("verrouillée".to_string(), |s| s.to_string()),
+            e.fov
         ),
         Line::DIM,
     ));

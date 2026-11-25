@@ -3323,6 +3323,25 @@ fn item_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &game::Build
     publish_items(st, rid, id, out);
 }
 
+/// (v328) Ce que vaut la graine du monde de `server` (de `creator`) pour le joueur `id` :
+/// verrouillée ou non, et s'il peut la voir et télécharger la carte (OP, ou elle ne l'est pas).
+fn push_seed_lock(st: &State, server: &str, creator: &str, id: u64) {
+    let Some(c) = st.conns.get(&id) else {
+        return;
+    };
+    let allowed = c
+        .pseudo
+        .as_deref()
+        .is_some_and(|p| st.servers.seed_allowed(server, creator, p));
+    transport::push(
+        &c.tx,
+        &Response::SeedLock {
+            locked: st.servers.seed_locked(server),
+            allowed,
+        },
+    );
+}
+
 /// (v224) Demande de lumière de l'éditeur (`BuildMsg::LightPut`), à l'arbitre de son chunk
 /// (le relais du monde, ou le relais de sa province) : seulement d'un OP du serveur, pas
 /// plus de `LIGHT_RATE` par seconde, d'une taille raisonnable ; publiée comme l'état d'un
@@ -7666,6 +7685,14 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     },
                 });
             }
+            // (v328) La graine du monde demandée (sans rien changer : `reason` vide) : à tout
+            // joueur du serveur, ce qui vaut pour lui (à son arrivée, à l'ouverture du monde).
+            if action == proto::SERVER_SEED && reason.trim().is_empty() {
+                push_seed_lock(st, &server, &creator, id);
+                return Some(Response::ServerAdmin {
+                    text: String::new(),
+                });
+            }
             let act = match action {
                 proto::SERVER_BAN => servers::Action::Ban,
                 proto::SERVER_UNBAN => servers::Action::Unban,
@@ -7685,6 +7712,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 proto::SERVER_WEATHER => servers::Action::Weather,
                 proto::SERVER_TELEPORT => servers::Action::Teleport,
                 proto::SERVER_SETSPAWN => servers::Action::SetSpawn,
+                proto::SERVER_SEED => servers::Action::Seed,
                 _ => servers::Action::List,
             };
             // Nouveau nom : vide ou trop long refusé avant de vérifier qu'on est OP.
@@ -7716,6 +7744,38 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             transport::push(&c.tx, &Response::SetTime { hours, fixed });
                         }
                         provinces::push_time(st, &server, (hours, fixed));
+                    }
+                    // (v328) La graine verrouillée ou non : chacun des joueurs du serveur
+                    // apprend ce qui vaut pour lui (les provinces aussi, pour ceux qui sont au
+                    // fond d'un pays). Un OP de plus ou de moins : lui, s'il est là (les
+                    // provinces le savent par leurs réglages).
+                    if act == servers::Action::Seed {
+                        let here: Vec<u64> = st
+                            .conns
+                            .iter()
+                            .filter(|(_, c)| c.room == Some(rid))
+                            .map(|(&k, _)| k)
+                            .collect();
+                        for k in here {
+                            push_seed_lock(st, &server, &creator, k);
+                        }
+                        provinces::push_settings(st, &server);
+                    }
+                    if matches!(act, servers::Action::Op | servers::Action::Deop) {
+                        let who: Vec<u64> = st
+                            .conns
+                            .iter()
+                            .filter(|(_, c)| {
+                                c.room == Some(rid)
+                                    && c.pseudo
+                                        .as_deref()
+                                        .is_some_and(|p| p.eq_ignore_ascii_case(&target))
+                            })
+                            .map(|(&k, _)| k)
+                            .collect();
+                        for k in who {
+                            push_seed_lock(st, &server, &creator, k);
+                        }
                     }
                     // (v229) Météo changée : de même, à tous les joueurs du serveur.
                     if act == servers::Action::Weather {
@@ -13102,6 +13162,80 @@ mod tests {
                 layers: vec![3, 3, 7],
             }
         );
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v328) La graine du monde d'un serveur de construction : verrouillée par défaut ; chacun
+    /// apprend ce qui vaut pour lui (le créateur et les OP la voient, les autres non) quand il
+    /// le demande, quand un OP la déverrouille ou la verrouille (pour tous), et quand il devient
+    /// OP ou ne l'est plus. Un joueur qui n'est pas OP ne la change pas.
+    #[test]
+    fn the_seed_lock_is_said_to_each_player_of_a_server() {
+        let dir = std::env::temp_dir().join(format!("minelib-graine-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let lock_of = |c: &Client| match wait(c, |e| matches!(e, Event::SeedLock { .. })) {
+            Event::SeedLock { locked, allowed } => (locked, allowed),
+            _ => unreachable!(),
+        };
+        let admin = |c: &Client, action: u8, pseudo: &str, reason: &str| {
+            c.send(Cmd::ServerAdmin {
+                action,
+                pseudo: pseudo.into(),
+                reason: reason.into(),
+            });
+        };
+        let createur = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let eve = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        // Demandée : verrouillée ; le créateur la voit, Eve non.
+        admin(&createur, proto::SERVER_SEED, "", "");
+        assert_eq!(lock_of(&createur), (true, true));
+        admin(&eve, proto::SERVER_SEED, "", "");
+        assert_eq!(lock_of(&eve), (true, false));
+        // Eve n'est pas OP : refusé.
+        admin(&eve, proto::SERVER_SEED, "", "unlock");
+        assert!(wait_error(&eve).contains("OP"));
+        // Le créateur la déverrouille : tous l'apprennent ; puis la verrouille.
+        admin(&createur, proto::SERVER_SEED, "", "unlock");
+        assert_eq!(lock_of(&eve), (false, true));
+        assert_eq!(lock_of(&createur), (false, true));
+        admin(&createur, proto::SERVER_SEED, "", "lock");
+        assert_eq!(lock_of(&eve), (true, false));
+        // Eve devient OP : elle la voit ; puis ne l'est plus.
+        admin(&createur, proto::SERVER_OP, "Eve", "");
+        assert_eq!(lock_of(&eve), (true, true));
+        admin(&createur, proto::SERVER_DEOP, "Eve", "");
+        assert_eq!(lock_of(&eve), (true, false));
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
     }

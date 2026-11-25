@@ -413,6 +413,12 @@ pub enum Event {
         left: f32,
         fixed: bool,
     },
+    /// (v328) La graine du monde du serveur de construction : verrouillée, et ce que ce
+    /// joueur peut en faire (voir `Response::SeedLock`).
+    SeedLock {
+        locked: bool,
+        allowed: bool,
+    },
     /// (v244) Foudre de Zeus légendaire du serveur (voir `Response::Zeus`).
     Zeus {
         seq: u32,
@@ -1473,6 +1479,7 @@ impl Worker {
             Response::BulkDone { id, error } => Event::BulkDone { id, error },
             Response::SetTime { hours, fixed } => Event::SetTime { hours, fixed },
             Response::SetWeather { kind, left, fixed } => Event::SetWeather { kind, left, fixed },
+            Response::SeedLock { locked, allowed } => Event::SeedLock { locked, allowed },
             Response::Zeus {
                 seq,
                 act,

@@ -73,6 +73,9 @@ pub struct Store {
     op_ready: HashMap<String, HashMap<String, std::time::Instant>>,
     /// (v244) Foudre de Zeus de chaque serveur (fichier `….foudre`).
     legends: HashMap<String, Legend>,
+    /// (v328) Serveurs dont la graine est déverrouillée par un OP (fichier `….graine`) ;
+    /// les autres l'ont verrouillée (par défaut).
+    seeds_open: std::collections::BTreeSet<String>,
 }
 
 /// (v238) Un OP nommé (pas le créateur) nomme un OP au plus une fois toutes les… et pas
@@ -130,6 +133,8 @@ pub enum Action {
     Teleport,
     /// (v223) Point d'apparition du serveur (OP) : `reason` = « x y z lacet tangage ».
     SetSpawn,
+    /// (v328) Verrouiller la graine du monde ou non (OP) : `reason` = « lock » ou « unlock ».
+    Seed,
 }
 
 /// Le relais s'arrête : les dernières positions sont écrites.
@@ -188,6 +193,10 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let seeds_open = std::fs::read(path.with_extension("graine"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Self {
             path,
             servers,
@@ -203,6 +212,33 @@ impl Store {
             weathers,
             op_ready: HashMap::new(),
             legends,
+            seeds_open,
+        }
+    }
+
+    /// (v328) La graine du monde de ce serveur est-elle verrouillée (par défaut, oui) ?
+    pub fn seed_locked(&self, server: &str) -> bool {
+        !self.seeds_open.contains(server)
+    }
+
+    /// (v328) Ce que `who` peut faire de la graine (la voir, télécharger la carte) : tout si
+    /// elle n'est pas verrouillée, ou s'il est OP (le créateur l'est toujours).
+    pub fn seed_allowed(&self, server: &str, creator: &str, who: &str) -> bool {
+        !self.seed_locked(server) || self.is_op(server, creator, who)
+    }
+
+    /// (v328) La verrouiller ou non ; gardé dans le fichier (`save` : relais du monde ; une
+    /// province ne fait que suivre ce qu'il lui dit).
+    fn set_seed_locked(&mut self, server: &str, locked: bool, save: bool) {
+        if locked {
+            self.seeds_open.remove(server);
+        } else {
+            self.seeds_open.insert(server.to_string());
+        }
+        if save {
+            if let Ok(b) = postcard::to_allocvec(&self.seeds_open) {
+                let _ = crate::accounts::write_atomic(&self.path.with_extension("graine"), &b);
+            }
         }
     }
 
@@ -505,6 +541,8 @@ impl Store {
     /// Relais de province (v139) : réglages du serveur tels que les tient le relais du
     /// monde (OP, bannis, mode par défaut). Rien n'est écrit sur le disque ici.
     pub fn mirror(&mut self, server: &str, s: &minelib_net::proto::ProvinceSettings) {
+        // (v328) La graine, comme le relais du monde la tient (rien d'écrit ici).
+        self.set_seed_locked(server, !s.seed_open, false);
         let a = self.servers.entry(server.to_string()).or_default();
         a.ops = s.ops.iter().map(|o| o.to_ascii_lowercase()).collect();
         a.bans = s
@@ -577,6 +615,23 @@ impl Store {
                 return Ok(format!("Serveur renommé : {}.", reason.trim()));
             }
             Action::Weather => return self.set_weather(server, reason, rand::random::<f32>()),
+            Action::Seed => {
+                let locked = match reason.trim() {
+                    "lock" => true,
+                    "unlock" => false,
+                    _ => return Err("Usage : /seed lock true|false.".into()),
+                };
+                self.set_seed_locked(server, locked, true);
+                return Ok(if locked {
+                    "Graine du monde verrouillée : seuls les OP la voient (/seed) et peuvent \
+                     télécharger la carte."
+                        .into()
+                } else {
+                    "Graine du monde déverrouillée : tous les joueurs du serveur peuvent la voir \
+                     (/seed) et télécharger la carte (menu Échap)."
+                        .into()
+                });
+            }
             Action::Teleport => {
                 return Ok(if target.is_empty() || target.eq_ignore_ascii_case(by) {
                     "Téléporté.".into()
@@ -716,6 +771,7 @@ impl Store {
             | Action::Weather
             | Action::Teleport
             | Action::SetSpawn
+            | Action::Seed
             | Action::DefaultGamemode => unreachable!("traité plus haut"),
             Action::Ban if is_creator => return Err("On ne bannit pas le créateur.".into()),
             Action::Ban if by.eq_ignore_ascii_case(target) => {
@@ -828,6 +884,58 @@ mod tests {
         assert!(!s2.whitelisted_out(&k, "Createur", "eve"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("whitelist"));
+    }
+
+    /// (v328) La graine du monde : verrouillée par défaut (seuls les OP et le créateur la
+    /// voient), déverrouillée ou verrouillée par un OP seulement, gardée sur le disque ; une
+    /// province suit ce que lui dit le relais du monde (sans rien écrire).
+    #[test]
+    fn the_seed_is_locked_by_default_and_ops_unlock_it() {
+        let path = std::env::temp_dir().join(format!("minelib-graine-{}", rand::random::<u32>()));
+        let mut s = Store::open(path.clone());
+        let k = key("Createur", "monde");
+        let other = key("Createur", "autre");
+        assert!(s.seed_locked(&k), "verrouillée par défaut");
+        assert!(!s.seed_allowed(&k, "Createur", "Eve"));
+        assert!(s.seed_allowed(&k, "Createur", "createur"), "le créateur la voit");
+        assert!(s
+            .act(&k, "Createur", "Eve", Action::Seed, "", "unlock")
+            .is_err());
+        assert!(s.seed_locked(&k), "pas OP : rien ne change");
+        s.act(&k, "Createur", "Createur", Action::Op, "Bob", "")
+            .unwrap();
+        assert!(s.seed_allowed(&k, "Createur", "BOB"), "un OP la voit");
+        assert!(s
+            .act(&k, "Createur", "Bob", Action::Seed, "", "ouvrir")
+            .is_err());
+        s.act(&k, "Createur", "Bob", Action::Seed, "", "unlock")
+            .unwrap();
+        assert!(!s.seed_locked(&k) && s.seed_allowed(&k, "Createur", "Eve"));
+        assert!(s.seed_locked(&other), "chaque serveur la sienne");
+        // Gardée sur le disque.
+        let mut again = Store::open(path.clone());
+        assert!(!again.seed_locked(&k) && again.seed_locked(&other));
+        again
+            .act(&k, "Createur", "Createur", Action::Seed, "", "lock")
+            .unwrap();
+        assert!(Store::open(path.clone()).seed_locked(&k));
+        // Une province suit le relais du monde.
+        let ppath = std::env::temp_dir().join(format!("minelib-graine-p-{}", rand::random::<u32>()));
+        let mut province = Store::open(ppath.clone());
+        let mut set = minelib_net::proto::ProvinceSettings {
+            seed_open: true,
+            ..Default::default()
+        };
+        province.mirror(&k, &set);
+        assert!(!province.seed_locked(&k));
+        set.seed_open = false;
+        province.mirror(&k, &set);
+        assert!(province.seed_locked(&k));
+        assert!(!ppath.with_extension("graine").exists(), "rien d'écrit chez la province");
+        let _ = std::fs::remove_file(&path);
+        for ext in ["graine", "whitelist"] {
+            let _ = std::fs::remove_file(path.with_extension(ext));
+        }
     }
 
     /// (v229) La météo imposée : par un OP seulement, pour une durée ordinaire tirée par le

@@ -79,6 +79,8 @@ use serde::{Deserialize, Serialize};
 /// (v325, toujours 75) `Host::wake`, `Hosted::world`, `Joined::world`, `ServerEntry::world`
 /// et `ServerEntry::creator`.
 /// (v326, toujours 75) `Host::replace`, `Host::code` et `Response::WorldLimit`.
+/// (v328, toujours 75) La graine du monde verrouillée (`SERVER_SEED`, `Response::SeedLock`,
+/// `ProvinceSettings::seed_open`).
 pub const PROTOCOL: u32 = 75;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
@@ -165,6 +167,13 @@ pub const SERVER_WEATHER: u8 = 19;
 /// (`Response::MatchPeer`). Les messages de la partie (`ToHost`, `ToPeer`, `Broadcast`) ne vont
 /// qu'entre son hôte et ses joueurs.
 pub const SERVER_MATCH: u8 = 20;
+/// (v328) La graine du monde (`/seed`) : `reason` = « lock » ou « unlock » (OP : la verrouiller
+/// ou non pour les autres joueurs), vide (tout joueur du serveur : son état, rien ne change).
+/// Verrouillée (par défaut), seuls les OP (et le créateur) la voient et peuvent télécharger
+/// une copie de la carte (menu Échap). Le relais dit à chacun ce qui vaut pour lui
+/// (`Response::SeedLock`) : à l'arrivée, quand un OP la change, quand on devient OP ou qu'on
+/// ne l'est plus, et à qui le demande.
+pub const SERVER_SEED: u8 = 21;
 
 /// (v229) Temps qu'il fait, dans `Response::SetWeather` : beau temps, pluie, orage ; ou
 /// aucun temps imposé (celui des horloges du monde, que chaque jeu calcule).
@@ -1841,6 +1850,13 @@ pub enum Response {
         left: f32,
         fixed: bool,
     },
+    /// (v328) Poussé (voir `SERVER_SEED`) : la graine du monde est verrouillée (`locked`), et
+    /// ce joueur peut la voir et télécharger la carte (`allowed` : elle ne l'est pas, ou il est
+    /// OP).
+    SeedLock {
+        locked: bool,
+        allowed: bool,
+    },
     /// (v231) Poussé : `from` nous invite dans son monde de construction `room` (`name`).
     Invited {
         from: String,
@@ -2076,6 +2092,7 @@ impl Response {
                 | Response::Probe { .. }
                 | Response::SetTime { .. }
                 | Response::SetWeather { .. }
+                | Response::SeedLock { .. }
                 | Response::Zeus { .. }
                 | Response::BuildSpawn { .. }
                 | Response::Arbitrate { .. }
@@ -2475,6 +2492,10 @@ pub struct ProvinceSettings {
     /// (v229) Météo du serveur (temps, secondes qu'il lui reste, figée : comme dans
     /// `Response::SetWeather`), quand un OP vient de la changer.
     pub weather: Option<(u8, f32, bool)>,
+    /// (v328) La graine du monde est déverrouillée (`SERVER_SEED` ; faux, par défaut : elle
+    /// l'est) : la province le dit à ses joueurs quand ça change (ceux qui ne sont plus
+    /// connectés au relais du monde).
+    pub seed_open: bool,
 }
 
 /// Province d'un relais de région (dans `ShardTask`) : où la joindre, et le jeton qui

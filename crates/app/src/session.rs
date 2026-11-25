@@ -574,6 +574,7 @@ struct Online {
     saved_mode: Option<GameMode>,
     friends_said: bool,
     light_op: (bool, Option<std::time::Instant>),
+    seed_lock: Option<(bool, bool)>,
 }
 
 pub struct Session {
@@ -1026,6 +1027,13 @@ pub struct Session {
     light_denied_said: Option<std::time::Instant>,
     light_op_ok: bool,
     light_clear_asked: bool,
+    /// (v328) Sur un serveur de construction, la graine du monde : (verrouillée, ce joueur peut
+    /// la voir et télécharger la carte), comme le relais le dit (`Event::SeedLock`). `None` :
+    /// pas encore dit (rien de permis d'ici là).
+    seed_lock: Option<(bool, bool)>,
+    /// (v328) `/seed lock` vient d'être demandé au relais (sa réponse se lit au tchat : pas
+    /// deux fois le même message).
+    seed_lock_asked: Option<std::time::Instant>,
     /// Lumières à afficher cette image, et état de leurs shaders (« Préparation des
     /// lumières… » tant qu'ils compilent).
     lights_wanted: bool,
@@ -1508,6 +1516,8 @@ impl Session {
             light_inbox: Vec::new(),
             light_denied_said: None,
             light_op_ok: false,
+            seed_lock: None,
+            seed_lock_asked: None,
             light_clear_asked: false,
             lights_wanted: false,
             shadow_lights: Vec::new(),
@@ -1648,9 +1658,21 @@ impl Session {
         save::save_world(&self.dir, &data, &self.world)
     }
 
+    /// (v328) Ce joueur peut-il voir la graine du monde (`/seed`, écran F3) et télécharger une
+    /// copie de la carte (menu Échap) ? En solo, oui ; sur un serveur de construction,
+    /// seulement si ses OP ne l'ont pas verrouillée (par défaut, elle l'est) ou s'il est OP
+    /// (le relais le dit : `Event::SeedLock` ; rien de permis avant).
+    pub fn seed_allowed(&self) -> bool {
+        self.build.is_none() || self.seed_lock.is_some_and(|(_, allowed)| allowed)
+    }
+
     /// Copie du monde tel qu'il est maintenant (serveur de construction compris) dans ses
-    /// mondes solo, sous un nouveau nom. Renvoie son dossier.
+    /// mondes solo, sous un nouveau nom. Renvoie son dossier. (v328) Refusée quand la graine
+    /// est verrouillée pour ce joueur (`seed_allowed`).
     pub fn download_copy(&mut self, saves: &std::path::Path) -> Result<std::path::PathBuf> {
+        if !self.seed_allowed() {
+            anyhow::bail!("carte verrouillée par les OP du serveur (/seed lock)");
+        }
         let name = format!("{} (copie)", self.meta.name);
         let dir = save::create_world(saves, &name, self.meta.seed)?;
         let mut meta = self.meta.clone();
@@ -1881,6 +1903,7 @@ impl Session {
                 saved_mode: self.saved_mode,
                 friends_said: self.friends_said,
                 light_op: (self.light_op_ok, self.light_op_probe),
+                seed_lock: self.seed_lock,
             })
         });
         Carry {
@@ -1921,7 +1944,9 @@ impl Session {
             saved_mode,
             friends_said,
             light_op,
+            seed_lock,
         } = *o;
+        self.seed_lock = seed_lock;
         let to = self.world.origin_blocks();
         // L'écart le plus court entre les deux origines, sur la carte bouclée.
         let w = minelib_world::lap::wrap_block;
@@ -8818,6 +8843,26 @@ impl Session {
                     *expires,
                     permit.clone(),
                 ),
+                // (v328) La graine du monde : ce qui vaut pour nous (à l'arrivée, quand un OP
+                // la verrouille ou non, ou qu'on devient OP ou qu'on ne l'est plus).
+                Event::SeedLock { locked, allowed } => {
+                    let before = self.seed_lock.replace((*locked, *allowed));
+                    let mine = self
+                        .seed_lock_asked
+                        .take()
+                        .is_some_and(|t| t.elapsed().as_secs_f32() < 10.0);
+                    if before.is_some_and(|(was, _)| was != *locked) && !mine {
+                        self.chat.say(
+                            if *locked {
+                                "Un OP a verrouillé la graine du monde (/seed, téléchargement de la carte)."
+                            } else {
+                                "Un OP a déverrouillé la graine du monde : /seed, et « Télécharger la carte » dans le menu Échap."
+                            },
+                            chat::YELLOW,
+                        );
+                    }
+                    return;
+                }
                 Event::SetWeather { kind, left, fixed } => {
                     self.storm.weather.impose(
                         crate::weather::Kind::from_byte(*kind),
@@ -9883,6 +9928,61 @@ impl Session {
                     action,
                     pseudo: target,
                     reason: words.get(2..).map_or(String::new(), |w| w.join(" ")),
+                });
+                true
+            }
+            // (v328) « /seed (commande commune) et /seed lock true/false (commande op) pour
+            // activer qu'on puisse avoir la seed de la map ou non ; si c'est locké on ne peut pas
+            // télécharger la map dans Échap et on ne peut pas voir la seed avec /seed ; locké par
+            // défaut » (Viendax, 25 novembre). En solo, la graine est au joueur.
+            "seed" | "graine" => {
+                // (Pas en partie FPS en ligne : ses commandes y sont comptées.)
+                if self.ranked_match() {
+                    return false;
+                }
+                let sub = words.get(1).map(|w| w.to_lowercase()).unwrap_or_default();
+                if sub.is_empty() {
+                    if self.seed_allowed() {
+                        self.chat
+                            .say(format!("Graine du monde : {}", self.world.seed), chat::YELLOW);
+                    } else if self.seed_lock.is_none() {
+                        self.chat.say(
+                            "Graine du monde : le serveur ne l'a pas encore dit, réessaie dans un instant.",
+                            chat::GREY,
+                        );
+                    } else {
+                        self.chat.say(
+                            "La graine de ce monde est verrouillée par ses OP (eux seuls la voient).",
+                            chat::RED,
+                        );
+                    }
+                    return true;
+                }
+                let lock = match (sub.as_str(), words.get(2).and_then(|w| chat::switch(w))) {
+                    ("lock" | "verrou" | "verrouiller", Some(on)) => Some(on),
+                    ("lock" | "verrou" | "verrouiller", None) if words.len() == 2 => Some(true),
+                    ("unlock" | "deverrouiller" | "déverrouiller", None) => Some(false),
+                    _ => None,
+                };
+                let Some(lock) = lock else {
+                    self.chat.say(
+                        "Usage : /seed (la graine du monde), /seed lock true|false (la verrouiller ou non : OP d'un serveur de construction).",
+                        chat::GREY,
+                    );
+                    return true;
+                };
+                if self.build.is_none() {
+                    self.chat.say(
+                        "/seed lock : sur un serveur de construction en ligne, pour ses OP (en solo, la graine est à toi).",
+                        chat::RED,
+                    );
+                    return true;
+                }
+                self.seed_lock_asked = Some(std::time::Instant::now());
+                self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                    action: minelib_net::proto::SERVER_SEED,
+                    pseudo: String::new(),
+                    reason: if lock { "lock" } else { "unlock" }.into(),
                 });
                 true
             }
@@ -11094,6 +11194,7 @@ impl Session {
                     "/tp <x y z | pseudo> ; /tp <pseudo> <x y z | pseudo> : téléporter (~ : par rapport à toi ; en ligne, OP)",
                     "/setspawn : point d'apparition là où tu es (en ligne, OP : pour qui arrive)",
                     "/worldname <nom> : renomme le monde",
+                    "/seed : la graine du monde ; /seed lock true|false : la verrouiller ou non (en ligne, OP ; verrouillée par défaut : ni /seed ni « Télécharger la carte » pour qui n'est pas OP)",
                     "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
                     "/timefix on|off : arrête ou relance le temps",
                     "/weather clear|rain|storm : le temps qu'il fait ; /weather fix [on|off] : le fige (en ligne, OP : pour tout le serveur)",
@@ -12478,7 +12579,8 @@ impl Session {
             origin: self.world.origin_blocks(),
             laps: self.laps(),
             hit,
-            seed: self.world.seed,
+            // (v328) Verrouillée par les OP du serveur : pas à l'écran F3 non plus.
+            seed: self.seed_allowed().then_some(self.world.seed),
             chunks_loaded: self.world.len(),
             stats,
             held: self

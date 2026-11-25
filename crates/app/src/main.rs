@@ -1641,6 +1641,12 @@ impl Game {
                             pseudo: String::new(),
                             reason: String::new(),
                         });
+                        // (v328) Et ce qui vaut pour sa graine (son créateur la voit toujours).
+                        self.accounts.room(Cmd::ServerAdmin {
+                            action: minelib_net::proto::SERVER_SEED,
+                            pseudo: String::new(),
+                            reason: String::new(),
+                        });
                         let (sig, name, bytes) = h.upload;
                         self.accounts.room(Cmd::UploadMap {
                             sig,
@@ -3109,6 +3115,12 @@ impl Game {
             pseudo: String::new(),
             reason: String::new(),
         });
+        // (v328) Sa graine : verrouillée ou non, et ce qui vaut pour nous.
+        self.accounts.room(minelib_net::client::Cmd::ServerAdmin {
+            action: minelib_net::proto::SERVER_SEED,
+            pseudo: String::new(),
+            reason: String::new(),
+        });
     }
 
     /// Réponses du relais, et options à enregistrer (clé du relais, dernier pseudo).
@@ -3535,14 +3547,23 @@ impl Game {
         y += 24.0 * s;
         let settings = c.button("Paramètres", cx, y, 200.0, true);
         // Serveur de construction : une copie du monde tel qu'il est, dans ses mondes solo.
+        // (v328) Pas quand ses OP ont verrouillé la graine du monde (par défaut : seuls eux).
         let on_build = self.session.as_ref().is_some_and(|s| s.build.is_some());
+        let may_download = self.session.as_ref().is_some_and(|s| s.seed_allowed());
         let download = on_build && {
             y += 24.0 * s;
-            c.button("Télécharger la carte", cx, y, 200.0, true)
+            c.button("Télécharger la carte", cx, y, 200.0, may_download)
         };
-        if let Some(t) = self.download_note.as_ref().filter(|_| on_build) {
+        let locked_note = (on_build && !may_download)
+            .then(|| "Carte verrouillée par les OP du serveur (/seed lock).".to_string());
+        if let Some(t) = locked_note
+            .as_ref()
+            .or(self.download_note.as_ref())
+            .filter(|_| on_build)
+        {
+            // (v328) Sous le bouton (haut de 20), plus sur son bas.
             let tw = Ui::text_width(t, s);
-            c.ui.text(cx - tw / 2.0, y + 14.0 * s, s, GREY, t.clone());
+            c.ui.text(cx - tw / 2.0, y + 23.0 * s, s, GREY, t.clone());
         }
         // Partie FPS en ligne : votes d'équipe (comme dans CS).
         let choices = self.session.as_ref().and_then(|s| s.vote_choices());

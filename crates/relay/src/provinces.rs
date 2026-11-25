@@ -1693,6 +1693,7 @@ pub(crate) fn settings_of(st: &State, server: &str) -> proto::ProvinceSettings {
         modes: st.bags.modes_of(server),
         time: None,
         weather: None,
+        seed_open: !st.servers.seed_locked(server),
     }
 }
 
@@ -4842,6 +4843,7 @@ pub(crate) fn settings(st: &mut State, settings: proto::ProvinceSettings) {
         return;
     };
     let server = room.server.clone();
+    let creator = room.creator.clone();
     let banned: Vec<u64> = room
         .members
         .iter()
@@ -4853,6 +4855,20 @@ pub(crate) fn settings(st: &mut State, settings: proto::ProvinceSettings) {
                 .is_some_and(|p| settings.bans.iter().any(|b| b.eq_ignore_ascii_case(p)))
         })
         .copied()
+        .collect();
+    // (v328) Ce que chacun pouvait faire de la graine avant (verrouillée, OP).
+    let seed_before: Vec<(u64, bool, bool)> = room
+        .members
+        .iter()
+        .filter(|m| !room.hidden.contains(m))
+        .filter_map(|m| {
+            let p = st.conns.get(m)?.pseudo.clone()?;
+            Some((
+                *m,
+                st.servers.seed_locked(&server),
+                st.servers.seed_allowed(&server, &creator, &p),
+            ))
+        })
         .collect();
     // (v146) Mode de chacun de ses joueurs avant : celui qu'un OP vient de changer le lui
     // dit (au fond d'un pays, il n'est plus connecté au relais du monde).
@@ -4896,6 +4912,21 @@ pub(crate) fn settings(st: &mut State, settings: proto::ProvinceSettings) {
             if let Some(c) = st.conns.get(m) {
                 transport::push(&c.tx, &Response::SetWeather { kind, left, fixed });
             }
+        }
+    }
+    // (v328) La graine : à qui elle change (verrouillée ou non par un OP, ou devenu OP ou
+    // plus).
+    for (m, locked0, allowed0) in seed_before {
+        let Some(c) = st.conns.get(&m) else {
+            continue;
+        };
+        let Some(p) = c.pseudo.as_deref() else {
+            continue;
+        };
+        let locked = st.servers.seed_locked(&server);
+        let allowed = st.servers.seed_allowed(&server, &creator, p);
+        if (locked, allowed) != (locked0, allowed0) {
+            transport::push(&c.tx, &Response::SeedLock { locked, allowed });
         }
     }
     for id in banned {

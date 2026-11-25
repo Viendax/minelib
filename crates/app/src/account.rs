@@ -1335,6 +1335,7 @@ impl Accounts {
                 | Event::BulkDone { .. }
                 | Event::SetTime { .. }
                 | Event::SetWeather { .. }
+                | Event::SeedLock { .. }
                 | Event::Zeus { .. }
                 | Event::BuildSpawn { .. }
                 | Event::MapProgress(..)

@@ -1105,6 +1105,7 @@ impl BuildNet {
                     | Event::Slain(_)
                     | Event::SetTime { .. }
                     | Event::SetWeather { .. }
+                    | Event::SeedLock { .. }
                         if dozing && here == Some(*p) =>
                     {
                         notices.push(e)
