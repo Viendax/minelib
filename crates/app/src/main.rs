@@ -1145,6 +1145,8 @@ impl Game {
         let settings = c.button("Paramètres", cx, y, 200.0, true);
         y += step * 1.5;
         let quit = c.button("Quitter le jeu", cx, y, 200.0, true);
+        // (v319) Le bas du dernier bouton : les questions d'en bas à gauche restent dessous.
+        let buttons_bottom = y + 20.0 * s;
         let ds = (s / 2.0).floor().max(1.0);
         // Version et état (à jour, mise à jour disponible…), bien lisible.
         let (line, color) = self.updater.line();
@@ -1165,30 +1167,51 @@ impl Game {
         if let Some(t) = &self.updater.status {
             c.ui.text(4.0 * s, c.h - 50.0 * s, ds, update::ORANGE, t.clone());
         }
+        // (v319) Les deux questions qui suivent (une seule fois chacune) : en bas à gauche,
+        // entre le dernier bouton et la version (« plus bas le message à gauche » : à 110 fois
+        // l'échelle du bas, le titre passait sur « Paramètres » dès que la fenêtre fait moins
+        // de 376 fois l'échelle de haut, 900 pixels compris), ses lignes espacées. Pas pendant
+        // qu'une mise à jour est proposée : son bouton est à cette place (la question revient
+        // après).
+        let ask = self.updater.available.is_none() && self.updater.status.is_none();
+        let question = |c: &mut Ctx<'_>, title: &str, lines: &[&str]| -> (bool, bool) {
+            let lines_y = 11.0 * s;
+            let buttons_y = lines_y + lines.len() as f32 * 10.0 * ds + 6.0 * s;
+            let height = buttons_y + 20.0 * s;
+            let (top, bottom) = (buttons_bottom, c.h - 12.0 * s);
+            // Au pixel près : un texte posé entre deux pixels prend un trait de la lettre
+            // voisine dans l'image des lettres.
+            let y0 = if bottom - top >= height {
+                top + (bottom - top - height) / 2.0
+            } else {
+                bottom - height - 2.0 * s
+            }
+            .round();
+            c.ui.text(4.0 * s, y0, s, WHITE, title);
+            for (i, line) in lines.iter().enumerate() {
+                c.ui
+                    .text(4.0 * s, y0 + lines_y + i as f32 * 10.0 * ds, ds, GREY, *line);
+            }
+            let yes = c.button("Oui", 4.0 * s + 33.0 * s, y0 + buttons_y, 66.0, true);
+            let no = c.button("Non", 4.0 * s + 105.0 * s, y0 + buttons_y, 66.0, true);
+            (yes, no)
+        };
         // (v307) Une seule fois, en bas à gauche : partager son journal réseau ? La
         // réponse se change ensuite dans Paramètres → Paramètres avancés.
         let mut share_answer = None;
-        if self.options.share_netlog.is_none() {
-            let y0 = c.h - 110.0 * s;
-            c.ui.text(4.0 * s, y0, s, WHITE, "Aider à corriger le réseau du jeu ?");
-            c.ui.text(
-                4.0 * s,
-                y0 + 11.0 * s,
-                ds,
-                GREY,
-                "Partager des lignes sur l'état de ton réseau avec le relais :",
+        if ask && self.options.share_netlog.is_none() {
+            let (yes, no) = question(
+                &mut c,
+                "Aider à corriger le réseau du jeu ?",
+                &[
+                    "Partager des lignes sur l'état de ton réseau avec le relais :",
+                    "ni pseudo, ni adresse. Se change dans Paramètres avancés.",
+                ],
             );
-            c.ui.text(
-                4.0 * s,
-                y0 + 11.0 * s + 7.0 * ds,
-                ds,
-                GREY,
-                "ni pseudo, ni adresse. Se change dans Paramètres avancés.",
-            );
-            if c.button("Oui", 4.0 * s + 33.0 * s, y0 + 26.0 * s, 66.0, true) {
+            if yes {
                 share_answer = Some(true);
             }
-            if c.button("Non", 4.0 * s + 105.0 * s, y0 + 26.0 * s, 66.0, true) {
+            if no {
                 share_answer = Some(false);
             }
         }
@@ -1197,24 +1220,21 @@ impl Game {
         // personne ne voit l'adresse de celui à qui il parle. Mais celui à qui un passeur
         // remet un paquet voit l'adresse du passeur : on ne le devient pas sans l'accepter.
         let mut passeur_answer = None;
-        if self.options.share_netlog.is_some() && self.options.passeur.is_none() {
-            let y0 = c.h - 116.0 * s - 7.0 * ds;
-            c.ui.text(4.0 * s, y0, s, WHITE, "Relayer pour les autres joueurs ?");
-            for (i, line) in [
-                "Ton jeu porte des paquets chiffrés d'autres joueurs, les leurs portent les",
-                "tiens : c'est ce qui cache les adresses IP entre joueurs. Ceux à qui ton jeu",
-                "remet un paquet voient ton adresse (pas ton pseudo). Qui relaie est servi",
-                "en premier quand les passeurs manquent. Paramètres avancés.",
-            ]
-            .iter()
-            .enumerate()
-            {
-                c.ui.text(4.0 * s, y0 + 11.0 * s + i as f32 * 7.0 * ds, ds, GREY, *line);
-            }
-            if c.button("Oui", 4.0 * s + 33.0 * s, y0 + 32.0 * s + 7.0 * ds, 66.0, true) {
+        if ask && self.options.share_netlog.is_some() && self.options.passeur.is_none() {
+            let (yes, no) = question(
+                &mut c,
+                "Relayer pour les autres joueurs ?",
+                &[
+                    "Ton jeu porte des paquets chiffrés d'autres joueurs, les leurs portent les",
+                    "tiens : c'est ce qui cache les adresses IP entre joueurs. Ceux à qui ton jeu",
+                    "remet un paquet voient ton adresse (pas ton pseudo). Qui relaie est servi",
+                    "en premier quand les passeurs manquent. Paramètres avancés.",
+                ],
+            );
+            if yes {
                 passeur_answer = Some(true);
             }
-            if c.button("Non", 4.0 * s + 105.0 * s, y0 + 32.0 * s + 7.0 * ds, 66.0, true) {
+            if no {
                 passeur_answer = Some(false);
             }
         }
