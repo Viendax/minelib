@@ -311,8 +311,15 @@ pub const LIVE_MAX: usize = 256;
 /// Ce que des joueurs doivent recevoir : (joueur, messages).
 pub type Sends = Vec<(u64, Vec<Vec<u8>>)>;
 
+/// (v318) Sur la carte bouclée : de part et d'autre de sa limite, deux chunks voisins sont
+/// proches.
 pub fn near(a: [i32; 2], b: [i32; 2]) -> bool {
-    (a[0] - b[0]).abs() <= NEAR && (a[1] - b[1]).abs() <= NEAR
+    minelib_net::proto::chunks_within(a, b, NEAR)
+}
+
+/// (v318) Le chunk à (`dx`, `dz`) de `c`, sur la carte bouclée.
+fn step(c: [i32; 2], dx: i32, dz: i32) -> [i32; 2] {
+    minelib_net::proto::wrap_chunks([c[0] as i64 + dx as i64, c[1] as i64 + dz as i64])
 }
 
 impl Build {
@@ -619,7 +626,7 @@ impl Build {
                     if dx.abs().max(dz.abs()) != d {
                         continue;
                     }
-                    let Some(members) = self.by_chunk.get(&[chunk[0] + dx, chunk[1] + dz]) else {
+                    let Some(members) = self.by_chunk.get(&step(chunk, dx, dz)) else {
                         continue;
                     };
                     let room = limit - out.len();
@@ -665,7 +672,7 @@ impl Build {
                     if dx.abs().max(dz.abs()) != d {
                         continue;
                     }
-                    let Some(members) = self.by_chunk.get(&[chunk[0] + dx, chunk[1] + dz]) else {
+                    let Some(members) = self.by_chunk.get(&step(chunk, dx, dz)) else {
                         continue;
                     };
                     if members.is_empty() {
@@ -709,19 +716,16 @@ impl Build {
     /// sauf `except` : ceux qui voient la foule d'essai d'un OP.
     pub fn within(&mut self, chunk: [i32; 2], radius: i32, except: u64) -> Vec<u64> {
         self.reindex();
-        let lo = minelib_net::proto::zone_of([chunk[0] - radius, chunk[1] - radius]);
-        let hi = minelib_net::proto::zone_of([chunk[0] + radius, chunk[1] + radius]);
         let mut out = Vec::new();
-        for zx in lo[0]..=hi[0] {
-            for zz in lo[1]..=hi[1] {
-                let Some(v) = self.by_zone.get(&[zx, zz]) else {
-                    continue;
-                };
-                out.extend(v.iter().filter_map(|&(m, c)| {
-                    let near = (c[0] - chunk[0]).abs() <= radius && (c[1] - chunk[1]).abs() <= radius;
-                    (near && m != except).then_some(m)
-                }));
-            }
+        // (v318) Les zones autour, sur la carte bouclée.
+        for w in minelib_net::proto::zones_around(chunk, radius) {
+            let Some(v) = self.by_zone.get(&w) else {
+                continue;
+            };
+            out.extend(v.iter().filter_map(|&(m, c)| {
+                let near = minelib_net::proto::chunks_within(c, chunk, radius);
+                (near && m != except).then_some(m)
+            }));
         }
         out
     }
@@ -744,19 +748,16 @@ impl Build {
                     .filter(|&id| id != except)
                     .collect();
             }
-            // Par zones (49 au lieu de 625 chunks : essai de charge souverain, v136).
+            // Par zones (49 au lieu de 625 chunks : essai de charge souverain, v136). (v318)
+            // Sur la carte bouclée.
             let mut out = Vec::new();
-            let lo = minelib_net::proto::zone_of([chunk[0] - NEAR, chunk[1] - NEAR]);
-            let hi = minelib_net::proto::zone_of([chunk[0] + NEAR, chunk[1] + NEAR]);
-            for zx in lo[0]..=hi[0] {
-                for zz in lo[1]..=hi[1] {
-                    if let Some(m) = self.by_zone.get(&[zx, zz]) {
-                        out.extend(
-                            m.iter()
-                                .filter(|&&(id, c)| id != except && near(c, chunk))
-                                .map(|&(id, _)| id),
-                        );
-                    }
+            for w in minelib_net::proto::zones_around(chunk, NEAR) {
+                if let Some(m) = self.by_zone.get(&w) {
+                    out.extend(
+                        m.iter()
+                            .filter(|&&(id, c)| id != except && near(c, chunk))
+                            .map(|&(id, _)| id),
+                    );
                 }
             }
             return out;
@@ -771,8 +772,12 @@ impl Build {
     /// Joueurs placés dans les chunks de `lo` à `hi` (inclus) : par zones (une province
     /// n'est pas cherchée parmi tous les joueurs du monde).
     pub fn players_in(&self, lo: [i32; 2], hi: [i32; 2]) -> Vec<u64> {
-        let inside =
-            |c: [i32; 2]| (lo[0]..=hi[0]).contains(&c[0]) && (lo[1]..=hi[1]).contains(&c[1]);
+        use minelib_net::proto::{cells_span, chunk_between, ZONE};
+        // (v318) Sur la carte bouclée : la boîte peut passer la limite (ses chunks de l'autre
+        // côté y sont).
+        let inside = |c: [i32; 2]| {
+            chunk_between(c[0], lo[0], hi[0]) && chunk_between(c[1], lo[1], hi[1])
+        };
         if self.indexed != self.positions.len() {
             return self
                 .positions
@@ -781,11 +786,9 @@ impl Build {
                 .map(|(&id, _)| id)
                 .collect();
         }
-        let zl = minelib_net::proto::zone_of(lo);
-        let zh = minelib_net::proto::zone_of(hi);
         let mut out = Vec::new();
-        for zx in zl[0]..=zh[0] {
-            for zz in zl[1]..=zh[1] {
+        for zx in cells_span(lo[0] as i64, hi[0] as i64, ZONE) {
+            for zz in cells_span(lo[1] as i64, hi[1] as i64, ZONE) {
                 if let Some(m) = self.by_zone.get(&[zx, zz]) {
                     out.extend(m.iter().filter(|(_, c)| inside(*c)).map(|&(id, _)| id));
                 }
@@ -942,14 +945,10 @@ impl Build {
     ) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
         // Les zones visées qui dorment se réveillent, seulement si ce joueur n'en a pas
         // tout reçu (le propriétaire, qui reçoit tout, ne les réveille pas toutes).
-        let z = minelib_net::proto::ZONE;
-        let in_reach = |w: &[i32; 2]| match chunk {
-            Some(c) => {
-                ((c[0] - NEAR).div_euclid(z)..=(c[0] + NEAR).div_euclid(z)).contains(&w[0])
-                    && ((c[1] - NEAR).div_euclid(z)..=(c[1] + NEAR).div_euclid(z)).contains(&w[1])
-            }
-            None => true,
-        };
+        // (v318) Les zones à portée, sur la carte bouclée.
+        let reach: Vec<[i32; 2]> =
+            chunk.map_or_else(Vec::new, |c| minelib_net::proto::zones_around(c, NEAR).collect());
+        let in_reach = |w: &[i32; 2]| chunk.is_none() || reach.contains(w);
         let known = self.known.get(&id);
         let due = |w: &[i32; 2], last: &[u64; 2]| {
             let k = known.and_then(|k| k.get(w)).copied().unwrap_or_default();
@@ -960,14 +959,12 @@ impl Build {
         let wanted: Vec<[i32; 2]> = match chunk {
             // Autour d'un joueur : les zones à portée, cherchées par leurs coordonnées (v136 :
             // pas en parcourant toutes les zones endormies du monde à chaque pas).
-            Some(c) => {
+            Some(_) => {
                 let mut v = Vec::new();
-                for zx in (c[0] - NEAR).div_euclid(z)..=(c[0] + NEAR).div_euclid(z) {
-                    for zz in (c[1] - NEAR).div_euclid(z)..=(c[1] + NEAR).div_euclid(z) {
-                        if let Some(last) = self.asleep.get(&[zx, zz]) {
-                            if due(&[zx, zz], last) && v.len() < WAKE_MAX {
-                                v.push([zx, zz]);
-                            }
+                for &w in &reach {
+                    if let Some(last) = self.asleep.get(&w) {
+                        if due(&w, last) && v.len() < WAKE_MAX {
+                            v.push(w);
                         }
                     }
                 }
@@ -999,14 +996,10 @@ impl Build {
         match chunk {
             // Autour d'un joueur : seulement les zones à portée (cherchées par leurs
             // coordonnées, sans parcourir toutes les zones du monde).
-            Some(c) => {
-                let z = minelib_net::proto::ZONE;
-                for zx in (c[0] - NEAR).div_euclid(z)..=(c[0] + NEAR).div_euclid(z) {
-                    for zz in (c[1] - NEAR).div_euclid(z)..=(c[1] + NEAR).div_euclid(z) {
-                        let zone = [zx, zz];
-                        if let Some(l) = self.logs.get(&zone) {
-                            take(zone, l);
-                        }
+            Some(_) => {
+                for &zone in &reach {
+                    if let Some(l) = self.logs.get(&zone) {
+                        take(zone, l);
                     }
                 }
             }
@@ -1431,9 +1424,9 @@ mod tests {
                                     .map(|i| {
                                         let pose = minelib_net::poses::Pose {
                                             pos: [
-                                                (r() % span) as f32 + 0.37,
-                                                64.0 + (r() % 4) as f32,
-                                                (r() % span) as f32 + 0.81,
+                                                (r() % span) as f64 + 0.37,
+                                                64.0 + (r() % 4) as f64,
+                                                (r() % span) as f64 + 0.81,
                                             ],
                                             yaw: (r() % 628) as f32 / 100.0,
                                             pitch: 0.1,
@@ -1750,6 +1743,36 @@ mod tests {
         let near = b.closest(1, [0, 0], |m| m % 2 == 0);
         assert_eq!(near.len(), POS_CLOSE_TO);
         assert!(near.iter().all(|m| m % 2 == 0));
+    }
+
+    /// (v318) Sur la carte bouclée : de part et d'autre de sa limite, deux joueurs voisins se
+    /// voient (positions, modifications, foule, voisins proches), et une boîte à cheval sur
+    /// elle trouve ceux des deux côtés ; un joueur plus loin, non.
+    #[test]
+    fn neighbours_across_the_edge_of_the_map_are_neighbours() {
+        let h = (minelib_net::proto::LAP_CHUNKS / 2) as i32;
+        let mut b = Build::default();
+        b.moved(1, [h - 1, 7], &|_| true);
+        b.moved(2, [-h, 7], &|_| true);
+        b.moved(3, [-h + 20, 7], &|_| true);
+        let mut got = std::collections::HashSet::new();
+        for _ in 0..40 {
+            got.extend(b.nearby(1, [h - 1, 7], 1));
+        }
+        assert!(got.contains(&2) && !got.contains(&3), "{got:?}");
+        let l = b.listeners([h - 1, 7], 0);
+        assert!(l.contains(&1) && l.contains(&2) && !l.contains(&3), "{l:?}");
+        let w = b.within([-h, 7], 2, 0);
+        assert!(w.contains(&1) && w.contains(&2) && !w.contains(&3), "{w:?}");
+        let p = b.players_in([h - 2, 0], [h + 1, 10]);
+        assert!(p.contains(&1) && p.contains(&2) && !p.contains(&3), "{p:?}");
+        assert!(b.closest(1, [h - 1, 7], |_| true).contains(&2));
+        // (Avec beaucoup de chunks occupés, par les zones : pareil.)
+        for id in 100..800u64 {
+            b.moved(id, [(id as i32) * 3, 1000], &|_| true);
+        }
+        let l = b.listeners([-h, 7], 0);
+        assert!(l.contains(&1) && l.contains(&2) && !l.contains(&3), "{l:?}");
     }
 
     #[test]

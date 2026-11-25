@@ -353,9 +353,10 @@ pub enum Event {
         mode: String,
         by: String,
     },
-    /// Position qu'on avait sur ce serveur de construction (à l'arrivée).
+    /// Position qu'on avait sur ce serveur de construction (à l'arrivée). (v318) En double
+    /// précision, sur la carte bouclée.
     BuildSpawn {
-        pos: [f32; 3],
+        pos: [f64; 3],
         yaw: f32,
         pitch: f32,
     },

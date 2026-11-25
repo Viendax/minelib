@@ -66,6 +66,10 @@ use serde::{Deserialize, Serialize};
 /// L'Évidé partagé en construction en ligne (`BuildMsg::Evide`, `EvideBite`, `EvideEat`,
 /// surveillés par le relais : `evide::Watch`).
 /// (v315, toujours 75) `LeaderboardFrom` : la suite du classement.
+/// (v318, toujours 75) En construction en ligne, les places (joueurs, retours, apparitions,
+/// objets au sol, foudre, foule d'essai, Évidés) sont en double précision et sur la carte
+/// bouclée (`wrap_chunk`) : loin du centre du monde comme de part et d'autre de sa limite,
+/// chacun voit les autres et le monde à leur place exacte.
 pub const PROTOCOL: u32 = 75;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
@@ -636,7 +640,7 @@ pub enum Request {
     /// Construction, au relais du monde, toutes les 10 s quand ses positions partent à un
     /// relais de région : où est le joueur (gardé pour son retour sur ce serveur).
     Spot {
-        pos: [f32; 3],
+        pos: [f64; 3],
         yaw: f32,
         pitch: f32,
     },
@@ -759,7 +763,7 @@ pub enum Request {
         /// (v139) Sacs de survie prêtés qui ont changé : (pseudo, objets, crédits de
         /// minage) ; positions de retour de ses joueurs (pseudo, x, y, z, lacet, tangage).
         bags: Vec<BagCopy>,
-        spots: Vec<(String, [f32; 5])>,
+        spots: Vec<(String, [f64; 5])>,
         /// (v139) Blocs changés dans la province par des joueurs en survie dont elle n'a
         /// pas le sac (pseudo, bloc : 0 cassé, sinon posé) : comptés par le relais du monde.
         loose: Vec<(String, u16)>,
@@ -1486,7 +1490,7 @@ pub enum Response {
         bags: Vec<BagCopy>,
         held: Vec<String>,
         /// (v144) Positions de retour de ses joueurs (toutes, de temps en temps).
-        spots: Vec<(String, [f32; 5])>,
+        spots: Vec<(String, [f64; 5])>,
     },
     /// (v144) Relais d'un pays → son relais de secours : ses provinces (pour qu'elles se
     /// rattachent à lui s'il prend la place du pays). (v150) Seulement celles qui ont changé,
@@ -1741,7 +1745,7 @@ pub enum Response {
     /// Arrivée sur un serveur de construction : là où l'on était à son départ (le relais
     /// la garde ; ce qu'on a fait ailleurs entre-temps n'y change rien).
     BuildSpawn {
-        pos: [f32; 3],
+        pos: [f64; 3],
         yaw: f32,
         pitch: f32,
     },
@@ -2092,8 +2096,149 @@ pub const PARTY_PROMOTE: u8 = 5;
 /// lobby doit tenir dans une équipe de la carte choisie (la moitié de ses joueurs).
 pub const PARTY_MAX: usize = FPS_MAX_PLAYERS as usize / 2;
 
+/// (v318) La carte bouclée (`minelib_world::lap`), en chunks : passé `LAP_CHUNKS / 2` chunks
+/// du centre (sur x ou sur z), on arrive à −`LAP_CHUNKS / 2`. Le même tour que
+/// `minelib_world::lap::LAP_CHUNKS` (essai `the_net_and_the_world_share_one_map` du jeu). Les
+/// zones (`ZONE`) la pavent exactement ; les régions, provinces et pays non (au bord, deux
+/// morceaux de région voisins, un de chaque côté).
+pub const LAP_CHUNKS: i64 = 134_217_720;
+/// (v318) Le tour de la carte, en blocs.
+pub const LAP_BLOCKS: i64 = LAP_CHUNKS * 16;
+/// (v318) Une place est sur la carte à moins de tant de blocs du centre (sur x et sur z) ; un
+/// peu plus loin (arrondi, place qui vient de passer la limite), elle reste vraisemblable :
+/// `MAP_FAR`.
+pub const MAP_HALF: f64 = (LAP_BLOCKS / 2) as f64;
+/// (v318) Au-delà (en blocs, sur x ou sur z), une place reçue est absurde (un jeu modifié).
+pub const MAP_FAR: f64 = MAP_HALF + 4096.0;
+
+/// (v318) Le chunk `c` ramené sur la carte bouclée.
+pub fn wrap_chunk(c: i64) -> i32 {
+    let half = LAP_CHUNKS / 2;
+    ((c + half).rem_euclid(LAP_CHUNKS) - half) as i32
+}
+
+/// (v318) Les chunks `c` (x, z) ramenés sur la carte bouclée.
+pub fn wrap_chunks(c: [i64; 2]) -> [i32; 2] {
+    [wrap_chunk(c[0]), wrap_chunk(c[1])]
+}
+
+/// (v318) L'écart le plus court (en chunks) de `b` à `a`, sur la carte bouclée : de part et
+/// d'autre de la limite, deux voisins restent voisins.
+pub fn chunk_gap(a: i32, b: i32) -> i32 {
+    wrap_chunk(a as i64 - b as i64)
+}
+
+/// (v318) `a` et `b` (chunks) à `r` chunks au plus l'un de l'autre, sur x et sur z.
+pub fn chunks_within(a: [i32; 2], b: [i32; 2], r: i32) -> bool {
+    chunk_gap(a[0], b[0]).abs() <= r && chunk_gap(a[1], b[1]).abs() <= r
+}
+
+/// (v318) Le bloc `v` ramené sur la carte bouclée.
+pub fn wrap_block(v: i64) -> i32 {
+    let half = LAP_BLOCKS / 2;
+    ((v + half).rem_euclid(LAP_BLOCKS) - half) as i32
+}
+
+/// (v318) La place `v` (blocs) ramenée sur la carte bouclée (0 si elle n'est pas un nombre).
+pub fn wrap_place(v: f64) -> f64 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    let l = LAP_BLOCKS as f64;
+    let w = v - l * ((v + MAP_HALF) / l).floor();
+    if w >= MAP_HALF {
+        w - l
+    } else {
+        w
+    }
+}
+
+/// (v318) L'écart le plus court (en blocs) de `b` à `a`, sur la carte bouclée.
+pub fn place_gap(a: f64, b: f64) -> f64 {
+    wrap_place(a - b)
+}
+
+/// (v318) Le chunk de la place (x, z), sur la carte bouclée.
+pub fn chunk_at(x: f64, z: f64) -> [i32; 2] {
+    let c = |v: f64| wrap_chunk((wrap_place(v).floor() as i64).div_euclid(16));
+    [c(x), c(z)]
+}
+
+/// (v318) Une place vraisemblable : des nombres, sur la carte (à `MAP_FAR` près), à une
+/// hauteur possible.
+pub fn sane_place(p: [f64; 3]) -> bool {
+    p.iter().all(|v| v.is_finite())
+        && p[0].abs() < MAP_FAR
+        && p[2].abs() < MAP_FAR
+        && p[1].abs() < 1.0e6
+}
+
+/// (v318) Les numéros des cases de `size` chunks (zones, régions…) des chunks `c − r` à
+/// `c + r` d'un axe, ramenés sur la carte bouclée : chacune une fois, dans l'ordre où on les
+/// traverse. Loin de la limite, c'est la suite des cases de `(c − r) / size` à
+/// `(c + r) / size` ; à cheval sur elle, celles de chaque côté.
+pub fn cells_around(c: i32, r: i32, size: i32) -> Around {
+    cells_span(c as i64 - r as i64, c as i64 + r as i64, size)
+}
+
+/// (v318) Les numéros des cases de `size` chunks des chunks `lo` à `hi` (compris) d'un axe,
+/// ramenés sur la carte bouclée (voir `cells_around`).
+pub fn cells_span(lo: i64, hi: i64, size: i32) -> Around {
+    let size = size.max(1);
+    let half = LAP_CHUNKS / 2;
+    if lo >= -half && hi < half {
+        return Around::Range((lo as i32).div_euclid(size)..=(hi as i32).div_euclid(size));
+    }
+    let mut v: Vec<i32> = Vec::new();
+    // (Jamais plus d'un tour de la carte.)
+    for x in lo..=hi.min(lo + LAP_CHUNKS - 1) {
+        let cell = wrap_chunk(x).div_euclid(size);
+        if v.last() != Some(&cell) && !v.contains(&cell) {
+            v.push(cell);
+        }
+    }
+    Around::List(v.into_iter())
+}
+
+/// (v318) Le chunk `c` est-il entre `lo` et `hi` (compris, `hi` au plus un tour plus loin que
+/// `lo`), sur la carte bouclée ?
+pub fn chunk_between(c: i32, lo: i32, hi: i32) -> bool {
+    (c as i64 - lo as i64).rem_euclid(LAP_CHUNKS) <= (hi as i64 - lo as i64)
+}
+
+/// (v318) Les cases d'un axe autour d'un chunk (voir `cells_around`).
+pub enum Around {
+    Range(std::ops::RangeInclusive<i32>),
+    List(std::vec::IntoIter<i32>),
+}
+
+impl Iterator for Around {
+    type Item = i32;
+    fn next(&mut self) -> Option<i32> {
+        match self {
+            Around::Range(r) => r.next(),
+            Around::List(l) => l.next(),
+        }
+    }
+}
+
+/// (v318) Les chunks à `r` chunks au plus de `c` (sur x et sur z), ramenés sur la carte
+/// bouclée.
+pub fn chunks_around(c: [i32; 2], r: i32) -> impl Iterator<Item = [i32; 2]> {
+    cells_around(c[0], r, 1).flat_map(move |x| cells_around(c[1], r, 1).map(move |z| [x, z]))
+}
+
 /// Côté d'une zone de garant, en chunks.
 pub const ZONE: i32 = 4;
+
+const _: () = assert!(LAP_CHUNKS % ZONE as i64 == 0 && (LAP_CHUNKS / 2) % ZONE as i64 == 0);
+
+/// (v318) Les zones des chunks à `r` chunks au plus de `c` (sur x et sur z), ramenées sur la
+/// carte bouclée.
+pub fn zones_around(c: [i32; 2], r: i32) -> impl Iterator<Item = [i32; 2]> {
+    cells_around(c[0], r, ZONE)
+        .flat_map(move |x| cells_around(c[1], r, ZONE).map(move |z| [x, z]))
+}
 
 /// Zone d'un chunk.
 pub fn zone_of(chunk: [i32; 2]) -> [i32; 2] {
@@ -2105,6 +2250,13 @@ pub const REGION: i32 = 32;
 
 pub fn region_of(chunk: [i32; 2]) -> [i32; 2] {
     [chunk[0].div_euclid(REGION), chunk[1].div_euclid(REGION)]
+}
+
+/// (v318) Les régions des chunks à `r` chunks au plus de `c` (sur x et sur z), ramenées sur
+/// la carte bouclée.
+pub fn regions_around(c: [i32; 2], r: i32) -> impl Iterator<Item = [i32; 2]> {
+    cells_around(c[0], r, REGION)
+        .flat_map(move |x| cells_around(c[1], r, REGION).map(move |z| [x, z]))
 }
 
 /// Ce que le relais de secours d'un monde doit savoir pour le reprendre.
@@ -2477,6 +2629,51 @@ pub fn province_key(parent: &[u8; 32], room: u64, province: [i32; 2], size: i32)
     m.update(&province[1].to_le_bytes());
     m.update(&size.to_le_bytes());
     m.finalize().into_bytes().into()
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    /// (v318) La carte bouclée : de part et d'autre de sa limite, les chunks, zones et régions
+    /// voisins restent voisins ; loin d'elle, rien ne change.
+    #[test]
+    fn neighbourhoods_go_across_the_edge_of_the_map() {
+        let h = (LAP_CHUNKS / 2) as i32;
+        assert_eq!(h, 67_108_860);
+        assert_eq!(wrap_chunk(h as i64), -h);
+        assert_eq!(wrap_chunk(-(h as i64) - 1), h - 1);
+        assert_eq!(chunk_gap(-h, h - 1), 1);
+        assert_eq!(chunk_gap(h - 1, -h), -1);
+        assert!(chunks_within([h - 1, 5], [-h, 5], 1));
+        assert!(!chunks_within([h - 3, 5], [-h, 5], 1));
+        let xs: Vec<i32> = cells_around(h - 2, 4, 1).collect();
+        assert_eq!(xs, vec![h - 6, h - 5, h - 4, h - 3, h - 2, h - 1, -h, -h + 1, -h + 2]);
+        // Les zones pavent la carte : celles de part et d'autre de la limite.
+        let zs: Vec<i32> = cells_around(h - 1, 4, ZONE).collect();
+        assert_eq!(zs, vec![(h - 5).div_euclid(ZONE), (h - 1).div_euclid(ZONE), -h / ZONE]);
+        // Les régions non : les deux morceaux de région du bord.
+        let rs: Vec<i32> = cells_around(h - 1, 16, REGION).collect();
+        assert_eq!(rs, vec![region_of([h - 1, 0])[0], region_of([-h, 0])[0]]);
+        assert_eq!(regions_around([h - 1, 0], 16).count(), 2 * 2);
+        // Loin de la limite, comme avant.
+        assert_eq!(cells_around(100, 16, REGION).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(zones_around([0, 0], 12).count(), 7 * 7);
+        // Places.
+        let half = MAP_HALF;
+        assert_eq!(chunk_at(half - 0.5, 0.0), [h - 1, 0]);
+        assert_eq!(chunk_at(half + 0.5, -half), [-h, -h]);
+        assert_eq!(wrap_place(half), -half);
+        assert_eq!(place_gap(-half + 0.25, half - 0.25), 0.5);
+        assert!(sane_place([half - 1.0, 70.0, -half]));
+        assert!(!sane_place([2.0 * half, 70.0, 0.0]));
+        assert!(!sane_place([f64::NAN, 70.0, 0.0]));
+        // Une boîte à cheval sur la limite.
+        assert!(chunk_between(-h, h - 2, h + 1));
+        assert!(chunk_between(h - 1, h - 2, h + 1));
+        assert!(!chunk_between(-h + 5, h - 2, h + 1));
+        assert!(chunk_between(3, -2, 5) && !chunk_between(6, -2, 5));
+    }
 }
 
 #[cfg(test)]

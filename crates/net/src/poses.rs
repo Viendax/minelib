@@ -11,7 +11,8 @@
 /// Position d'un joueur, telle que les autres la voient.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose {
-    pub pos: [f32; 3],
+    /// (v318) Ses pieds, en double précision, sur la carte bouclée (`proto::wrap_place`).
+    pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
     pub crouch: f32,
@@ -123,9 +124,7 @@ static ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 /// Positions au plus par paquet.
 pub const POSES_MAX: usize = 2048;
 /// Pas de la position (blocs) : 1/32, soit 3 cm.
-const STEP: f32 = 32.0;
-/// Au-delà (en blocs), une position est absurde et n'est pas écrite.
-const FAR: f32 = 4.0e7;
+const STEP: f64 = 32.0;
 
 fn put(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
@@ -160,7 +159,8 @@ fn get_signed(data: &[u8], at: &mut usize) -> Option<i64> {
 impl Pose {
     /// Rien d'infini ni d'absurde (ce qu'un jeu modifié pourrait envoyer).
     pub fn sane(&self) -> bool {
-        self.pos.iter().all(|v| v.is_finite() && v.abs() < FAR)
+        // (v318) Sur la carte bouclée (au-delà, absurde : pas écrite).
+        crate::proto::sane_place(self.pos)
             && [self.yaw, self.pitch, self.crouch, self.speed]
                 .iter()
                 .all(|v| v.is_finite())
@@ -174,7 +174,7 @@ pub fn pack_poses(entries: &mut Vec<(u64, Option<&str>, Pose)>) -> Vec<u8> {
     entries.retain(|e| e.2.sane());
     entries.truncate(POSES_MAX);
     entries.sort_unstable_by_key(|e| e.0);
-    let fixed = |v: f32| (v * STEP).round() as i64;
+    let fixed = |v: f64| (v * STEP).round() as i64;
     let base = entries.first().map_or([0; 3], |e| e.2.pos.map(fixed));
     let mut out = Vec::with_capacity(16 + entries.len() * 12);
     for b in base {
@@ -269,9 +269,9 @@ pub fn unpack_poses(data: &[u8]) -> Option<Vec<(u64, Option<String>, Pose)>> {
         } else {
             0
         };
-        let mut pos = [0f32; 3];
+        let mut pos = [0f64; 3];
         for (a, p) in pos.iter_mut().enumerate() {
-            *p = base[a].checked_add(get_signed(data, &mut at)?)? as f32 / STEP;
+            *p = base[a].checked_add(get_signed(data, &mut at)?)? as f64 / STEP;
         }
         let yaw = *data.get(at)? as f32 / 256.0 * std::f32::consts::TAU;
         let pitch =
@@ -314,7 +314,8 @@ mod tests {
         let mut seed = 0xDEAD_BEEF_1234u64;
         for round in 0..200 {
             let n = (rnd(&mut seed) % 300) as usize;
-            let spread = [30.0f32, 400.0, 3.0e7][round % 3];
+            // (v318) Jusqu'aux bords de la carte bouclée.
+            let spread = [30.0f64, 400.0, 3.0e7, 2.1e9][round % 4];
             let names: Vec<String> = (0..n).map(|i| format!("Joueur{i}")).collect();
             let poses: Vec<(u64, Pose)> = (0..n)
                 .map(|i| {
@@ -325,9 +326,9 @@ mod tests {
                     };
                     let p = Pose {
                         pos: [
-                            (unit(&mut seed) - 0.5) * spread,
-                            unit(&mut seed) * 255.0,
-                            (unit(&mut seed) - 0.5) * spread,
+                            (unit(&mut seed) as f64 - 0.5) * spread,
+                            unit(&mut seed) as f64 * 255.0,
+                            (unit(&mut seed) as f64 - 0.5) * spread,
                         ],
                         yaw: (unit(&mut seed) - 0.5) * 20.0,
                         pitch: (unit(&mut seed) - 0.5) * 3.1,
@@ -357,10 +358,9 @@ mod tests {
             assert_eq!(back.len(), entries.len());
             for ((id, name, p), (bid, bname, b)) in entries.iter().zip(&back) {
                 assert_eq!((id, name.map(str::to_string)), (bid, bname.clone()));
-                // (Au loin, un nombre sur 32 bits n'a plus cette finesse lui-même.)
-                let fine = if spread > 1.0e6 { 4.0 } else { 0.02 };
+                // (v318) En double précision : au 1/32 de bloc même au bord de la carte.
                 for a in 0..3 {
-                    assert!((p.pos[a] - b.pos[a]).abs() <= fine, "{p:?} {b:?}");
+                    assert!((p.pos[a] - b.pos[a]).abs() <= 0.016, "{p:?} {b:?}");
                 }
                 let turn = std::f32::consts::TAU;
                 let d = (p.yaw - b.yaw).rem_euclid(turn);
@@ -387,9 +387,9 @@ mod tests {
             .map(|i| {
                 let p = Pose {
                     pos: [
-                        5000.0 + unit(&mut seed) * 60.0,
-                        64.0 + unit(&mut seed) * 8.0,
-                        -3000.0 + unit(&mut seed) * 60.0,
+                        5000.0 + unit(&mut seed) as f64 * 60.0,
+                        64.0 + unit(&mut seed) as f64 * 8.0,
+                        -3000.0 + unit(&mut seed) as f64 * 60.0,
                     ],
                     yaw: unit(&mut seed) * 6.0,
                     pitch: unit(&mut seed) - 0.5,
@@ -454,7 +454,7 @@ mod tests {
                 2,
                 None,
                 Pose {
-                    pos: [f32::NAN, 0.0, 0.0],
+                    pos: [f64::NAN, 0.0, 0.0],
                     ..good
                 },
             ),
@@ -462,15 +462,16 @@ mod tests {
                 3,
                 None,
                 Pose {
-                    pos: [0.0, f32::INFINITY, 0.0],
+                    pos: [0.0, f64::INFINITY, 0.0],
                     ..good
                 },
             ),
             (
                 4,
                 None,
+                // (v318) Hors de la carte bouclée (à 50 millions de blocs, on y est encore).
                 Pose {
-                    pos: [5.0e7, 0.0, 0.0],
+                    pos: [2.0e9, 0.0, 0.0],
                     ..good
                 },
             ),
@@ -521,6 +522,43 @@ mod tests {
         for absurd in [0x30u8, 0x21, 0x1f, 0x9f, 0x60] {
             assert_eq!(Held::clean(absurd), 0, "{absurd:#x}");
             assert!(!Held::back(absurd) && Held::of(absurd).is_none());
+        }
+    }
+
+    /// (v318) Loin du centre du monde et de part et d'autre de la limite de la carte bouclée :
+    /// chaque position revient à sa place exacte (au 1/32 de bloc), une position hors de la
+    /// carte n'est pas écrite (et un paquet qui en dit une est refusé).
+    #[test]
+    fn far_poses_and_poses_across_the_edge_come_back_exactly() {
+        let half = crate::proto::MAP_HALF;
+        let pose = |x: f64, z: f64| Pose {
+            pos: [x, 70.25, z],
+            yaw: 1.0,
+            pitch: 0.0,
+            crouch: 0.0,
+            speed: 0.0,
+            ping: None,
+            held: 0,
+        };
+        let places = [
+            (half - 0.5, 12.0),
+            (-half + 0.5, 12.03125),
+            (1_000_000_000.156_25, -999_999_999.5),
+            (16_777_216.5, 16_777_216.5),
+        ];
+        let mut entries: Vec<(u64, Option<&str>, Pose)> = places
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, z))| (i as u64 + 1, None, pose(x, z)))
+            .collect();
+        entries.push((9, None, pose(crate::proto::MAP_FAR + 1.0, 0.0)));
+        let packed = pack_poses(&mut entries);
+        let back = unpack_poses(&packed).expect("paquet lisible");
+        assert_eq!(back.len(), places.len(), "la position hors de la carte n'est pas écrite");
+        for ((x, z), (_, _, b)) in places.iter().zip(&back) {
+            assert!((b.pos[0] - x).abs() <= 1.0 / 64.0, "{x} {:?}", b.pos);
+            assert!((b.pos[2] - z).abs() <= 1.0 / 64.0, "{z} {:?}", b.pos);
+            assert_eq!(b.pos[1], 70.25);
         }
     }
 }

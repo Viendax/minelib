@@ -654,7 +654,7 @@ mod tests {
     /// Trois joueurs envoient chacun `steps` positions, une toutes les `every_ms`
     /// millisecondes, à un quatrième : paquets et positions qu'il reçoit, comptés à partir
     /// de la position `from` de chacun.
-    fn three_neighbours(steps: u32, every_ms: u64, from: f32) -> (u32, u32) {
+    fn three_neighbours(steps: u32, every_ms: u64, from: f64) -> (u32, u32) {
         use crate::game::{self, BuildMsg};
         use crate::poses::Pose;
         use crate::proto::{Request, Response};
@@ -673,7 +673,7 @@ mod tests {
                             name: format!("Joueur{id}"),
                             close: false,
                             pose: Pose {
-                                pos: [id as f32, 64.0, step as f32],
+                                pos: [id as f64, 64.0, step as f64],
                                 yaw: 1.0,
                                 pitch: 0.0,
                                 crouch: 0.0,
@@ -725,7 +725,7 @@ mod tests {
         }
         drop(c);
         server.join().unwrap();
-        assert!(last.values().all(|z| *z == (steps - 1) as f32), "la dernière de chacun");
+        assert!(last.values().all(|z| *z == (steps - 1) as f64), "la dernière de chacun");
         (packets, entries)
     }
 
@@ -752,7 +752,7 @@ mod tests {
                             name: format!("Joueur{id}"),
                             close: false,
                             pose: Pose {
-                                pos: [id as f32, 64.0, step as f32],
+                                pos: [id as f64, 64.0, step as f64],
                                 yaw: 1.0,
                                 pitch: 0.0,
                                 crouch: 0.0,

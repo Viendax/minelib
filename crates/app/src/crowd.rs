@@ -603,7 +603,8 @@ impl Npc {
         NpcState {
             id,
             num: self.num,
-            pos: self.pos.to_array(),
+            // (v318) Le paquet est en double précision (la partie compte depuis son origine).
+            pos: self.pos.to_array().map(f64::from),
             yaw: self.yaw,
             speed: self.speed,
             push: (self.air > 0.0).then_some(self.push.to_array()),
@@ -614,7 +615,7 @@ impl Npc {
 
     /// (v227) PNJ d'une foule reçue, tel que le dit son état.
     fn received(world: &World, s: &NpcState) -> Npc {
-        let pos = Vec3::from(s.pos);
+        let pos = Vec3::from(s.pos.map(|v| v as f32));
         let mut n = Npc {
             name: format!("Pnj{}", s.num),
             pos,
@@ -648,7 +649,7 @@ impl Npc {
             self.num = s.num;
             self.name = format!("Pnj{}", s.num);
         }
-        let pos = Vec3::from(s.pos);
+        let pos = Vec3::from(s.pos.map(|v| v as f32));
         // Reparti d'ailleurs (réapparu, personnage caché qui se cache) : sa marche aussi.
         if pos.distance(self.pos) > 4.0 {
             self.walk = crate::session::Walk::new(pos);
@@ -766,10 +767,10 @@ impl Outbox {
             self.cursor = k + 1;
         }
         Some(Packet {
-            center: center.to_array(),
+            center: center.to_array().map(f64::from),
             count: count as u16,
             npcs: ids.iter().map(|&i| crowd.npcs[i as usize].state(i)).collect(),
-            found: self.found.take(),
+            found: self.found.take().map(|(w, a)| (w, a.map(f64::from))),
             stop: false,
         })
     }
@@ -778,7 +779,7 @@ impl Outbox {
 /// (v227) Le dernier paquet d'une foule menée en ligne : elle s'arrête.
 pub fn stop_packet(center: Vec3) -> Packet {
     Packet {
-        center: center.to_array(),
+        center: center.to_array().map(f64::from),
         stop: true,
         ..Packet::default()
     }

@@ -40,6 +40,11 @@ pub struct Whitelist {
     pub names: Vec<String>,
 }
 
+/// (v318) Lit un fichier de places en double précision (`None` : absent ou illisible).
+fn read_places<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
+    postcard::from_bytes(&std::fs::read(path).ok()?).ok()
+}
+
 pub struct Store {
     path: PathBuf,
     servers: HashMap<String, Admin>,
@@ -49,7 +54,7 @@ pub struct Store {
     /// Dernière position de chaque joueur sur chaque serveur (fichier `….positions`) :
     /// serveur → pseudo (minuscules) → [x, y, z, lacet, tangage]. Le relais en est le
     /// gardien : on revient là où on était, quoi qu'on ait fait ailleurs entre-temps.
-    positions: HashMap<String, HashMap<String, [f32; 5]>>,
+    positions: HashMap<String, HashMap<String, [f64; 5]>>,
     /// Positions changées depuis le dernier enregistrement, et ce dernier enregistrement.
     positions_dirty: bool,
     positions_saved: std::time::Instant,
@@ -62,7 +67,7 @@ pub struct Store {
     weathers: HashMap<String, (u8, u64, bool)>,
     /// (v223) Point d'apparition de chaque serveur (fichier `….spawns`) : [x, y, z, lacet,
     /// tangage], pour qui y arrive la première fois.
-    spawns: HashMap<String, [f32; 5]>,
+    spawns: HashMap<String, [f64; 5]>,
     /// (v238) Serveur → OP nommé (minuscules) → quand il pourra de nouveau nommer un OP
     /// (`OP_WAIT` après en avoir nommé un, ou après l'être devenu). En mémoire seulement.
     op_ready: HashMap<String, HashMap<String, std::time::Instant>>,
@@ -148,17 +153,32 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
-        let positions = std::fs::read(path.with_extension("positions"))
-            .ok()
-            .and_then(|b| postcard::from_bytes(&b).ok())
+        // (v318) Places en double précision (fichier `….positions64`) ; celui d'avant
+        // (simple précision, `….positions`) est lu s'il n'y en a pas encore.
+        let positions = read_places(&path.with_extension("positions64"))
+            .or_else(|| {
+                let old: HashMap<String, HashMap<String, [f32; 5]>> =
+                    postcard::from_bytes(&std::fs::read(path.with_extension("positions")).ok()?)
+                        .ok()?;
+                Some(
+                    old.into_iter()
+                        .map(|(s, m)| (s, m.into_iter().map(|(p, v)| (p, v.map(f64::from))).collect()))
+                        .collect(),
+                )
+            })
             .unwrap_or_default();
         let times = std::fs::read(path.with_extension("times"))
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
-        let spawns = std::fs::read(path.with_extension("spawns"))
-            .ok()
-            .and_then(|b| postcard::from_bytes(&b).ok())
+        // (v318) Pareil (`….spawns64`, sinon `….spawns`).
+        let spawns = read_places(&path.with_extension("spawns64"))
+            .or_else(|| {
+                let old: HashMap<String, [f32; 5]> =
+                    postcard::from_bytes(&std::fs::read(path.with_extension("spawns")).ok()?)
+                        .ok()?;
+                Some(old.into_iter().map(|(s, v)| (s, v.map(f64::from))).collect())
+            })
             .unwrap_or_default();
         let weathers = std::fs::read(path.with_extension("weather"))
             .ok()
@@ -316,7 +336,7 @@ impl Store {
     }
 
     /// Dernière position connue de `pseudo` sur ce serveur.
-    pub fn position(&self, server: &str, pseudo: &str) -> Option<[f32; 5]> {
+    pub fn position(&self, server: &str, pseudo: &str) -> Option<[f64; 5]> {
         self.positions
             .get(server)?
             .get(&pseudo.to_ascii_lowercase())
@@ -325,7 +345,7 @@ impl Store {
 
     /// Position actuelle de `pseudo` sur ce serveur (gardée en mémoire ; écrite par
     /// `save_positions`).
-    pub fn set_position(&mut self, server: &str, pseudo: &str, p: [f32; 5]) {
+    pub fn set_position(&mut self, server: &str, pseudo: &str, p: [f64; 5]) {
         if p.iter().all(|v| v.is_finite()) {
             self.positions
                 .entry(server.to_string())
@@ -339,7 +359,8 @@ impl Store {
     pub fn save_positions_now(&mut self) {
         if std::mem::take(&mut self.positions_dirty) {
             if let Ok(b) = postcard::to_allocvec(&self.positions) {
-                let _ = crate::accounts::write_atomic(&self.path.with_extension("positions"), &b);
+                let _ =
+                    crate::accounts::write_atomic(&self.path.with_extension("positions64"), &b);
             }
         }
     }
@@ -353,7 +374,7 @@ impl Store {
         self.positions_dirty = false;
         self.positions_saved = std::time::Instant::now();
         if let Ok(b) = postcard::to_allocvec(&self.positions) {
-            let _ = crate::accounts::write_atomic(&self.path.with_extension("positions"), &b);
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("positions64"), &b);
         }
     }
 
@@ -364,7 +385,7 @@ impl Store {
     }
 
     /// (v223) Point d'apparition du serveur (`/setspawn`), s'il en a un.
-    pub fn spawn(&self, server: &str) -> Option<[f32; 5]> {
+    pub fn spawn(&self, server: &str) -> Option<[f64; 5]> {
         self.spawns.get(server).copied()
     }
 
@@ -403,7 +424,7 @@ impl Store {
             let _ = crate::accounts::write_atomic(&self.path.with_extension("defaults"), &b);
         }
         if let Ok(b) = postcard::to_allocvec(&self.spawns) {
-            let _ = crate::accounts::write_atomic(&self.path.with_extension("spawns"), &b);
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("spawns64"), &b);
         }
     }
 
@@ -564,13 +585,21 @@ impl Store {
                 });
             }
             Action::SetSpawn => {
-                let v: Vec<f32> = reason
+                // (v318) En double précision, ramené sur la carte bouclée.
+                let v: Vec<f64> = reason
                     .split_whitespace()
                     .filter_map(|t| t.parse().ok())
                     .collect();
                 let [x, y, z, yaw, pitch] = v[..] else {
                     return Err("Position illisible.".into());
                 };
+                if !(x.is_finite() && z.is_finite()) {
+                    return Err("Position illisible.".into());
+                }
+                let (x, z) = (
+                    minelib_net::proto::wrap_place(x),
+                    minelib_net::proto::wrap_place(z),
+                );
                 let at = [x, y, z, yaw, pitch];
                 if !at.iter().all(|c| c.is_finite()) || y.abs() > 4096.0 {
                     return Err("Position illisible.".into());

@@ -123,9 +123,13 @@ pub struct Other {
     /// Son numéro sur le relais du monde (vocal), s'il passe par lui.
     pub id: Option<u64>,
     /// Position montrée : elle rejoint la dernière reçue en douceur (les joueurs lointains
-    /// envoient moins souvent, voir le relais).
+    /// envoient moins souvent, voir le relais). (v318) Comptée depuis l'origine de la partie
+    /// (`World::origin`), tirée de `abs`.
     pub pos: Vec3,
-    target: Vec3,
+    /// (v318) La même, et la dernière reçue, en places absolues (double précision, sur la
+    /// carte bouclée).
+    abs: [f64; 3],
+    target: [f64; 3],
     /// Intervalle moyen entre deux positions reçues (s).
     interval: f32,
     pub yaw: f32,
@@ -147,6 +151,8 @@ pub struct Other {
 /// encore envoyé : ces modifications partent désormais de `truth` (c'est lui qui reviendra
 /// si elles sont refusées), et restent à l'écran. Vrai s'il y en avait.
 fn rebase_journal(world: &mut World, pos: [i32; 3], truth: BlockId) -> bool {
+    // (v318) `pos` est absolue ; le journal compte depuis l'origine du monde.
+    let pos = world.local_block(pos);
     let Some(journal) = world.journal.as_mut() else {
         return false;
     };
@@ -280,6 +286,11 @@ pub struct BuildNet {
     /// l'autre).
     pub others: HashMap<String, Other>,
     chunk: Option<[i32; 2]>,
+    /// (v318) Origine de la partie (`World::origin_blocks`) : tout ce que ce module dit au
+    /// réseau et en reçoit est en places absolues (sur la carte bouclée) ; ce qu'il donne à
+    /// la partie et en reçoit compte depuis elle. Relevée à chaque image (`update`), et
+    /// tout de suite quand la partie en change (`set_origin`).
+    origin: [i32; 3],
     pos_timer: f32,
     /// (v285) Prochaine position rapprochée (foule), et si le lien vers le relais qui
     /// reçoit nos positions est lent (hôte joint par les serveurs relais d'iroh), revu
@@ -347,7 +358,7 @@ pub struct BuildNet {
     next_bulk: u32,
     /// États d'objets (au sol, coffres) et refus reçus du relais du monde, à traiter par
     /// la partie (voir `crate::drops`) ; (v224) et lumières de l'éditeur (`crate::lightnet`).
-    pub item_inbox: Vec<BuildMsg>,
+    item_inbox: Vec<BuildMsg>,
     /// Message en cours de traitement venu d'un relais de région (tenu par un joueur ; son
     /// numéro de connexion) : seul le relais du monde arbitre les objets, on n'en accepte
     /// pas d'ailleurs.
@@ -382,18 +393,19 @@ pub struct BuildNet {
     thor_asked: HashMap<u32, PKey>,
     /// (v229) Foudres publiées par les arbitres et refus de nos demandes (`BuildMsg::Thor`,
     /// `ThorDenied`), pour la partie (`Session::update_thor`).
-    pub thor_inbox: Vec<BuildMsg>,
+    thor_inbox: Vec<BuildMsg>,
     light_queue: Vec<(BuildMsg, f32)>,
     /// (v227) Foules d'essai menées par d'autres joueurs (OP) : paquets reçus, par pseudo de
     /// celui qui la mène (voir `crowd::RemoteCrowd`).
-    pub crowd_inbox: Vec<(String, Vec<u8>)>,
+    crowd_inbox: Vec<(String, Vec<u8>)>,
     /// (v227) Coups des autres joueurs à notre foule d'essai : qui, quel PNJ, d'où (ses yeux).
-    pub crowd_hits: Vec<(String, u16, [f32; 3])>,
+    /// (v318) En places absolues.
+    crowd_hits: Vec<(String, u16, [f64; 3])>,
     /// (v312) L'Évidé partagé, publié par un relais (jamais par un joueur) : les monstres que
     /// mènent d'autres joueurs (pseudo du meneur, paquet de `minelib_net::evide`) ; les
     /// morsures admises (meneur, monstre, victime, en rampant, tirages de l'endroit et de la
     /// morsure) ; les bouchées admises (meneur, monstre, pavé, cube, qui, vie qui reste).
-    pub evide_inbox: Vec<(String, Vec<u8>)>,
+    evide_inbox: Vec<(String, Vec<u8>)>,
     pub evide_bites: Vec<(String, u16, String, bool, u32, u32)>,
     pub evide_eats: Vec<(String, u16, u8, [u8; 3], String, u8)>,
     /// (v227) Notre foule d'essai a été refusée par le relais (pas OP, trop de paquets).
@@ -480,10 +492,9 @@ impl Shards {
 
     /// Se connecte aux relais des régions en vue de `chunk`, quitte les autres.
     fn keep_near(&mut self, chunk: [i32; 2]) {
-        let lo = proto::region_of([chunk[0] - VIEW_CHUNKS, chunk[1] - VIEW_CHUNKS]);
-        let hi = proto::region_of([chunk[0] + VIEW_CHUNKS, chunk[1] + VIEW_CHUNKS]);
-        let in_view =
-            |r: [i32; 2]| (lo[0]..=hi[0]).contains(&r[0]) && (lo[1]..=hi[1]).contains(&r[1]);
+        // (v318) Sur la carte bouclée : près de sa limite, celles de l'autre côté aussi.
+        let view: HashSet<[i32; 2]> = proto::regions_around(chunk, VIEW_CHUNKS).collect();
+        let in_view = |r: [i32; 2]| view.contains(&r);
         let me = self.pseudo.clone();
         let mine = |list: &Vec<proto::ShardInfo>| proto::shard_for(list, &me).cloned();
         // (Le même relais dont seule l'époque a changé : on y reste.)
@@ -550,12 +561,171 @@ impl Shards {
     }
 }
 
+/// (v318) L'écart (blocs, sur x et z ; le plus court sur la carte bouclée) entre deux places
+/// absolues.
+fn gap(a: [f64; 3], b: [f64; 3]) -> f32 {
+    let dx = proto::place_gap(a[0], b[0]);
+    let dz = proto::place_gap(a[2], b[2]);
+    let dy = a[1] - b[1];
+    (dx * dx + dy * dy + dz * dz).sqrt() as f32
+}
+
+/// (v318) `a` avancée de la fraction `k` vers `b` (places absolues, l'écart le plus court sur
+/// la carte bouclée).
+fn toward(a: [f64; 3], b: [f64; 3], k: f64) -> [f64; 3] {
+    [
+        proto::wrap_place(a[0] + proto::place_gap(b[0], a[0]) * k),
+        a[1] + (b[1] - a[1]) * k,
+        proto::wrap_place(a[2] + proto::place_gap(b[2], a[2]) * k),
+    ]
+}
+
 /// Distance de vue (chunks) : un relais de région à moins de cela est rejoint.
 const VIEW_CHUNKS: i32 = 12;
 
 fn chunk_of(x: i32, z: i32) -> [i32; 2] {
     let c = ChunkPos::containing(x, z);
     [c.x, c.z]
+}
+
+/// (v318) Le bloc de la case absolue `p` (le monde compte depuis son origine,
+/// `World::origin`).
+fn block_at(world: &World, p: [i32; 3]) -> BlockId {
+    let l = world.local_block(p);
+    world.get(l[0], l[1], l[2])
+}
+
+/// (v318) Pose `b` (venu du réseau) en la case absolue `p` ; les chunks à remailler.
+fn put_at(world: &mut World, p: [i32; 3], b: BlockId) -> Vec<ChunkPos> {
+    let l = world.local_block(p);
+    world.set_remote(l[0], l[1], l[2], b)
+}
+
+/// (v318) Place absolue (double précision, sur la carte bouclée) de la place `v` d'une partie
+/// qui compte depuis `origin` (blocs).
+pub fn abs_place(origin: [i32; 3], v: Vec3) -> [f64; 3] {
+    [
+        proto::wrap_place(v.x as f64 + origin[0] as f64),
+        v.y as f64,
+        proto::wrap_place(v.z as f64 + origin[2] as f64),
+    ]
+}
+
+/// (v318) Place, dans une partie qui compte depuis `origin`, de la place absolue `a` : la
+/// plus proche de l'origine sur la carte bouclée.
+pub fn local_place(origin: [i32; 3], a: [f64; 3]) -> Vec3 {
+    Vec3::new(
+        proto::place_gap(a[0], origin[0] as f64) as f32,
+        a[1] as f32,
+        proto::place_gap(a[2], origin[2] as f64) as f32,
+    )
+}
+
+/// (v318) `a`, comptée depuis `origin` (vers la partie : `to_abs` faux) ou vers l'absolu
+/// (`to_abs`), en double précision.
+fn moved(a: [f64; 3], origin: [i32; 3], to_abs: bool) -> [f64; 3] {
+    let (ox, oz) = (origin[0] as f64, origin[2] as f64);
+    if to_abs {
+        [proto::wrap_place(a[0] + ox), a[1], proto::wrap_place(a[2] + oz)]
+    } else {
+        [proto::place_gap(a[0], ox), a[1], proto::place_gap(a[2], oz)]
+    }
+}
+
+/// (v318) La case `p`, comptée depuis `origin` ou vers l'absolu (`to_abs`).
+fn moved_block(p: [i32; 3], origin: [i32; 3], to_abs: bool) -> [i32; 3] {
+    let wrap = minelib_world::lap::wrap_block;
+    let s = if to_abs { 1 } else { -1 };
+    [
+        wrap(p[0] as i64 + s * origin[0] as i64),
+        p[1],
+        wrap(p[2] as i64 + s * origin[2] as i64),
+    ]
+}
+
+/// (v318) Le chunk `c`, compté depuis `origin` (blocs) ou vers l'absolu (`to_abs`).
+fn moved_chunk(c: [i32; 2], origin: [i32; 3], to_abs: bool) -> [i32; 2] {
+    let s = if to_abs { 1 } else { -1 };
+    let o = [origin[0].div_euclid(16) as i64, origin[2].div_euclid(16) as i64];
+    proto::wrap_chunks([c[0] as i64 + s * o[0], c[1] as i64 + s * o[1]])
+}
+
+/// (v318) Le chunk de la place `a` (absolue : sur la carte bouclée ; de la partie : tel quel).
+fn chunk_of_place(a: [f64; 3], abs: bool) -> [i32; 2] {
+    if abs {
+        proto::chunk_at(a[0], a[2])
+    } else {
+        chunk_of(a[0].floor() as i32, a[2].floor() as i32)
+    }
+}
+
+/// (v318) Le message `m` (objets, coffres, lumières, foudre), ses places comptées depuis
+/// `origin` (vers la partie) ou vers l'absolu (`to_abs`, vers le réseau). Les autres messages
+/// ne changent pas.
+pub fn moved_msg(m: &BuildMsg, origin: [i32; 3], to_abs: bool) -> BuildMsg {
+    let mut m = m.clone();
+    let light = |t: &mut Option<Vec<u8>>| {
+        if let Some(text) = t.as_mut() {
+            if let Some(mut l) = crate::lights::PlacedLight::from_text(text) {
+                l.position = moved(l.position, origin, to_abs);
+                *text = l.to_text().into_bytes();
+            }
+        }
+    };
+    match &mut m {
+        BuildMsg::DropItem { pos, .. } => *pos = moved(*pos, origin, to_abs),
+        BuildMsg::Item { at, .. } => *at = moved(*at, origin, to_abs),
+        BuildMsg::ChestPut { pos, .. }
+        | BuildMsg::ChestTake { pos, .. }
+        | BuildMsg::Slot { pos, .. } => *pos = moved_block(*pos, origin, to_abs),
+        BuildMsg::LightPut { chunk, light: t, .. } | BuildMsg::Light { chunk, light: t, .. } => {
+            light(t);
+            *chunk = moved_chunk(*chunk, origin, to_abs);
+        }
+        BuildMsg::ThorAsk { chunk, pos, .. } | BuildMsg::Thor { chunk, pos, .. } => {
+            *pos = moved(*pos, origin, to_abs);
+            *chunk = chunk_of_place(*pos, to_abs);
+        }
+        BuildMsg::ZeusAsk {
+            chunk, act, pos, to, ..
+        }
+        | BuildMsg::Zeus {
+            chunk, act, pos, to, ..
+        } => {
+            *pos = moved(*pos, origin, to_abs);
+            // (Vers le ciel, `to` est une direction ; sinon un point.)
+            if *act != proto::ZEUS_SKY {
+                *to = moved(*to, origin, to_abs);
+            }
+            *chunk = chunk_of_place(*pos, to_abs);
+        }
+        _ => {}
+    }
+    m
+}
+
+/// (v318) Le paquet de L'Évidé partagé `data` (`minelib_net::evide`), ses places comptées
+/// depuis `origin` (vers la partie) ou vers l'absolu (`to_abs`). `None` : paquet illisible.
+fn moved_evide(data: &[u8], origin: [i32; 3], to_abs: bool) -> Option<Vec<u8>> {
+    let mut mobs = minelib_net::evide::unpack(data)?;
+    for m in &mut mobs {
+        m.pos = moved(m.pos, origin, to_abs);
+    }
+    Some(minelib_net::evide::pack(&mobs))
+}
+
+/// (v318) Le paquet de foule d'essai `data`, ses places comptées depuis `origin` (vers la
+/// partie) ou vers l'absolu (`to_abs`). `None` : paquet illisible.
+fn moved_crowd(data: &[u8], origin: [i32; 3], to_abs: bool) -> Option<Vec<u8>> {
+    let mut p = minelib_net::crowd::unpack(data)?;
+    p.center = moved(p.center, origin, to_abs);
+    for n in &mut p.npcs {
+        n.pos = moved(n.pos, origin, to_abs);
+    }
+    if let Some((_, at)) = &mut p.found {
+        *at = moved(*at, origin, to_abs);
+    }
+    Some(minelib_net::crowd::pack(&p))
 }
 
 impl BuildNet {
@@ -572,6 +742,7 @@ impl BuildNet {
             zones: HashSet::new(),
             others: HashMap::new(),
             chunk: None,
+            origin: [0; 3],
             pos_timer: 0.0,
             close_timer: 0.0,
             slow_link: (0.0, false),
@@ -758,10 +929,8 @@ impl BuildNet {
 
     /// (v145) Les provinces (et pays) qui décident d'une région en vue de ce chunk.
     fn needed(&self, chunk: [i32; 2]) -> HashSet<PKey> {
-        let lo = proto::region_of([chunk[0] - ROOT_VIEW, chunk[1] - ROOT_VIEW]);
-        let hi = proto::region_of([chunk[0] + ROOT_VIEW, chunk[1] + ROOT_VIEW]);
-        (lo[0]..=hi[0])
-            .flat_map(|x| (lo[1]..=hi[1]).map(move |z| [x, z]))
+        // (v318) Sur la carte bouclée.
+        proto::regions_around(chunk, ROOT_VIEW)
             .filter_map(|r| self.best(r).map(pkey))
             .collect()
     }
@@ -1288,14 +1457,11 @@ impl BuildNet {
         if self.province_list.is_empty() {
             return false;
         }
-        let lo = proto::region_of([chunk[0] - ROOT_VIEW, chunk[1] - ROOT_VIEW]);
-        let hi = proto::region_of([chunk[0] + ROOT_VIEW, chunk[1] + ROOT_VIEW]);
-        (lo[0]..=hi[0]).all(|x| {
-            (lo[1]..=hi[1]).all(|z| {
-                self.best([x, z])
-                    .and_then(|i| self.provinces.get(&pkey(i)))
-                    .is_some_and(|c| c.joined && c.link.is_some())
-            })
+        // (v318) Sur la carte bouclée.
+        proto::regions_around(chunk, ROOT_VIEW).all(|r| {
+            self.best(r)
+                .and_then(|i| self.provinces.get(&pkey(i)))
+                .is_some_and(|c| c.joined && c.link.is_some())
         })
     }
 
@@ -1428,10 +1594,8 @@ impl BuildNet {
             self.doze_t = if ok { self.doze_t + dt } else { 0.0 };
             return;
         }
-        let lo = proto::region_of([chunk[0] - ROOT_VIEW, chunk[1] - ROOT_VIEW]);
-        let hi = proto::region_of([chunk[0] + ROOT_VIEW, chunk[1] + ROOT_VIEW]);
-        let root_needed =
-            (lo[0]..=hi[0]).any(|x| (lo[1]..=hi[1]).any(|z| self.best([x, z]).is_none()));
+        // (v318) Sur la carte bouclée.
+        let root_needed = proto::regions_around(chunk, ROOT_VIEW).any(|r| self.best(r).is_none());
         self.wake_t = if deep { 0.0 } else { self.wake_t + dt };
         if root_needed || !cert_ok || self.wake_t > WAKE_AFTER {
             self.wake_wanted.set(true);
@@ -1466,6 +1630,76 @@ impl BuildNet {
         std::mem::take(&mut self.notices)
     }
 
+    /// (v318) La partie compte désormais depuis `origin` (`World::origin_blocks`) : les
+    /// joueurs proches y sont montrés à leur place tout de suite.
+    pub fn set_origin(&mut self, origin: [i32; 3]) {
+        self.origin = origin;
+        for o in self.others.values_mut() {
+            o.pos = local_place(origin, o.abs);
+        }
+    }
+
+    /// États d'objets (au sol, coffres) et refus reçus, à traiter par la partie (voir
+    /// `crate::drops`) ; (v224) et lumières de l'éditeur (`crate::lightnet`). (v318) Leurs
+    /// places comptées depuis l'origine de la partie.
+    pub fn take_items(&mut self) -> Vec<BuildMsg> {
+        let o = self.origin;
+        std::mem::take(&mut self.item_inbox)
+            .iter()
+            .map(|m| moved_msg(m, o, false))
+            .collect()
+    }
+
+    /// Remet en tête ce que la partie n'a pas pu traiter maintenant (`take_items`).
+    pub fn untake_items(&mut self, rest: Vec<BuildMsg>) {
+        let o = self.origin;
+        let mut v: Vec<BuildMsg> = rest.iter().map(|m| moved_msg(m, o, true)).collect();
+        v.append(&mut self.item_inbox);
+        self.item_inbox = v;
+    }
+
+    /// (v229) Foudres publiées par les arbitres et refus de nos demandes (`BuildMsg::Thor`,
+    /// `Zeus`, `ThorDenied`), pour la partie (`Session::update_thor`). (v318) Leurs places
+    /// comptées depuis l'origine de la partie.
+    pub fn take_thor(&mut self) -> Vec<BuildMsg> {
+        let o = self.origin;
+        std::mem::take(&mut self.thor_inbox)
+            .iter()
+            .map(|m| moved_msg(m, o, false))
+            .collect()
+    }
+
+    /// (v227) Paquets des foules d'essai des autres (par celui qui la mène). (v318) Leurs
+    /// places comptées depuis l'origine de la partie.
+    pub fn take_crowds(&mut self) -> Vec<(String, Vec<u8>)> {
+        let o = self.origin;
+        std::mem::take(&mut self.crowd_inbox)
+            .into_iter()
+            .filter_map(|(who, d)| moved_crowd(&d, o, false).map(|d| (who, d)))
+            .collect()
+    }
+
+    /// (v312) L'Évidé partagé : les monstres que mènent d'autres joueurs (pseudo du meneur,
+    /// paquet de `minelib_net::evide`). (v318) Leurs places comptées depuis l'origine de la
+    /// partie.
+    pub fn take_evides(&mut self) -> Vec<(String, Vec<u8>)> {
+        let o = self.origin;
+        std::mem::take(&mut self.evide_inbox)
+            .into_iter()
+            .filter_map(|(who, d)| moved_evide(&d, o, false).map(|d| (who, d)))
+            .collect()
+    }
+
+    /// (v227) Coups des autres à notre foule d'essai : qui, quel PNJ, d'où (ses yeux).
+    /// (v318) Comptés depuis l'origine de la partie.
+    pub fn take_crowd_hits(&mut self) -> Vec<(String, u16, [f32; 3])> {
+        let o = self.origin;
+        std::mem::take(&mut self.crowd_hits)
+            .into_iter()
+            .map(|(by, id, from)| (by, id, local_place(o, from).to_array()))
+            .collect()
+    }
+
     /// Demande d'objet (lâcher, ramasser, coffre) : à l'arbitre des objets de ce chunk, le
     /// relais du monde, ou (v139) le relais de sa province (jamais un relais de région).
     /// Province pas encore prête : refusée ici (ce qui a été lâché revient).
@@ -1473,6 +1707,11 @@ impl BuildNet {
         if !minelib_net::items::is_request(req) {
             return;
         }
+        // (v318) La demande vient de la partie : en places absolues, au chunk de sa place
+        // (ramasser : celui que donne la partie).
+        let req = &moved_msg(req, self.origin, true);
+        let chunk = minelib_net::items::chunk_of_msg(req)
+            .unwrap_or_else(|| moved_chunk(chunk, self.origin, true));
         let data = game::encode(req);
         match self.authority(chunk) {
             Authority::Root => self.send(Request::ToZone { chunk, data }),
@@ -1502,6 +1741,10 @@ impl BuildNet {
         let Some(chunk) = self.chunk else {
             return;
         };
+        // (v318) Paquet de la partie : en places absolues.
+        let Some(data) = moved_crowd(&data, self.origin, true) else {
+            return;
+        };
         let msg = BuildMsg::Crowd {
             owner: self.pseudo.clone(),
             data,
@@ -1523,6 +1766,16 @@ impl BuildNet {
         let Some(chunk) = self.chunk else {
             return;
         };
+        // (v318) Nos monstres comptent depuis l'origine de la partie : en places absolues.
+        let msg = match msg {
+            BuildMsg::Evide { owner, data } => {
+                let Some(data) = moved_evide(&data, self.origin, true) else {
+                    return;
+                };
+                BuildMsg::Evide { owner, data }
+            }
+            other => other,
+        };
         self.send_at(
             chunk,
             Request::Nearby {
@@ -1542,7 +1795,8 @@ impl BuildNet {
             owner: owner.to_string(),
             by: self.pseudo.clone(),
             id,
-            from,
+            // (v318) En place absolue.
+            from: abs_place(self.origin, Vec3::from(from)),
         };
         self.send_at(
             chunk,
@@ -1558,6 +1812,8 @@ impl BuildNet {
     /// province). Province pas encore prête : refusée ici (la lumière revient comme les
     /// autres l'ont, voir `lightnet`).
     pub fn send_light(&mut self, req: &BuildMsg) {
+        // (v318) La demande vient de la partie : en places absolues.
+        let req = &moved_msg(req, self.origin, true);
         // (Derrière celles qui attendent : l'ordre des demandes compte.)
         if !self.light_queue.is_empty() || !self.try_light(req) {
             self.light_queue.push((req.clone(), 0.0));
@@ -1605,6 +1861,9 @@ impl BuildNet {
     /// (v244) De même pour un coup de la Foudre de Zeus (`BuildMsg::ZeusAsk`, avec le
     /// laissez-passer du relais du monde).
     pub fn send_thor(&mut self, req: &BuildMsg) {
+        // (v318) La demande vient de la partie : en places absolues (son chunk, celui de sa
+        // place sur la carte bouclée).
+        let req = &moved_msg(req, self.origin, true);
         let (BuildMsg::ThorAsk { seq, chunk, .. } | BuildMsg::ZeusAsk { seq, chunk, .. }) = req
         else {
             return;
@@ -1699,6 +1958,12 @@ impl BuildNet {
     /// WorldEdit d'un OP : les blocs changés (case, nouveau, ancien), déjà posés ici, partent
     /// au relais par paquets (il vérifie qu'on est OP et les publie à tous).
     pub fn bulk(&mut self, cells: Vec<([i32; 3], BlockId, BlockId)>) {
+        // (v318) Cases de la partie (comptées depuis son origine), en places absolues.
+        let o = self.origin;
+        let cells: Vec<([i32; 3], BlockId, BlockId)> = cells
+            .into_iter()
+            .map(|(p, b, old)| (moved_block(p, o, true), b, old))
+            .collect();
         for part in cells.chunks(4096) {
             self.next_bulk += 1;
             let id = self.next_bulk;
@@ -1722,7 +1987,7 @@ impl BuildNet {
         }
         let mut dirty = Vec::new();
         for (p, old) in olds.into_iter().rev() {
-            dirty.extend(world.set_remote(p[0], p[1], p[2], old));
+            dirty.extend(put_at(world, p, old));
         }
         dirty
     }
@@ -1790,7 +2055,10 @@ impl BuildNet {
         // (il refuse une modification hors de portée de son auteur). (v140) Au fond des
         // provinces servies par un relais de province (tout ce qu'on a en vue), seulement
         // quand on change de province : c'est à leurs relais qu'on le dit.
-        let chunk = chunk_of(feet.x.floor() as i32, feet.z.floor() as i32);
+        // (v318) En places absolues : la partie compte depuis l'origine du monde.
+        self.origin = world.origin_blocks();
+        let at = abs_place(self.origin, feet);
+        let chunk = proto::chunk_at(at[0], at[2]);
         let deep = self.deep(chunk);
         if self.chunk != Some(chunk) || deep != self.was_deep {
             self.chunk = Some(chunk);
@@ -1819,6 +2087,8 @@ impl BuildNet {
                 .unwrap_or_default()
         };
         for (pos, id, old) in edits {
+            // (v318) La case en place absolue.
+            let pos = world.abs_block(pos);
             // Une demande au relais du monde, qui accepte la modification et lui donne son
             // rang ; dans une région souveraine, signée au relais de la région, dont l'hôte
             // principal le fait (voir `minelib_net::sovereign`). Le bloc d'avant est gardé
@@ -1890,7 +2160,7 @@ impl BuildNet {
             let Some((h, _)) = self.doubtful.remove(&pos) else {
                 continue;
             };
-            if self.pending.contains_key(&pos) || world.get(pos[0], pos[1], pos[2]) != h.got {
+            if self.pending.contains_key(&pos) || block_at(world, pos) != h.got {
                 continue;
             }
             // Une modification du joueur que ce relais avait confirmée : elle est redemandée
@@ -1914,7 +2184,7 @@ impl BuildNet {
             // (v288) Défaite, elle n'est plus « déjà vue » : si un relais qui décide la
             // remet plus tard (au même rang), elle s'applique.
             self.seen.remove(&pos);
-            dirty.extend(world.set_remote(pos[0], pos[1], pos[2], h.pre));
+            dirty.extend(put_at(world, pos, h.pre));
         }
         #[cfg(test)]
         {
@@ -1934,7 +2204,7 @@ impl BuildNet {
             self.pending.remove(&pos);
             self.net[3] += 1;
             log::info!("construction : pas de réponse du relais pour {pos:?}, annulé");
-            dirty.extend(world.set_remote(pos[0], pos[1], pos[2], old));
+            dirty.extend(put_at(world, pos, old));
         }
         // Relais de province en vue (v138) : connexions, messages reçus.
         dirty.extend(self.pump_provinces(world, chunk, dt));
@@ -2052,7 +2322,7 @@ impl BuildNet {
             self.net[0] += 1;
             let msg = BuildMsg::Player {
                 pseudo: self.pseudo.clone(),
-                pos: feet.to_array(),
+                pos: at,
                 yaw: look.0,
                 pitch: look.1,
                 crouch,
@@ -2073,7 +2343,7 @@ impl BuildNet {
             if self.spot_timer <= 0.0 && self.shards.link(proto::region_of(chunk)).is_some() {
                 self.spot_timer = SPOT_EVERY;
                 let spot = Request::Spot {
-                    pos: feet.to_array(),
+                    pos: at,
                     yaw: look.0,
                     pitch: look.1,
                 };
@@ -2097,7 +2367,7 @@ impl BuildNet {
             self.net[1] += 1;
             let msg = BuildMsg::Player {
                 pseudo: self.pseudo.clone(),
-                pos: feet.to_array(),
+                pos: at,
                 yaw: look.0,
                 pitch: look.1,
                 crouch,
@@ -2144,12 +2414,15 @@ impl BuildNet {
             self.net = [0; 5];
             self.net_since = std::time::Instant::now();
         }
+        let origin = self.origin;
         for o in self.others.values_mut() {
             o.seen += dt;
             // Rejoint la dernière position reçue en un intervalle : vitesse régulière même
-            // pour un joueur lointain (moins de messages).
-            let k = (dt / o.interval.max(POS_FASTEST)).min(1.0);
-            o.pos += (o.target - o.pos) * k;
+            // pour un joueur lointain (moins de messages). (v318) En places absolues (l'écart
+            // le plus court sur la carte bouclée), montrée depuis l'origine de la partie.
+            let k = (dt / o.interval.max(POS_FASTEST)).min(1.0) as f64;
+            o.abs = toward(o.abs, o.target, k);
+            o.pos = local_place(origin, o.abs);
         }
         self.others
             .retain(|_, o| o.seen < STALE_S.max(o.interval * 3.0));
@@ -2191,18 +2464,20 @@ impl BuildNet {
     /// (v165) Relais de la province la plus proche du chunk `chunk` où l'on est entré (la
     /// plus petite à distance égale).
     fn nearest_province_link(&self, chunk: [i32; 2]) -> Option<&Sender<Inbound>> {
-        let region = proto::region_of(chunk);
         self.provinces
             .values()
             .filter(|c| c.joined)
             .filter_map(|c| c.link.as_ref().map(|l| (c, l)))
             .min_by_key(|(c, _)| {
-                let s = c.info.size.max(1);
-                let lo = c.info.first_region();
+                // (v318) En chunks, sur la carte bouclée.
+                let s = c.info.size.max(1) * proto::REGION;
+                let r = c.info.first_region();
+                let lo = [r[0] * proto::REGION, r[1] * proto::REGION];
                 let hi = [lo[0] + s - 1, lo[1] + s - 1];
-                let dx = (lo[0] - region[0]).max(region[0] - hi[0]).max(0);
-                let dz = (lo[1] - region[1]).max(region[1] - hi[1]).max(0);
-                (dx.max(dz), c.info.size)
+                let d = |c: i32, lo: i32, hi: i32| {
+                    proto::chunk_gap(lo, c).max(proto::chunk_gap(c, hi)).max(0)
+                };
+                (d(chunk[0], lo[0], hi[0]).max(d(chunk[1], lo[1], hi[1])), c.info.size)
             })
             .map(|(_, l)| l)
     }
@@ -2427,7 +2702,7 @@ impl BuildNet {
                 match self.pending.remove(&pos) {
                     // (Sauf s'il a déjà rechangé la case : voir `rebase_journal`.)
                     Some(p) if rebase_journal(world, pos, p.old) => Vec::new(),
-                    Some(p) => world.set_remote(pos[0], pos[1], pos[2], p.old),
+                    Some(p) => put_at(world, pos, p.old),
                     None => Vec::new(),
                 }
             }
@@ -2492,7 +2767,13 @@ impl BuildNet {
             return;
         }
         self.net[2] += 1;
-        let target = Vec3::from(p.pos);
+        // (v318) En places absolues (sur la carte bouclée).
+        let target = [
+            proto::wrap_place(p.pos[0]),
+            p.pos[1],
+            proto::wrap_place(p.pos[2]),
+        ];
+        let origin = self.origin;
         let key: String = pseudo.chars().take(16).collect();
         match self.others.get_mut(&key) {
             Some(o) => {
@@ -2501,8 +2782,9 @@ impl BuildNet {
                 }
                 // Intervalle mesuré (lissé) ; téléportation : on y va d'un coup.
                 o.interval = o.interval * 0.7 + o.seen.clamp(POS_FASTEST, 4.0) * 0.3;
-                if (target - o.pos).length() > 8.0 {
-                    o.pos = target;
+                if gap(target, o.abs) > 8.0 {
+                    o.abs = target;
+                    o.pos = local_place(origin, target);
                 }
                 o.target = target;
                 o.yaw = p.yaw;
@@ -2522,7 +2804,8 @@ impl BuildNet {
                     Other {
                         pseudo: key,
                         id: home,
-                        pos: target,
+                        pos: local_place(origin, target),
+                        abs: target,
                         target,
                         interval: POS_EVERY,
                         yaw: p.yaw,
@@ -2576,7 +2859,7 @@ impl BuildNet {
             None => self
                 .pending
                 .get(&pos)
-                .map_or_else(|| world.get(pos[0], pos[1], pos[2]), |p| p.old),
+                .map_or_else(|| block_at(world, pos), |p| p.old),
         };
         // (La confirmation de sa propre modification signée.)
         let mine = self
@@ -2694,7 +2977,7 @@ impl BuildNet {
         if rebase_journal(world, pos, BlockId(block)) {
             return Vec::new();
         }
-        world.set_remote(pos[0], pos[1], pos[2], BlockId(block))
+        put_at(world, pos, BlockId(block))
     }
 
     /// Une modification de cette case est confirmée.
@@ -3447,7 +3730,8 @@ mod tests {
                         _ => {}
                     }
                 }
-                self.thor_seen.append(&mut n.thor_inbox);
+                // (v318) Comptées depuis l'origine de son monde, comme dans la partie.
+                self.thor_seen.extend(n.take_thor());
             }
             self.doze_tick();
             self.voice_tick(dt);
@@ -4360,6 +4644,260 @@ mod tests {
     #[test]
     fn a_world_relay_that_stops_cleanly_hands_over_at_once() {
         guarded_world(Fault::Release);
+    }
+
+    /// (v318) « En ligne, les positions partagées sont encore en simple précision… que tu
+    /// t'ajoutes à faire » (Viendax, 25 novembre) : de bout en bout (vrai relais, vraies
+    /// connexions), un monde construit à un milliard de blocs du centre, à cheval sur la
+    /// limite de la carte bouclée, par des joueurs dont les parties comptent chacune depuis
+    /// une origine différente (de part et d'autre de la limite, et sur elle). Les
+    /// modifications de chacun arrivent à tous à leur place ; chacun voit les autres où ils
+    /// sont, un objet lâché là où il tombe, la foudre d'un OP là où elle frappe ; à la fin,
+    /// tous les mondes sont identiques case par case (en places absolues), rien en attente.
+    #[test]
+    fn build_worlds_stay_identical_far_away_and_across_the_edge() {
+        use minelib_net::items::Pile;
+        let dir = std::env::temp_dir().join(format!("minelib-loin-{}", rand_u32()));
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let edge = (proto::LAP_CHUNKS / 2) as i32;
+        let half = proto::MAP_HALF;
+        // Le monde : 4 chunks sur x de part et d'autre de la limite, 2 sur z à un milliard de
+        // blocs du centre.
+        const Z: i32 = 62_500_000;
+        let xs: Vec<i32> = (edge - 2..edge + 2)
+            .map(|c| proto::wrap_chunk(c as i64))
+            .collect();
+        assert_eq!(xs, vec![edge - 2, edge - 1, -edge, -edge + 1]);
+        // L'origine de chacun : du côté +x de la limite, de l'autre côté, sur elle.
+        let origins = [
+            ChunkPos { x: edge - 64, z: Z - 32 },
+            ChunkPos { x: -edge + 64, z: Z + 32 },
+            ChunkPos { x: edge - 1, z: Z },
+        ];
+        let far_world = |o: ChunkPos| {
+            let mut w = World::new(0);
+            w.set_origin(o);
+            for &ax in &xs {
+                for az in Z..Z + 2 {
+                    let l = w.local_chunk(ChunkPos { x: ax, z: az });
+                    w.insert_empty(l);
+                    for dx in 0..16 {
+                        for dz in 0..16 {
+                            w.set(l.x * 16 + dx, 10, l.z * 16 + dz, BlockId::STONE);
+                        }
+                    }
+                }
+            }
+            w.journal = Some(Vec::new());
+            w
+        };
+        // Places absolues : `t` blocs de la limite sur x (négatif : du côté +x).
+        let place = |t: f64, z: f64| [proto::wrap_place(half + t), 11.0, z];
+        let mut bots = vec![Bot::new(&addr, h.public, "Proprio", false)];
+        bots[0].c.send(Cmd::Host {
+            kind: 1,
+            name: "Loin".into(),
+            map: "loin".into(),
+            map_sig: [9; 32],
+            max_players: 0,
+        });
+        let mut room = None;
+        let t = Instant::now();
+        while room.is_none() {
+            while let Some(e) = bots[0].c.poll() {
+                match e {
+                    Event::Hosted(r) => room = Some(r),
+                    Event::Link(l) => bots[0].link = Some(l),
+                    _ => {}
+                }
+            }
+            assert!(t.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let room = room.unwrap();
+        bots[0].start_net(true);
+        for i in 1..3 {
+            let mut b = Bot::new(&addr, h.public, &format!("Joueur{i}"), false);
+            b.c.send(Cmd::Join(room));
+            b.wait(|e| matches!(e, Event::Joined { .. }));
+            b.start_net(false);
+            bots.push(b);
+        }
+        let zb = (Z * 16) as f64;
+        // Places absolues des joueurs (pieds).
+        let mut at: Vec<[f64; 3]> = vec![
+            place(-10.5, zb + 8.5),
+            place(12.5, zb + 20.5),
+            place(0.5, zb + 16.5),
+        ];
+        for (b, o) in bots.iter_mut().zip(origins) {
+            b.world = far_world(o);
+        }
+        let local = |b: &Bot, a: [f64; 3]| local_place(b.world.origin_blocks(), a);
+        let mut seed = 777u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let dt = 0.02;
+        let mut edited = std::collections::BTreeSet::new();
+        let mut items: Vec<Vec<BuildMsg>> = vec![Vec::new(); 3];
+        let drop_at = place(13.0, zb + 21.0);
+        let bolt_at = place(-10.0, zb + 9.0);
+        for step in 0..500 {
+            let building = step < 250;
+            for (i, b) in bots.iter_mut().enumerate() {
+                if building {
+                    // On marche de part et d'autre de la limite.
+                    let r = rnd();
+                    let a = &mut at[i];
+                    let t = proto::place_gap(a[0], half) + (r % 3) as f64 - 1.0;
+                    a[0] = proto::wrap_place(half + t.clamp(-28.0, 28.0));
+                    a[2] = (a[2] + ((r >> 4) % 3) as f64 - 1.0).clamp(zb + 1.0, zb + 31.0);
+                    for _ in 0..(rnd() % 9 == 0) as u32 {
+                        let abs = [
+                            proto::wrap_block(half as i64 + (rnd() % 64) as i64 - 32),
+                            11 + (rnd() % 3) as i32,
+                            Z * 16 + (rnd() % 32) as i32,
+                        ];
+                        let l = b.world.local_block(abs);
+                        let block = if rnd() % 4 == 0 {
+                            BlockId::AIR
+                        } else {
+                            BlockId(1 + rnd() as u16 % 8)
+                        };
+                        b.world.set(l[0], l[1], l[2], block);
+                        edited.insert(abs);
+                    }
+                }
+                b.pos = local(b, at[i]);
+                b.tick(dt);
+                if let Some(n) = b.net.as_mut() {
+                    items[i].extend(n.take_items());
+                }
+            }
+            // Un objet lâché (place de la partie de celui qui le lâche), une foudre de l'OP.
+            if step == 100 {
+                let b = &mut bots[1];
+                let p = local(b, drop_at);
+                let req = BuildMsg::DropItem {
+                    seq: 1,
+                    id: 777,
+                    pos: p.to_array().map(f64::from),
+                    pile: Pile { item: 1, count: 3 },
+                };
+                let c = chunk_of(p.x.floor() as i32, p.z.floor() as i32);
+                b.net.as_mut().unwrap().send_item(c, &req);
+            }
+            if step == 120 {
+                let b = &mut bots[0];
+                let p = local(b, bolt_at);
+                let req = BuildMsg::ThorAsk {
+                    seq: 5,
+                    chunk: chunk_of(p.x.floor() as i32, p.z.floor() as i32),
+                    up: false,
+                    pos: p.to_array().map(f64::from),
+                    dir: [0.0, -1.0, 0.0],
+                    seed: 4242,
+                };
+                b.net.as_mut().unwrap().send_thor(&req);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(edited.len() > 30, "assez de modifications : {}", edited.len());
+        for b in &bots {
+            assert_eq!(b.net.as_ref().unwrap().pending(), 0, "{} : en attente", b.name);
+        }
+        // Chacun voit les autres là où ils sont (dans sa partie, depuis son origine).
+        for (i, b) in bots.iter().enumerate() {
+            for (j, other) in bots.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let key: String = other.name.chars().take(16).collect();
+                let o = b.net.as_ref().unwrap().others.get(&key);
+                let o = o.unwrap_or_else(|| panic!("{} ne voit pas {}", b.name, other.name));
+                let want = local(b, at[j]);
+                assert!(
+                    o.pos.distance(want) < 0.5,
+                    "{} voit {} en {:?} au lieu de {want:?}",
+                    b.name,
+                    other.name,
+                    o.pos
+                );
+            }
+        }
+        // L'objet lâché : chez tous, à sa place.
+        for (i, b) in bots.iter().enumerate() {
+            let got = items[i].iter().find_map(|m| match m {
+                BuildMsg::Item {
+                    id: 777,
+                    at,
+                    drop: Some(_),
+                    ..
+                } => Some(*at),
+                _ => None,
+            });
+            let got = got.unwrap_or_else(|| panic!("{} n'a pas vu l'objet lâché", b.name));
+            let want = local(b, drop_at);
+            assert!(
+                (got[0] as f32 - want.x).abs() < 0.01 && (got[2] as f32 - want.z).abs() < 0.01,
+                "{} : objet en {got:?} au lieu de {want:?}",
+                b.name
+            );
+        }
+        // La foudre de l'OP : chez tous, là où elle frappe.
+        for b in &bots {
+            let got = b.thor_seen.iter().find_map(|m| match m {
+                BuildMsg::Thor { pos, seed: 4242, .. } => Some(*pos),
+                _ => None,
+            });
+            let got = got.unwrap_or_else(|| panic!("{} n'a pas vu la foudre", b.name));
+            let want = local(b, bolt_at);
+            assert!(
+                (got[0] as f32 - want.x).abs() < 0.01 && (got[2] as f32 - want.z).abs() < 0.01,
+                "{} : foudre en {got:?} au lieu de {want:?}",
+                b.name
+            );
+        }
+        // Les mondes, en places absolues.
+        let mut differ = Vec::new();
+        let owner = &bots[0];
+        for b in &bots[1..] {
+            for t in -32..32i64 {
+                let x = proto::wrap_block(half as i64 + t);
+                for z in Z * 16..Z * 16 + 32 {
+                    for y in 11..15 {
+                        let la = b.world.local_block([x, y, z]);
+                        let lo = owner.world.local_block([x, y, z]);
+                        let (a, o) = (b.world.get(la[0], y, la[2]), owner.world.get(lo[0], y, lo[2]));
+                        if a != o {
+                            differ.push((b.name.clone(), [x, y, z], a, o));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(differ.is_empty(), "mondes différents : {differ:?}");
+        // (Et ce qui a été posé est bien là.)
+        let placed = edited
+            .iter()
+            .filter(|a| {
+                let l = owner.world.local_block(**a);
+                owner.world.get(l[0], l[1], l[2]) != BlockId::AIR
+            })
+            .count();
+        assert!(placed > 10, "blocs posés : {placed}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -6251,7 +6789,7 @@ mod tests {
                     let near: Vec<[f32; 3]> = items[i]
                         .view
                         .live_drops()
-                        .map(|(_, d)| d.pos)
+                        .map(|(_, d)| d.pos.map(|v| v as f32))
                         .filter(|p| (p[0] - b.pos.x).abs() < 12.0)
                         .collect();
                     if !near.is_empty() {
@@ -6582,7 +7120,7 @@ mod tests {
             seq,
             chunk: chunk_of(x.floor() as i32, 16),
             up,
-            pos: [x, 12.0, 16.5],
+            pos: [x as f64, 12.0, 16.5],
             dir: if up { [0.0, 1.0, 0.0] } else { [0.0, -1.0, 0.0] },
             seed,
         };
@@ -7212,7 +7750,7 @@ mod tests {
         let msg = |x: f32| {
             game::encode(&BuildMsg::Player {
                 pseudo: "Loin".into(),
-                pos: [x, 64.0, 0.0],
+                pos: [x as f64, 64.0, 0.0],
                 yaw: 0.0,
                 pitch: 0.0,
                 crouch: 0.0,
@@ -7351,12 +7889,22 @@ mod tests {
         b.receive(0, [0, 0], &game::encode(&BuildMsg::CrowdDenied), &mut w);
         assert!(b.crowd_denied);
         // Pas encore placé : rien ne part ; placé, la foule et le coup partent avec nos
-        // positions (`Nearby`), à notre nom.
-        b.send_crowd(vec![4, 5]);
+        // positions (`Nearby`), à notre nom. (v318) Une vraie foule : son paquet est lu pour
+        // passer en places absolues ; illisible, il ne part pas.
+        let ours = minelib_net::crowd::pack(&minelib_net::crowd::Packet {
+            center: [40.0, 64.0, -20.0],
+            count: 0,
+            npcs: Vec::new(),
+            found: None,
+            stop: false,
+        });
+        b.send_crowd(ours.clone());
         assert!(rx.try_recv().is_err());
         let _ = b.update(&mut w, Vec3::new(40.0, 64.0, -20.0), (0.0, 0.0), 0.0, 0.0, 0.0, 0.05);
         while rx.try_recv().is_ok() {}
         b.send_crowd(vec![4, 5]);
+        assert!(rx.try_recv().is_err());
+        b.send_crowd(ours.clone());
         b.send_crowd_hit("Op", 3, [1.0, 2.0, 3.0]);
         let mut sent = Vec::new();
         while let Ok(m) = rx.try_recv() {
@@ -7373,7 +7921,7 @@ mod tests {
                     [2, -2],
                     BuildMsg::Crowd {
                         owner: "Moi".into(),
-                        data: vec![4, 5]
+                        data: ours
                     }
                 ),
                 (

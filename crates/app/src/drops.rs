@@ -77,14 +77,14 @@ pub fn shift(m: &BuildMsg, from: [i32; 2], to: [i32; 2], limit: f64) -> Option<B
             seq,
             got,
         } => {
-            let x = at[0] as f64 + dx as f64;
-            let z = at[2] as f64 + dz as f64;
+            let x = at[0] + dx as f64;
+            let z = at[2] + dz as f64;
             if !(x.abs() <= limit && z.abs() <= limit) {
                 return None;
             }
             Some(BuildMsg::Item {
                 id: *id,
-                at: [x as f32, at[1], z as f32],
+                at: [x, at[1], z],
                 drop: *drop,
                 to: who.clone(),
                 seq: *seq,
@@ -121,6 +121,12 @@ fn chunk_at(x: f32, z: f32) -> [i32; 2] {
     ]
 }
 
+/// (v318) Le point d'un objet au sol (ses places sont en double précision ; celles de la
+/// partie, comptées depuis son origine, tiennent en simple précision).
+fn v3(p: [f64; 3]) -> Vec3 {
+    Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)
+}
+
 impl Items {
     pub fn new(local: bool) -> Self {
         Self {
@@ -142,6 +148,39 @@ impl Items {
     /// Ce jeu arbitre-t-il lui-même (solo) ?
     pub fn is_local(&self) -> bool {
         self.local
+    }
+
+    /// (v318) La partie compte désormais depuis une autre origine (en ligne : elle en change
+    /// sans quitter le serveur, `Session::take_carry`) : toutes les places de (`dx`, `dz`)
+    /// blocs de plus (des multiples de 16 : les origines sont des chunks).
+    pub fn rebase(&mut self, dx: i64, dz: i64) {
+        self.view.shift(dx, dz);
+        let v = Vec3::new(dx as f32, 0.0, dz as f32);
+        for b in self.born.values_mut() {
+            if let Some(p) = &mut b.1 {
+                *p += v;
+            }
+        }
+        for f in self.flights.values_mut() {
+            for p in f.iter_mut() {
+                *p += v;
+            }
+        }
+        let (cx, cz) = ((dx / 16) as i32, (dz / 16) as i32);
+        for (c, m) in &mut self.outbox {
+            *c = [c[0] + cx, c[1] + cz];
+            match m {
+                BuildMsg::DropItem { pos, .. } => {
+                    pos[0] += dx as f64;
+                    pos[2] += dz as f64;
+                }
+                BuildMsg::ChestPut { pos, .. } | BuildMsg::ChestTake { pos, .. } => {
+                    pos[0] += dx as i32;
+                    pos[2] += dz as i32;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// États enregistrés avec le monde `dir`.
@@ -302,7 +341,7 @@ impl Items {
     pub fn drop_item(&mut self, from: Vec3, to: Vec3, pile: Pile) -> u64 {
         let id: u64 = rand::random();
         self.born.insert(id, (Instant::now(), Some(from), true));
-        let req = self.ledger.drop_item(id, to.to_array(), pile);
+        let req = self.ledger.drop_item(id, to.to_array().map(f64::from), pile);
         self.outbox.push((chunk_at(to.x, to.z), req));
         id
     }
@@ -362,7 +401,7 @@ impl Items {
                     < path.len() as f32 * crate::equip::TOSS_STEP + 1.0
             })
         });
-        let near: Vec<(u64, [f32; 3])> = self
+        let near: Vec<(u64, [f64; 3])> = self
             .view
             .live_drops()
             .filter(|(id, d)| {
@@ -372,7 +411,7 @@ impl Items {
                 });
                 age > 0.0
                     && !self.asked.contains_key(id)
-                    && Vec3::from(d.pos).distance(center) < PICK_RANGE
+                    && v3(d.pos).distance(center) < PICK_RANGE
                     && room(d.pile)
             })
             .map(|(id, d)| (id, d.pos))
@@ -380,7 +419,7 @@ impl Items {
         for (id, pos) in near {
             self.asked.insert(id, now);
             let req = self.ledger.take_item(id);
-            self.outbox.push((chunk_at(pos[0], pos[2]), req));
+            self.outbox.push((chunk_at(pos[0] as f32, pos[2] as f32), req));
         }
     }
 
@@ -458,7 +497,7 @@ impl Items {
         for (id, d) in self.view.live_drops() {
             // (v263) Dessiné écarté des murs (les objets posés avant, ou lâchés par un jeu
             // d'avant, ne restent pas à moitié dans un bloc).
-            let rest = crate::equip::clear_of_walls(world, Vec3::from(d.pos));
+            let rest = crate::equip::clear_of_walls(world, v3(d.pos));
             if rest.distance_squared(cam) > 64.0 * 64.0 {
                 continue;
             }
@@ -503,7 +542,7 @@ impl Items {
         let t = self.start.elapsed().as_secs_f32();
         let mut out = Vec::new();
         for (id, d) in self.view.live_drops() {
-            let rest = crate::equip::clear_of_walls(world, Vec3::from(d.pos));
+            let rest = crate::equip::clear_of_walls(world, v3(d.pos));
             if rest.distance_squared(cam) > 64.0 * 64.0
                 || Item::from_code(d.pile.item) != Some(Item::Zeus)
             {
@@ -541,7 +580,7 @@ impl Items {
             let Some(d) = slot else {
                 continue;
             };
-            let p = Vec3::from(d.pos);
+            let p = v3(d.pos);
             let (x, z) = (p.x.floor() as i32, p.z.floor() as i32);
             if !world.contains(minelib_world::ChunkPos::containing(x, z)) {
                 continue;
@@ -607,7 +646,7 @@ impl Items {
                 }
             }
             if next != p {
-                d.pos = next.to_array();
+                d.pos = next.to_array().map(f64::from);
                 moved = true;
             }
         }
@@ -756,7 +795,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("minelib-objets-loin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let item = |id: u64, at: [f32; 3], n: u8| BuildMsg::Item {
+        let item = |id: u64, at: [f64; 3], n: u8| BuildMsg::Item {
             id,
             at,
             drop: Some(stone(n)),
@@ -801,6 +840,61 @@ mod tests {
         let all = Items::saved_at(&dir, [0, 0], [0, 0]);
         assert_eq!(all.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v318) En ligne, la partie change d'origine sans quitter le serveur : les objets au sol
+    /// qu'elle connaît (ce qu'a publié l'arbitre), les coffres et les demandes pas encore
+    /// parties passent à leur place depuis la nouvelle origine (de part et d'autre de la
+    /// limite de la carte bouclée aussi), sans rien perdre.
+    #[test]
+    fn online_items_follow_a_new_origin() {
+        let mut it = Items::new(false);
+        let item = |id: u64, at: [f64; 3]| BuildMsg::Item {
+            id,
+            at,
+            drop: Some(stone(2)),
+            to: String::new(),
+            seq: 0,
+            got: None,
+        };
+        it.hear(&item(1, [10.5, 70.0, -3.25]), "moi", Some(Vec3::new(9.0, 71.0, -3.0)));
+        it.hear(&item(2, [1_073_741_000.5, 70.0, 0.5]), "moi", None);
+        it.hear(
+            &BuildMsg::Slot {
+                pos: [4, 64, 5],
+                slot: 0,
+                pile: Some(stone(7)),
+                by: String::new(),
+                seq: 0,
+                got: None,
+            },
+            "moi",
+            None,
+        );
+        it.drop_item(Vec3::new(1.0, 70.0, 1.0), Vec3::new(2.5, 70.0, 2.5), stone(1));
+        // L'origine recule de 4 096 blocs sur x et avance de 8 192 sur z.
+        it.rebase(4096, -8192);
+        let at = |it: &Items, id: u64| {
+            it.view
+                .live_drops()
+                .find(|(k, _)| *k == id)
+                .map(|(_, d)| d.pos)
+                .unwrap()
+        };
+        assert_eq!(at(&it, 1), [4106.5, 70.0, -8195.25]);
+        // (Au-delà de la limite : ramené sur la carte, le plus près de l'origine.)
+        let far = at(&it, 2);
+        assert_eq!(far[0], minelib_world::lap::wrap_f64(1_073_741_000.5 + 4096.0));
+        assert!(far[0] < 0.0);
+        assert!(it.view.chests.contains_key(&[4100, 64, -8187]));
+        assert_eq!(it.born.get(&1).unwrap().1, Some(Vec3::new(4105.0, 71.0, -8195.0)));
+        match &it.outbox[0] {
+            (c, BuildMsg::DropItem { pos, .. }) => {
+                assert_eq!(*pos, [4098.5, 70.0, -8189.5]);
+                assert_eq!(*c, [256, -512]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -996,7 +1090,7 @@ mod tests {
         let mut it = Items::new(true);
         it.drop_item(Vec3::ZERO, Vec3::new(3.5, 10.0, 8.5), stone(1));
         it.arbitrate(ME);
-        let pos = |it: &Items| Vec3::from(it.view.live_drops().next().unwrap().1.pos);
+        let pos = |it: &Items| v3(it.view.live_drops().next().unwrap().1.pos);
         for _ in 0..60 {
             it.drift(&w, 1.0 / 60.0);
         }
@@ -1060,7 +1154,7 @@ mod tests {
         for _ in 0..120 {
             assert!(it.drift(&w, 1.0 / 60.0).is_empty());
         }
-        let p = Vec3::from(it.view.live_drops().next().unwrap().1.pos);
+        let p = v3(it.view.live_drops().next().unwrap().1.pos);
         assert!(p.y > 10.5, "à la surface de la lave : {p}");
     }
 }

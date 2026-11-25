@@ -229,6 +229,26 @@ mod tests {
         assert_eq!(on_map((7, 0.0)), (0, 7.0));
     }
 
+    /// (v318) Le jeu et le relais parlent de la même carte bouclée (`minelib_net::proto` ne
+    /// dépend pas du monde : son tour est écrit deux fois).
+    #[test]
+    fn the_net_and_the_world_share_one_map() {
+        use minelib_net::proto;
+        use minelib_world::lap;
+        assert_eq!(lap::LAP, proto::LAP_BLOCKS);
+        assert_eq!(lap::LAP_CHUNKS, proto::LAP_CHUNKS);
+        assert_eq!(lap::HALF as f64, proto::MAP_HALF);
+        for v in [0.0, 1.5, -1e9, 1_073_741_759.5, -1_073_741_760.0, 1_073_741_760.0, 5e9, -7.25e12] {
+            assert_eq!(lap::wrap_f64(v), proto::wrap_place(v), "{v}");
+        }
+        for v in [0i64, -1, 1_073_741_759, 1_073_741_760, -1_073_741_761, 9_999_999_999] {
+            assert_eq!(lap::wrap_block(v), proto::wrap_block(v), "{v}");
+        }
+        for c in [0i64, 67_108_859, 67_108_860, -67_108_861, 1 << 40] {
+            assert_eq!(lap::wrap_chunk(c), proto::wrap_chunk(c), "{c}");
+        }
+    }
+
     #[test]
     fn laps_are_told_with_their_direction() {
         assert_eq!(text([0, 0]), None);

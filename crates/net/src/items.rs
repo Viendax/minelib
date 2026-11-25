@@ -45,7 +45,8 @@ pub struct Pile {
 /// Objet posé au sol.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Dropped {
-    pub pos: [f32; 3],
+    /// (v318) En double précision, sur la carte bouclée.
+    pub pos: [f64; 3],
     pub pile: Pile,
 }
 
@@ -75,11 +76,9 @@ fn valid(p: Pile) -> bool {
     (1..=MAX_PILE).contains(&p.count)
 }
 
-fn chunk_of(x: f32, z: f32) -> [i32; 2] {
-    [
-        (x.floor() as i32).div_euclid(16),
-        (z.floor() as i32).div_euclid(16),
-    ]
+fn chunk_of(x: f64, z: f64) -> [i32; 2] {
+    // (v318) Sur la carte bouclée.
+    crate::proto::chunk_at(x, z)
 }
 
 /// Chunk où ranger un état publié (pour le remettre aux joueurs proches).
@@ -149,6 +148,23 @@ impl ItemStore {
         }
     }
 
+    /// (v318) Toutes les places de cet état comptées depuis une autre origine : (`dx`, `dz`)
+    /// blocs de plus, sur la carte bouclée (une partie qui change d'origine sans quitter le
+    /// serveur).
+    pub fn shift(&mut self, dx: i64, dz: i64) {
+        use crate::proto::{wrap_block, wrap_place};
+        for d in self.drops.values_mut().flatten() {
+            d.pos[0] = wrap_place(d.pos[0] + dx as f64);
+            d.pos[2] = wrap_place(d.pos[2] + dz as f64);
+        }
+        let b = |p: [i32; 3]| [wrap_block(p[0] as i64 + dx), p[1], wrap_block(p[2] as i64 + dz)];
+        self.chests = std::mem::take(&mut self.chests)
+            .into_iter()
+            .map(|(p, c)| (b(p), c))
+            .collect();
+        self.opened = std::mem::take(&mut self.opened).into_iter().map(b).collect();
+    }
+
     /// Objets au sol présents.
     pub fn live_drops(&self) -> impl Iterator<Item = (u64, &Dropped)> {
         self.drops
@@ -200,7 +216,8 @@ impl ItemStore {
     fn apply_new(&mut self, req: &BuildMsg, by: &str) -> Result<Vec<BuildMsg>, u32> {
         match *req {
             BuildMsg::DropItem { seq, id, pos, pile } => {
-                let sane = pos.iter().all(|v| v.is_finite() && v.abs() < 4.0e7);
+                // (v318) Sur la carte bouclée.
+                let sane = crate::proto::sane_place(pos);
                 // Numéro déjà vu (même ramassé depuis) : la demande est un doublon.
                 if !valid(pile) || !sane || self.drops.contains_key(&id) {
                     return Err(seq);
@@ -331,7 +348,7 @@ impl ItemStore {
         };
         self.opened.insert(pos);
         let mut out = Vec::new();
-        let at = [pos[0] as f32 + 0.5, pos[1] as f32, pos[2] as f32 + 0.5];
+        let at = [pos[0] as f64 + 0.5, pos[1] as f64, pos[2] as f64 + 0.5];
         for (i, pile) in chest.into_iter().enumerate() {
             let Some(pile) = pile else { continue };
             out.push(BuildMsg::Slot {
@@ -370,7 +387,7 @@ impl ItemStore {
                 drop: Some(pile),
                 ..
             } => {
-                let sane = at.iter().all(|v| v.is_finite() && v.abs() < 4.0e7);
+                let sane = crate::proto::sane_place(at);
                 if !valid(pile) || !sane || self.drops.contains_key(&id) {
                     return None;
                 }
@@ -525,7 +542,7 @@ impl Ledger {
     }
 
     /// Lâcher `pile` (déjà retirée de l'inventaire par l'appelant) en `pos`.
-    pub fn drop_item(&mut self, id: u64, pos: [f32; 3], pile: Pile) -> BuildMsg {
+    pub fn drop_item(&mut self, id: u64, pos: [f64; 3], pile: Pile) -> BuildMsg {
         let seq = self.seq();
         self.owed.insert(seq, Some(pile));
         BuildMsg::DropItem { seq, id, pos, pile }
@@ -745,7 +762,7 @@ mod tests {
             BuildMsg::DropItem {
                 seq: 13,
                 id: 9,
-                pos: [f32::NAN, 0.0, 0.0],
+                pos: [f64::NAN, 0.0, 0.0],
                 pile: pile(WOOD, 1),
             },
             BuildMsg::ChestPut {

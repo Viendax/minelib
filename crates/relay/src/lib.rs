@@ -279,7 +279,7 @@ impl Handle {
         entries: Vec<([i32; 2], u64, Vec<u8>)>,
         bags: Vec<proto::BagCopy>,
         held: Vec<String>,
-        spots: Vec<(String, [f32; 5])>,
+        spots: Vec<(String, [f64; 5])>,
     ) -> Option<u64> {
         provinces::copy(
             &mut self.state.lock().unwrap(),
@@ -1409,7 +1409,7 @@ struct State {
     /// relais en surveille (`minelib_net::evide::Watch`) ; où il voit chaque joueur (ses
     /// pieds, d'après sa dernière position admise) ; l'horloge de cette surveillance.
     evides: HashMap<u64, minelib_net::evide::Watch>,
-    evide_seen: HashMap<u64, [f32; 3]>,
+    evide_seen: HashMap<u64, [f64; 3]>,
     evide_clock: Instant,
     /// Passeurs de la voie rapide des parties FPS, et parties qu'ils portent.
     fast: passeurs::Fast,
@@ -3001,13 +3001,10 @@ fn refresh_needs(st: &mut State, rid: u64, id: u64) {
     };
     let mut want = Vec::new();
     if let Some(&c) = room.build.positions.get(&id) {
-        let lo = proto::region_of([c[0] - zones::NEAR, c[1] - zones::NEAR]);
-        let hi = proto::region_of([c[0] + zones::NEAR, c[1] + zones::NEAR]);
-        for rx in lo[0]..=hi[0] {
-            for rz in lo[1]..=hi[1] {
-                if !served.contains(&[rx, rz]) && !provinces::in_set(&delegated, [rx, rz]) {
-                    want.push([rx, rz]);
-                }
+        // (v318) Sur la carte bouclée.
+        for r in proto::regions_around(c, zones::NEAR) {
+            if !served.contains(&r) && !provinces::in_set(&delegated, r) {
+                want.push(r);
             }
         }
     }
@@ -3167,9 +3164,8 @@ fn build_edit(
         .rooms
         .get(&rid)
         .and_then(|r| r.build.positions.get(&id))
-        .is_some_and(|h| {
-            (h[0] - chunk[0]).abs() <= zones::NEAR && (h[1] - chunk[1]).abs() <= zones::NEAR
-        });
+        // (v318) Sur la carte bouclée.
+        .is_some_and(|h| proto::chunks_within(*h, chunk, zones::NEAR));
     let calm = st.conns.get_mut(&id).is_some_and(|c| {
         let (r, max) = if fluid {
             (&mut c.fluid_rate, FLUID_RATE)
@@ -3223,7 +3219,7 @@ fn item_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &game::Build
         room.build.positions.get(&id),
         room.build.items.target_chunk(m),
     ) {
-        (Some(h), Some(t)) => (h[0] - t[0]).abs() <= 2 && (h[1] - t[1]).abs() <= 2,
+        (Some(h), Some(t)) => proto::chunks_within(*h, t, 2),
         (_, None) => true,
         (None, _) => false,
     };
@@ -3370,9 +3366,12 @@ pub(crate) fn thor_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &
     };
     let op = st.servers.is_op(&room.server, &room.creator, pseudo);
     // (Là où ce relais le sait : un joueur qu'il n'a pas encore placé n'est pas refusé.)
-    let near = room.build.positions.get(&id).is_none_or(|at| {
-        (at[0] - chunk[0]).abs() <= THOR_REACH && (at[1] - chunk[1]).abs() <= THOR_REACH
-    });
+    // (v318) Sur la carte bouclée.
+    let near = room
+        .build
+        .positions
+        .get(&id)
+        .is_none_or(|at| proto::chunks_within(*at, *chunk, THOR_REACH));
     let calm = st.conns.get_mut(&id).is_some_and(|c| {
         if c.thor_rate.0.elapsed() >= Duration::from_secs(1) {
             c.thor_rate = (Instant::now(), 0);
@@ -3612,9 +3611,12 @@ pub(crate) fn zeus_zone_request(
     let Some(room) = st.rooms.get(&rid) else {
         return;
     };
-    let near = room.build.positions.get(&id).is_none_or(|at| {
-        (at[0] - chunk[0]).abs() <= THOR_REACH && (at[1] - chunk[1]).abs() <= THOR_REACH
-    });
+    // (v318) Sur la carte bouclée.
+    let near = room
+        .build
+        .positions
+        .get(&id)
+        .is_none_or(|at| proto::chunks_within(*at, *chunk, THOR_REACH));
     let now = now_secs();
     let signed = *expires >= now
         && *expires <= now + proto::ZEUS_PERMIT_S + 5
@@ -5687,10 +5689,20 @@ const HOSTS_WAIT: Duration = Duration::from_secs(5);
 const SHARD_VIEW: i32 = 16;
 
 /// Régions en vue d'un joueur placé en `chunk`.
+/// (v318) Place de retour d'un joueur (pieds, regard), ramenée sur la carte bouclée.
+fn spot_of(pos: [f64; 3], yaw: f32, pitch: f32) -> [f64; 5] {
+    [
+        proto::wrap_place(pos[0]),
+        pos[1],
+        proto::wrap_place(pos[2]),
+        yaw as f64,
+        pitch as f64,
+    ]
+}
+
 fn regions_in_view(chunk: [i32; 2]) -> impl Iterator<Item = [i32; 2]> {
-    let lo = proto::region_of([chunk[0] - SHARD_VIEW, chunk[1] - SHARD_VIEW]);
-    let hi = proto::region_of([chunk[0] + SHARD_VIEW, chunk[1] + SHARD_VIEW]);
-    (lo[0]..=hi[0]).flat_map(move |x| (lo[1]..=hi[1]).map(move |z| [x, z]))
+    // (v318) Sur la carte bouclée : près de sa limite, celles de l'autre côté aussi.
+    proto::regions_around(chunk, SHARD_VIEW)
 }
 
 /// Donne à un joueur les relais des régions en vue de là où il est, et son billet, si
@@ -7381,8 +7393,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         &c.tx,
                         &Response::BuildSpawn {
                             pos: [p[0], p[1], p[2]],
-                            yaw: p[3],
-                            pitch: p[4],
+                            yaw: p[3] as f32,
+                            pitch: p[4] as f32,
                         },
                     );
                 }
@@ -7566,10 +7578,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         let to = match reason.trim().strip_prefix('@') {
                             Some(other) => st.servers.position(&server, other.trim()),
                             None => {
-                                let v: Vec<f32> = reason
+                                // (v318) En double précision, ramenée sur la carte bouclée.
+                                let v: Vec<f64> = reason
                                     .split_whitespace()
                                     .filter_map(|t| t.parse().ok())
-                                    .filter(|c: &f32| c.is_finite())
+                                    .filter(|c: &f64| c.is_finite())
                                     .collect();
                                 // (Son regard reste le sien : le dernier connu ici.)
                                 let look = st
@@ -7577,9 +7590,13 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                                     .position(&server, who)
                                     .map_or((0.0, 0.0), |p| (p[3], p[4]));
                                 match v[..] {
-                                    [x, y, z] if y.abs() <= 4096.0 => {
-                                        Some([x, y, z, look.0, look.1])
-                                    }
+                                    [x, y, z] if y.abs() <= 4096.0 => Some([
+                                        proto::wrap_place(x),
+                                        y,
+                                        proto::wrap_place(z),
+                                        look.0,
+                                        look.1,
+                                    ]),
                                     _ => None,
                                 }
                             }
@@ -7606,8 +7623,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             &c.tx,
                             &Response::BuildSpawn {
                                 pos: [to[0], to[1], to[2]],
-                                yaw: to[3],
-                                pitch: to[4],
+                                yaw: to[3] as f32,
+                                pitch: to[4] as f32,
                             },
                         );
                     }
@@ -8497,7 +8514,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 .get(&rid)
                 .filter(|r| r.kind == 1)
                 .map(|r| r.server.clone())?;
-            let at = [pos[0], pos[1], pos[2], yaw, pitch];
+            // (v318) Sur la carte bouclée.
+            let at = spot_of(pos, yaw, pitch);
             st.servers.set_position(&server, pseudo, at);
             // (Relais de province, v139 : transmise au relais du monde.)
             provinces::spot(st, rid, pseudo, at);
@@ -8538,7 +8556,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         .filter(|r| r.kind == 1)
                         .map(|r| (rid, r.server.clone()))
                 }) {
-                    let at = [pos[0], pos[1], pos[2], yaw, pitch];
+                    let at = spot_of(pos, yaw, pitch);
                     st.servers.set_position(&server, pseudo, at);
                     // (Relais de province, v139 : transmise au relais du monde.)
                     provinces::spot(st, rid, pseudo, at);
@@ -12796,7 +12814,7 @@ mod tests {
             chunk,
             data: game::encode(&m),
         };
-        let stand = |pseudo: &str, pos: [f32; 3]| game::BuildMsg::Player {
+        let stand = |pseudo: &str, pos: [f64; 3]| game::BuildMsg::Player {
             pseudo: pseudo.into(),
             pos,
             yaw: 0.0,
@@ -13259,7 +13277,7 @@ mod tests {
                 }
             }
         };
-        let ask = |seq: u32, chunk: [i32; 2], pos: [f32; 3]| Request::ToZone {
+        let ask = |seq: u32, chunk: [i32; 2], pos: [f64; 3]| Request::ToZone {
             chunk,
             data: game::encode(&game::BuildMsg::ThorAsk {
                 seq,
@@ -13359,7 +13377,7 @@ mod tests {
         // Un point qui n'est pas dans le chunk annoncé, un nombre infini, trop loin de
         // lui : refusées.
         transport::push(&clink, &ask(2, [0, 0], [40.0, 70.0, 4.5]));
-        transport::push(&clink, &ask(3, [0, 0], [f32::NAN, 70.0, 4.5]));
+        transport::push(&clink, &ask(3, [0, 0], [f64::NAN, 70.0, 4.5]));
         transport::push(&clink, &ask(4, [40, 0], [645.0, 70.0, 4.5]));
         for seq in [2, 3, 4] {
             assert_eq!(next(&createur), game::BuildMsg::ThorDenied {
@@ -15935,7 +15953,7 @@ mod tests {
                             st,
                             id,
                             Request::Spot {
-                                pos: [c[0] as f32 * 16.0, 70.0, c[1] as f32 * 16.0],
+                                pos: [c[0] as f64 * 16.0, 70.0, c[1] as f64 * 16.0],
                                 yaw: 0.0,
                                 pitch: 0.0,
                             },
@@ -16214,14 +16232,14 @@ mod tests {
                         }
                         // (v140) Positions de retour de ses joueurs, toutes les 2 s, avec
                         // ce qu'elle publie.
-                        let spots: Vec<(String, [f32; 5])> = if k == 0 && sec % 2 == 0 {
+                        let spots: Vec<(String, [f64; 5])> = if k == 0 && sec % 2 == 0 {
                             authors
                                 .iter()
                                 .map(|&i| {
                                     let c = home(i);
                                     (
                                         format!("J{i}"),
-                                        [c[0] as f32 * 16.0, 70.0, c[1] as f32 * 16.0, 0.0, 0.0],
+                                        [c[0] as f64 * 16.0, 70.0, c[1] as f64 * 16.0, 0.0, 0.0],
                                     )
                                 })
                                 .collect()

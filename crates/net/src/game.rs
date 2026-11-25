@@ -526,9 +526,10 @@ pub enum BuildMsg {
         by: String,
         seq: u64,
     },
+    /// (v318) Ses pieds, en double précision, sur la carte bouclée.
     Player {
         pseudo: String,
-        pos: [f32; 3],
+        pos: [f64; 3],
         yaw: f32,
         pitch: f32,
         crouch: f32,
@@ -548,7 +549,7 @@ pub enum BuildMsg {
     DropItem {
         seq: u32,
         id: u64,
-        pos: [f32; 3],
+        pos: [f64; 3],
         pile: crate::items::Pile,
     },
     /// Ramasser l'objet `id`.
@@ -572,7 +573,7 @@ pub enum BuildMsg {
     /// demande vient d'être acceptée ; `got` : ce qu'il gagne (objet ramassé).
     Item {
         id: u64,
-        at: [f32; 3],
+        at: [f64; 3],
         drop: Option<crate::items::Pile>,
         to: String,
         seq: u32,
@@ -635,7 +636,7 @@ pub enum BuildMsg {
         owner: String,
         by: String,
         id: u16,
-        from: [f32; 3],
+        from: [f64; 3],
     },
     /// (v227) Foule refusée (pas OP de ce serveur, trop de paquets, paquet trop gros ou
     /// absurde) : remis au seul demandeur, dont la foule s'arrête.
@@ -648,7 +649,7 @@ pub enum BuildMsg {
         seq: u32,
         chunk: [i32; 2],
         up: bool,
-        pos: [f32; 3],
+        pos: [f64; 3],
         dir: [f32; 3],
         seed: u32,
     },
@@ -658,7 +659,7 @@ pub enum BuildMsg {
     Thor {
         chunk: [i32; 2],
         up: bool,
-        pos: [f32; 3],
+        pos: [f64; 3],
         dir: [f32; 3],
         seed: u32,
         by: String,
@@ -677,8 +678,8 @@ pub enum BuildMsg {
         seq: u32,
         chunk: [i32; 2],
         act: u8,
-        pos: [f32; 3],
-        to: [f32; 3],
+        pos: [f64; 3],
+        to: [f64; 3],
         seed: u32,
         expires: u64,
         permit: Vec<u8>,
@@ -689,8 +690,8 @@ pub enum BuildMsg {
     Zeus {
         chunk: [i32; 2],
         act: u8,
-        pos: [f32; 3],
-        to: [f32; 3],
+        pos: [f64; 3],
+        to: [f64; 3],
         seed: u32,
         by: String,
         seq: u32,
@@ -754,25 +755,28 @@ pub fn zeus_sane(m: &BuildMsg) -> bool {
         return false;
     };
     let finite = pos.iter().chain(to.iter()).all(|v| v.is_finite());
+    // (v318) Sur la carte bouclée, en double précision.
     if !finite
         || permit.len() > 128
-        || pos[0].abs() > 3.0e7
-        || pos[2].abs() > 3.0e7
+        || !crate::proto::sane_place(*pos)
         || !(-64.0..=4096.0).contains(&pos[1])
     {
         return false;
     }
-    let at = [
-        (pos[0].floor() as i32).div_euclid(16),
-        (pos[2].floor() as i32).div_euclid(16),
+    let at = crate::proto::chunk_at(pos[0], pos[2]);
+    // (Le petit éclair : l'écart le plus court, même de part et d'autre de la limite.)
+    let d = [
+        crate::proto::place_gap(to[0], pos[0]),
+        to[1] - pos[1],
+        crate::proto::place_gap(to[2], pos[2]),
     ];
-    let d = [to[0] - pos[0], to[1] - pos[1], to[2] - pos[2]];
-    let len2 = to.iter().map(|v| v * v).sum::<f32>();
+    let len2 = to.iter().map(|v| v * v).sum::<f64>();
+    let arc = ZEUS_ARC_MAX as f64;
     at == *chunk
         && match *act {
             ZEUS_STRIKE => true,
             ZEUS_SKY => (0.9..=1.1).contains(&len2) && to[1] > 0.05,
-            ZEUS_ARC => d.iter().map(|v| v * v).sum::<f32>() <= ZEUS_ARC_MAX * ZEUS_ARC_MAX,
+            ZEUS_ARC => d.iter().map(|v| v * v).sum::<f64>() <= arc * arc,
             _ => false,
         }
 }
@@ -791,15 +795,12 @@ pub fn thor_sane(m: &BuildMsg) -> bool {
     else {
         return false;
     };
-    let finite = pos.iter().chain(dir.iter()).all(|v| v.is_finite());
-    if !finite || pos[0].abs() > 3.0e7 || pos[2].abs() > 3.0e7 || !(-64.0..=4096.0).contains(&pos[1])
-    {
+    let finite = pos.iter().all(|v| v.is_finite()) && dir.iter().all(|v| v.is_finite());
+    // (v318) Sur la carte bouclée, en double précision.
+    if !finite || !crate::proto::sane_place(*pos) || !(-64.0..=4096.0).contains(&pos[1]) {
         return false;
     }
-    let at = [
-        (pos[0].floor() as i32).div_euclid(16),
-        (pos[2].floor() as i32).div_euclid(16),
-    ];
+    let at = crate::proto::chunk_at(pos[0], pos[2]);
     let len2 = dir.iter().map(|v| v * v).sum::<f32>();
     at == *chunk && (!*up || ((0.9..=1.1).contains(&len2) && dir[1] > 0.05))
 }

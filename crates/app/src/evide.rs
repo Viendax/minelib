@@ -2360,7 +2360,9 @@ impl Evide {
         let sym = |v: f32| unit(v / (2.0 * WIRE_HEAD) + 0.5);
         net::Mob {
             id: self.id as u16,
-            pos: self.pos.to_array(),
+            // (v318) Comptée depuis l'origine de la partie : `BuildNet::send_evide` la met en
+            // place absolue.
+            pos: self.pos.to_array().map(f64::from),
             yaw: self.yaw,
             tall: self.tall,
             pose: [
@@ -2391,7 +2393,7 @@ impl Evide {
     /// (v312) Le pantin de l'Évidé `m` que mène `owner` : figé, il suit ce que le relais en
     /// publie (`hear`).
     pub fn puppet(owner: &str, m: minelib_net::evide::Mob) -> Self {
-        let mut e = Evide::new(Vec3::from(m.pos), m.yaw, u32::from(m.id) + 1);
+        let mut e = Evide::new(Vec3::from(m.pos.map(|v| v as f32)), m.yaw, u32::from(m.id) + 1);
         e.frozen = true;
         e.lead = Some((owner.to_string(), m.id));
         e.goal = Some(m);
@@ -2417,7 +2419,7 @@ impl Evide {
         let sym = |b: u8| (unit(b) - 0.5) * 2.0 * WIRE_HEAD;
         let turn = crate::player_model::turn_toward;
         if self.dying.is_none() {
-            let to = Vec3::from(m.pos);
+            let to = Vec3::from(m.pos.map(|v| v as f32));
             self.pos = if self.pos.distance(to) > 6.0 { to } else { self.pos.lerp(to, k) };
             self.yaw = turn(self.yaw, m.yaw, k);
             let a = &mut self.anim;

@@ -319,7 +319,8 @@ impl Rules {
         if !(0..HEIGHT).contains(&edit.pos[1]) {
             return Some(format!("hauteur {} hors du monde", edit.pos[1]));
         }
-        if (edit.at[0] - chunk[0]).abs() > VIEW || (edit.at[1] - chunk[1]).abs() > VIEW {
+        // (v318) Sur la carte bouclée (de part et d'autre de sa limite, à portée aussi).
+        if !crate::proto::chunks_within(edit.at, chunk, VIEW) {
             return Some(format!("case {:?} hors de vue de son auteur", edit.pos));
         }
         if edit.t < self.floor_t {

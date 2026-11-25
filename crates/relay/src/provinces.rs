@@ -78,7 +78,7 @@ const UP: ([i32; 2], u64) = ([i32::MIN, i32::MIN], 0);
 const HERE: ([i32; 2], u64) = ([i32::MIN, i32::MIN], 1);
 
 /// Position de retour d'un joueur (pseudo, x, y, z, lacet, tangage).
-type Spot = (String, [f32; 5]);
+type Spot = (String, [f64; 5]);
 
 /// Relais du monde : une province confiée (ou en train de l'être).
 pub(crate) struct ProvinceRef {
@@ -187,7 +187,7 @@ pub(crate) struct ProvinceRoom {
     requests: Vec<Request>,
     /// Positions de retour de ses joueurs, à transmettre au relais du monde (toutes les
     /// `SPOT_MS`), et dernier envoi.
-    spots: HashMap<String, [f32; 5]>,
+    spots: HashMap<String, [f64; 5]>,
     last_spots: u64,
     /// Blocs changés ici par des joueurs en survie dont elle n'a pas le sac : comptés par
     /// le relais du monde (dans le prochain envoi).
@@ -1290,7 +1290,7 @@ pub(crate) fn archive(
     n: u64,
     entries: Vec<([i32; 2], u64, Vec<u8>)>,
     bags: Vec<proto::BagCopy>,
-    spots: Vec<(String, [f32; 5])>,
+    spots: Vec<(String, [f64; 5])>,
     loose: Vec<(String, u16)>,
     dump: u64,
 ) {
@@ -1353,10 +1353,8 @@ pub(crate) fn archive(
     }
     // (Une province ne place un joueur que chez elle.)
     for (who, at) in spots {
-        let chunk = [
-            (at[0].floor() as i32).div_euclid(16),
-            (at[2].floor() as i32).div_euclid(16),
-        ];
+        // (v318) Sur la carte bouclée.
+        let chunk = proto::chunk_at(at[0], at[2]);
         if at.iter().all(|v| v.is_finite()) && near(chunk, p, size) {
             if pays {
                 spot(st, rid, &who, at);
@@ -1604,9 +1602,11 @@ const LOOSE_MAX: usize = 64;
 
 /// Le chunk `c` est-il dans la province `p` ou à moins de deux chunks d'elle ?
 fn near(c: [i32; 2], p: [i32; 2], size: i32) -> bool {
-    [[0, 0], [-2, -2], [-2, 2], [2, -2], [2, 2]]
-        .iter()
-        .any(|d| proto::province_of(proto::region_of([c[0] + d[0], c[1] + d[1]]), size) == p)
+    // (v318) Sur la carte bouclée.
+    [[0, 0], [-2, -2], [-2, 2], [2, -2], [2, 2]].iter().any(|d| {
+        let at = proto::wrap_chunks([c[0] as i64 + d[0], c[1] as i64 + d[1]]);
+        proto::province_of(proto::region_of(at), size) == p
+    })
 }
 
 /// Le joueur `who` (minuscules) est-il dans la province `p` ou tout près, d'après ce
@@ -3149,9 +3149,22 @@ fn present_anywhere(room: &super::Room, who: &str) -> bool {
         })
 }
 
+/// (v318) Les provinces (de `size` régions de côté) qui touchent `p`, elle comprise, sur la
+/// carte bouclée : près de sa limite, celles de l'autre côté (les provinces ne la pavent pas
+/// exactement : celles du bord sont plus étroites).
+fn provinces_around(p: [i32; 2], size: i32) -> Vec<[i32; 2]> {
+    let span = proto::REGION * size.max(1);
+    let axis = |a: i32| -> Vec<i32> {
+        proto::cells_span(a as i64 * span as i64 - 1, (a as i64 + 1) * span as i64, span).collect()
+    };
+    let (xs, zs) = (axis(p[0]), axis(p[1]));
+    xs.iter().flat_map(|&x| zs.iter().map(move |&z| [x, z])).collect()
+}
+
 /// (v145) Relais d'un pays : à chacune de ses provinces servies, ses voisines (elle comprise),
 /// quand elles ont changé.
 fn tell_neighbours(st: &mut State, rid: u64) {
+    let size = size(st);
     let Some(room) = st.rooms.get(&rid) else {
         return;
     };
@@ -3194,9 +3207,10 @@ fn tell_neighbours(st: &mut State, rid: u64) {
         if r.info.is_none() || r.host == 0 {
             continue;
         }
-        let mut list: Vec<ProvinceInfo> = (-1..=1)
-            .flat_map(|dx| (-1..=1).map(move |dz| [p[0] + dx, p[1] + dz]))
-            .filter_map(|q| room.provinces.get(&q).and_then(|x| x.info.clone()))
+        // (v318) Sur la carte bouclée : près de sa limite, celles de l'autre côté.
+        let mut list: Vec<ProvinceInfo> = provinces_around(*p, size)
+            .iter()
+            .filter_map(|q| room.provinces.get(q).and_then(|x| x.info.clone()))
             .collect();
         list.sort_by_key(|i| i.province);
         let said = room
@@ -3445,7 +3459,7 @@ fn send_copy(
     n: u64,
     entries: Vec<super::zones::Entry>,
     bags: Vec<proto::BagCopy>,
-    spots: Vec<(String, [f32; 5])>,
+    spots: Vec<(String, [f64; 5])>,
 ) {
     let Some(pr) = st.rooms.get(&rid).and_then(|r| r.province.as_ref()) else {
         return;
@@ -3526,7 +3540,7 @@ pub(crate) fn follow(
         key: at.2,
     });
     pr.children_said = None;
-    let spots: Vec<(String, [f32; 5])> = pr.spots.iter().map(|(w, a)| (w.clone(), *a)).collect();
+    let spots: Vec<(String, [f64; 5])> = pr.spots.iter().map(|(w, a)| (w.clone(), *a)).collect();
     let (acked, held): (u64, Vec<String>) = (pr.acked, pr.held.iter().cloned().collect());
     let bags: Vec<proto::BagCopy> = held
         .iter()
@@ -3580,7 +3594,7 @@ pub(crate) fn copy(
     entries: Vec<super::zones::Entry>,
     bags: Vec<proto::BagCopy>,
     held: Vec<String>,
-    spots: Vec<(String, [f32; 5])>,
+    spots: Vec<(String, [f64; 5])>,
 ) -> Option<u64> {
     let rid = st.province_room?;
     let room = st.rooms.get_mut(&rid)?;
@@ -4714,7 +4728,7 @@ fn bags_upkeep(st: &mut State, rid: u64) {
 
 /// Relais de province : un joueur redit où il est (gardé pour son retour, transmis au
 /// relais du monde).
-pub(crate) fn spot(st: &mut State, rid: u64, pseudo: &str, at: [f32; 5]) {
+pub(crate) fn spot(st: &mut State, rid: u64, pseudo: &str, at: [f64; 5]) {
     if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
         pr.spots.insert(pseudo.to_ascii_lowercase(), at);
     }

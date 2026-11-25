@@ -42,6 +42,8 @@
 //!                               comparer l'image et le nombre de triangles)
 //!   MINELIB_EN_LIGNE=1          ouvre MINELIB_WORLD en ligne (construction), dès que le
 //!                               compte est connecté (voir MINELIB_TEST_ACCOUNT) (essais)
+//!   MINELIB_REJOINDRE=<texte>   rejoint le premier serveur de construction dont le nom
+//!                               contient ce texte, dès que le compte est connecté (essais)
 //!   MINELIB_CMD=<s>:<commande>[|<s>:<commande>…]  tape ces commandes du tchat, chacune
 //!                               <s> secondes après l'entrée dans le monde (essais)
 //!   MINELIB_DEMO=1              nouveau monde : mur + toutes les torches colorées
@@ -433,6 +435,10 @@ struct Game {
     auto_world: Option<String>,
     /// Essais (`MINELIB_EN_LIGNE=1`) : monde à ouvrir en ligne dès que le compte est connecté.
     auto_online: Option<PathBuf>,
+    /// (v318) Essais (`MINELIB_REJOINDRE`) : serveur de construction à rejoindre (un morceau
+    /// de son nom), et quand sa liste a été demandée.
+    auto_join: Option<String>,
+    auto_join_asked: f32,
     pending_open: Option<(PathBuf, u32)>,
     /// (v309) La partie doit repartir d'une origine plus proche du joueur (`Session::
     /// wants_rebase`) : faite en fin d'image (`rebase_world`).
@@ -563,6 +569,7 @@ impl Game {
             config: SessionConfig {
                 view_distance,
                 far_origin: true,
+                online_build: false,
             },
             ui: Ui::default(),
             sysmon: SysMonitor::start(),
@@ -592,6 +599,10 @@ impl Game {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             auto_online: None,
+            auto_join: std::env::var("MINELIB_REJOINDRE")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            auto_join_asked: -10.0,
             pending_open: None,
             rebase: false,
             clear_meshes: false,
@@ -766,12 +777,13 @@ impl Game {
     }
 
     fn play(&mut self, dir: PathBuf) {
-        self.play_with(dir, true);
+        self.play_with(dir, true, false);
     }
 
-    /// (v309) Ouvre le monde `dir` ; `far_origin` faux : en ligne ou en partie FPS, tout est
-    /// compté depuis le centre du monde (voir `SessionConfig::far_origin`).
-    fn play_with(&mut self, dir: PathBuf, far_origin: bool) {
+    /// (v309) Ouvre le monde `dir` ; `far_origin` faux : en partie FPS, tout est compté depuis
+    /// le centre du monde (voir `SessionConfig::far_origin`). (v318) `online_build` : monde de
+    /// construction en ligne (`SessionConfig::online_build`).
+    fn play_with(&mut self, dir: PathBuf, far_origin: bool, online_build: bool) {
         // Nouveau monde : rien de l'ancien ne doit rester à l'écran.
         self.session = None;
         self.played = true;
@@ -784,6 +796,7 @@ impl Game {
         self.clear_meshes = true;
         let config = SessionConfig {
             far_origin,
+            online_build,
             ..self.config
         };
         match Session::open(dir, config) {
@@ -972,20 +985,22 @@ impl Game {
             return;
         }
         let dir = s.dir.clone();
-        let place = s.abs_of(s.player.pos);
-        let chat = std::mem::take(&mut s.chat);
-        let vel = s.player.vel;
+        let place = s.exact_place();
+        // (v318) Le tchat, la vitesse, et en ligne la connexion au serveur et ce qu'on en
+        // sait : la partie rouverte les reprend (on ne quitte pas le serveur).
+        let carry = s.take_carry();
+        let online = carry.online();
         drop(s);
         log::info!(
-            "loin de l'origine de la partie : rouverte depuis une origine plus proche (joueur en {:.1} / {:.1} / {:.1})",
+            "loin de l'origine de la partie : rouverte depuis une origine plus proche (joueur en {:.1} / {:.1} / {:.1}){}",
             place[0],
             place[1],
-            place[2]
+            place[2],
+            if online { ", sans quitter le serveur" } else { "" }
         );
-        self.play_with(dir, true);
+        self.play_with(dir, true, online);
         if let Some(n) = &mut self.session {
-            n.chat = chat;
-            n.player.vel = vel;
+            n.put_carry(carry);
         }
     }
 
@@ -2235,7 +2250,7 @@ impl Game {
     /// en mode FPS garde le sien dans son fichier.
     fn play_vs_bots(&mut self, dir: PathBuf) {
         self.fps_status = None;
-        self.play_with(dir, false);
+        self.play_with(dir, false, false);
         if let Some(s) = &mut self.session {
             if s.game.mode != save::GameMode::Fps {
                 s.saved_mode = Some(s.game.mode);
@@ -2620,7 +2635,7 @@ impl Game {
             return;
         };
         let map = fpsmap::load(&dir);
-        self.play_with(dir, false);
+        self.play_with(dir, false, false);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Fps;
@@ -2645,7 +2660,7 @@ impl Game {
         let Some(link) = self.accounts.link.clone() else {
             return;
         };
-        self.play_with(dir, false);
+        self.play_with(dir, false, false);
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Fps;
             // Pas de vol en partie en ligne.
@@ -2681,7 +2696,7 @@ impl Game {
             .into_iter()
             .find(|w| w.dir == dir)
             .map_or_else(|| "Monde".into(), |w| w.meta.name);
-        self.play_with(dir, false);
+        self.play_with(dir, true, true);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             if s.game.mode == save::GameMode::Fps {
@@ -2691,6 +2706,8 @@ impl Game {
             let mut b = buildnet::BuildNet::new(link, pseudo.clone(), true);
             b.set_node_dir(self.accounts.relay_dir());
             b.set_identity(self.accounts.identity.clone());
+            // (v318) La partie compte depuis cette origine (loin du centre, proche du joueur).
+            b.set_origin(s.world.origin_blocks());
             s.build = Some(b);
         }
         self.accounts.room(minelib_net::client::Cmd::Host {
@@ -2739,7 +2756,7 @@ impl Game {
                 }
             }
         };
-        self.play_with(dir, false);
+        self.play_with(dir, true, true);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Creative;
@@ -2747,6 +2764,8 @@ impl Game {
             let mut b = buildnet::BuildNet::new(link, pseudo, false);
             b.set_node_dir(self.accounts.relay_dir());
             b.set_identity(self.accounts.identity.clone());
+            // (v318) La partie compte depuis cette origine (loin du centre, proche du joueur).
+            b.set_origin(s.world.origin_blocks());
             s.build = Some(b);
             s.chat
                 .say(format!("Monde de {host} rejoint."), chat::YELLOW);
@@ -4496,6 +4515,40 @@ impl GameLoop for Game {
         if self.auto_online.is_some() && self.accounts.link.is_some() {
             if let Some(dir) = self.auto_online.take() {
                 self.host_build(dir);
+            }
+        }
+        // (v318) Essais : rejoindre un serveur de construction (`MINELIB_REJOINDRE`).
+        if self.session.is_none() && self.accounts.link.is_some() {
+            if let Some(want) = self.auto_join.clone() {
+                let found = self
+                    .accounts
+                    .servers
+                    .iter()
+                    .find(|e| e.name.contains(want.as_str()))
+                    .map(|e| e.id);
+                match found {
+                    Some(room) => {
+                        self.auto_join = None;
+                        log::info!("essai : serveur « {want} » rejoint");
+                        self.accounts.room(minelib_net::client::Cmd::Join(room));
+                    }
+                    None if self.time - self.auto_join_asked > 2.0 => {
+                        self.auto_join_asked = self.time;
+                        // (Un monde ouvert en ligne pour la première fois est sous liste
+                        // blanche : `/whitelist off` dans ce monde pour qu'il paraisse.)
+                        log::info!(
+                            "essai : « {want} » pas encore dans la liste ({} serveur(s) : {:?})",
+                            self.accounts.servers.len(),
+                            self.accounts
+                                .servers
+                                .iter()
+                                .map(|e| e.name.as_str())
+                                .collect::<Vec<_>>(),
+                        );
+                        self.accounts.refresh_servers(1);
+                    }
+                    None => {}
+                }
             }
         }
         if let Some(limit) = self.exit_after {

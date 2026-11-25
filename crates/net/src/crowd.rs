@@ -15,7 +15,8 @@ pub struct NpcState {
     pub id: u16,
     /// Numéro de son pseudo (`Pnj` suivi de ce numéro).
     pub num: u32,
-    pub pos: [f32; 3],
+    /// (v318) Ses pieds, en double précision, sur la carte bouclée.
+    pub pos: [f64; 3],
     pub yaw: f32,
     /// Vitesse au sol (blocs/s, au 1/20).
     pub speed: f32,
@@ -31,14 +32,14 @@ pub struct NpcState {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Packet {
     /// Centre de la foule (le joueur qui la mène) : les positions s'écrivent par rapport à
-    /// lui.
-    pub center: [f32; 3],
+    /// lui. (v318) En double précision, sur la carte bouclée.
+    pub center: [f64; 3],
     /// Nombre de PNJ de la foule (ceux de numéro plus grand n'y sont plus).
     pub count: u16,
     pub npcs: Vec<NpcState>,
     /// Le personnage caché vient d'être trouvé par ce joueur, là (pour prévenir ceux qui
     /// sont près).
-    pub found: Option<(String, [f32; 3])>,
+    pub found: Option<(String, [f64; 3])>,
     /// La foule s'arrête (`/npc stresstest off`, ou celui qui la menait part).
     pub stop: bool,
 }
@@ -47,9 +48,12 @@ const HURT: u8 = 1;
 const HIDDEN: u8 = 2;
 const AIR: u8 = 4;
 
-/// Au 1/32 de bloc par rapport au centre (± 1 024 blocs ; au-delà, ramené au bord).
-fn rel(v: f32, c: f32) -> i16 {
-    ((v - c) * 32.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+/// Au 1/32 de bloc par rapport au centre (± 1 024 blocs ; au-delà, ramené au bord). (v318)
+/// Sur x et z, l'écart le plus court sur la carte bouclée (de part et d'autre de la limite,
+/// un PNJ reste près du centre).
+fn rel(v: f64, c: f64, axis: usize) -> i16 {
+    let d = if axis == 1 { v - c } else { crate::proto::place_gap(v, c) };
+    (d * 32.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
 }
 
 fn angle(a: f32) -> u8 {
@@ -79,9 +83,9 @@ pub fn pack(p: &Packet) -> Vec<u8> {
     for n in &p.npcs {
         out.extend_from_slice(&n.id.to_le_bytes());
         out.extend_from_slice(&n.num.to_le_bytes());
-        out.extend_from_slice(&rel(n.pos[0], p.center[0]).to_le_bytes());
-        out.extend_from_slice(&rel(n.pos[1], p.center[1]).to_le_bytes());
-        out.extend_from_slice(&rel(n.pos[2], p.center[2]).to_le_bytes());
+        for k in 0..3 {
+            out.extend_from_slice(&rel(n.pos[k], p.center[k], k).to_le_bytes());
+        }
         out.push(angle(n.yaw));
         out.push((n.speed * 20.0).round().clamp(0.0, 255.0) as u8);
         let flags = (n.hurt as u8 * HURT) | (n.hidden as u8 * HIDDEN) | (n.push.is_some() as u8 * AIR);
@@ -116,8 +120,8 @@ impl Read<'_> {
     fn u32(&mut self) -> Option<u32> {
         self.take().map(u32::from_le_bytes)
     }
-    fn f32(&mut self) -> Option<f32> {
-        self.take().map(f32::from_le_bytes).filter(|v| v.is_finite())
+    fn f64(&mut self) -> Option<f64> {
+        self.take().map(f64::from_le_bytes).filter(|v| v.is_finite())
     }
 }
 
@@ -127,8 +131,8 @@ pub const MAX_NPCS: usize = 4096;
 /// Le paquet que disent ces octets (`None` : tronqué ou absurde).
 pub fn unpack(data: &[u8]) -> Option<Packet> {
     let mut r = Read(data);
-    let center = [r.f32()?, r.f32()?, r.f32()?];
-    if center.iter().any(|c| c.abs() > 3.0e7) {
+    let center = [r.f64()?, r.f64()?, r.f64()?];
+    if !crate::proto::sane_place(center) {
         return None;
     }
     let count = r.u16()?;
@@ -143,7 +147,7 @@ pub fn unpack(data: &[u8]) -> Option<Packet> {
             let (name, rest) = r.0.split_at(len);
             r.0 = rest;
             let who = String::from_utf8(name.to_vec()).ok()?;
-            Some((who, [r.f32()?, r.f32()?, r.f32()?]))
+            Some((who, [r.f64()?, r.f64()?, r.f64()?]))
         }
     };
     let n = r.u16()? as usize;
@@ -154,10 +158,11 @@ pub fn unpack(data: &[u8]) -> Option<Packet> {
     for _ in 0..n {
         let id = r.u16()?;
         let num = r.u32()?;
+        let wrap = crate::proto::wrap_place;
         let pos = [
-            center[0] + r.i16()? as f32 / 32.0,
-            center[1] + r.i16()? as f32 / 32.0,
-            center[2] + r.i16()? as f32 / 32.0,
+            wrap(center[0] + r.i16()? as f64 / 32.0),
+            center[1] + r.i16()? as f64 / 32.0,
+            wrap(center[2] + r.i16()? as f64 / 32.0),
         ];
         let yaw = r.u8()? as f32 / 256.0 * std::f32::consts::TAU;
         let speed = r.u8()? as f32 / 20.0;
@@ -226,8 +231,9 @@ mod tests {
             stop: false,
         };
         let data = pack(&p);
-        // Une quinzaine d'octets par PNJ.
-        assert!(data.len() < 40 + 2 * 18, "{} octets", data.len());
+        // Une quinzaine d'octets par PNJ ((v318) centre et trouvaille en double précision :
+        // 24 octets de plus par paquet).
+        assert!(data.len() < 64 + 2 * 18, "{} octets", data.len());
         let q = unpack(&data).unwrap();
         assert_eq!(q.center, p.center);
         assert_eq!((q.count, q.stop), (4000, false));
@@ -256,5 +262,37 @@ mod tests {
         long.push(0);
         assert!(unpack(&long).is_none());
         assert!(unpack(&[]).is_none());
+    }
+
+    /// (v318) Une foule au bord de la carte bouclée : ses PNJ de l'autre côté de la limite
+    /// reviennent à leur place (pas ramenés au bord du paquet), en double précision.
+    #[test]
+    fn a_crowd_across_the_edge_of_the_map_comes_back_in_place() {
+        let half = crate::proto::MAP_HALF;
+        let npc = |id: u16, x: f64| NpcState {
+            id,
+            num: id as u32,
+            pos: [x, 70.0, 1_000_000_000.5],
+            yaw: 0.0,
+            speed: 1.0,
+            push: None,
+            hurt: false,
+            hidden: false,
+        };
+        let p = Packet {
+            center: [half - 10.25, 70.0, 1_000_000_000.25],
+            count: 2,
+            npcs: vec![npc(0, half - 30.0), npc(1, -half + 40.5)],
+            found: None,
+            stop: false,
+        };
+        let q = unpack(&pack(&p)).unwrap();
+        assert_eq!(q.center, p.center);
+        assert_eq!(q.npcs[0].pos, [half - 30.0, 70.0, 1_000_000_000.5]);
+        assert_eq!(q.npcs[1].pos, [-half + 40.5, 70.0, 1_000_000_000.5]);
+        // Hors de la carte : absurde.
+        let mut far = p.clone();
+        far.center[0] = crate::proto::MAP_FAR * 2.0;
+        assert!(unpack(&pack(&far)).is_none());
     }
 }

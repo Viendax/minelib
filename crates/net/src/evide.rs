@@ -62,8 +62,8 @@ pub const DYING: u8 = 4;
 pub struct Mob {
     /// Son numéro chez son meneur.
     pub id: u16,
-    /// Ses pieds.
-    pub pos: [f32; 3],
+    /// Ses pieds. (v318) En double précision, sur la carte bouclée.
+    pub pos: [f64; 3],
     /// Son cap (rad, sur un octet).
     pub yaw: f32,
     /// La hauteur de sa boîte (blocs, au 1/50).
@@ -117,11 +117,12 @@ pub fn unpack(data: &[u8]) -> Option<Vec<Mob>> {
     for _ in 0..n {
         let mut take = |k: usize| rest.take(k);
         let id = u16::from_le_bytes(take(2)?.try_into().ok()?);
-        let mut pos = [0f32; 3];
+        let mut pos = [0f64; 3];
         for p in &mut pos {
-            *p = f32::from_le_bytes(take(4)?.try_into().ok()?);
+            *p = f64::from_le_bytes(take(8)?.try_into().ok()?);
         }
-        if pos.iter().any(|v| !v.is_finite() || v.abs() > 4.0e7) {
+        // (v318) Sur la carte bouclée.
+        if !crate::proto::sane_place(pos) {
             return None;
         }
         let yaw = take(1)?[0] as f32 / 256.0 * std::f32::consts::TAU;
@@ -179,14 +180,18 @@ pub fn bite_sane(part: u8, cell: [u8; 3]) -> bool {
     part < 7 && cell.iter().all(|c| *c < 32)
 }
 
-fn flat(a: [f32; 3], b: [f32; 3]) -> f32 {
-    ((a[0] - b[0]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+/// (v318) L'écart à plat, le plus court sur la carte bouclée (de part et d'autre de sa limite,
+/// deux voisins restent voisins).
+fn flat(a: [f64; 3], b: [f64; 3]) -> f32 {
+    let dx = crate::proto::place_gap(a[0], b[0]);
+    let dz = crate::proto::place_gap(a[2], b[2]);
+    (dx * dx + dz * dz).sqrt() as f32
 }
 
 /// Ce que le relais sait d'un monstre.
 #[derive(Clone, Debug)]
 struct Seen {
-    pos: [f32; 3],
+    pos: [f64; 3],
     at: f64,
     health: u8,
     bites: Vec<[u8; 4]>,
@@ -206,7 +211,7 @@ impl Watch {
     /// publier (illisible, ou plus aucun monstre à portée). Dans le paquet rendu : la place de
     /// chaque monstre telle que le relais l'admet, sa vie et ses morceaux mangés tels que le
     /// relais les tient.
-    pub fn states(&mut self, owner: &str, lead: [f32; 3], now: f64, data: &[u8]) -> Option<Vec<u8>> {
+    pub fn states(&mut self, owner: &str, lead: [f64; 3], now: f64, data: &[u8]) -> Option<Vec<u8>> {
         let mut mobs = unpack(data)?;
         let mut held = self.mobs.keys().filter(|k| k.0 == owner).count();
         mobs.retain_mut(|m| {
@@ -220,11 +225,14 @@ impl Watch {
                     let dt = (now - seen.at).clamp(0.0, 2.0) as f32;
                     let (far, reach) = (flat(m.pos, seen.pos), SPEED_MAX * dt + SLACK);
                     if far > reach {
-                        let k = reach / far;
-                        m.pos[0] = seen.pos[0] + (m.pos[0] - seen.pos[0]) * k;
-                        m.pos[2] = seen.pos[2] + (m.pos[2] - seen.pos[2]) * k;
+                        // (v318) Sur la carte bouclée.
+                        let k = (reach / far) as f64;
+                        let gap = crate::proto::place_gap;
+                        let wrap = crate::proto::wrap_place;
+                        m.pos[0] = wrap(seen.pos[0] + gap(m.pos[0], seen.pos[0]) * k);
+                        m.pos[2] = wrap(seen.pos[2] + gap(m.pos[2], seen.pos[2]) * k);
                     }
-                    let high = FALL_MAX * dt + SLACK;
+                    let high = (FALL_MAX * dt + SLACK) as f64;
                     m.pos[1] = m.pos[1].clamp(seen.pos[1] - high, seen.pos[1] + high);
                     seen.pos = m.pos;
                     seen.at = now;
@@ -259,11 +267,12 @@ impl Watch {
     /// Le monstre `id` de `owner` mord un joueur que le relais voit en `victim` : permis ?
     /// (Vivant, pas plus d'une morsure toutes les `BITE_EVERY_S` secondes, la victime à
     /// portée de la place que le relais lui connaît.)
-    pub fn bite(&mut self, owner: &str, id: u16, victim: [f32; 3], now: f64) -> bool {
+    pub fn bite(&mut self, owner: &str, id: u16, victim: [f64; 3], now: f64) -> bool {
         let Some(seen) = self.mobs.get_mut(&(owner.to_string(), id)) else {
             return false;
         };
-        let near = flat(seen.pos, victim) <= BITE_FLAT && (victim[1] - seen.pos[1]).abs() <= BITE_HIGH;
+        let near = flat(seen.pos, victim) <= BITE_FLAT
+            && (victim[1] - seen.pos[1]).abs() <= BITE_HIGH as f64;
         if seen.health == 0 || now - seen.last_bite < BITE_EVERY_S || now - seen.at > 2.0 || !near {
             return false;
         }
@@ -280,12 +289,12 @@ impl Watch {
         id: u16,
         part: u8,
         cell: [u8; 3],
-        eater: [f32; 3],
+        eater: [f64; 3],
         now: f64,
     ) -> Option<u8> {
         let seen = self.mobs.get_mut(&(owner.to_string(), id))?;
         let bite = [part, cell[0], cell[1], cell[2]];
-        let dy = eater[1] - seen.pos[1];
+        let dy = (eater[1] - seen.pos[1]) as f32;
         let near = flat(seen.pos, eater) <= EAT_FLAT && (-EAT_BELOW..=EAT_ABOVE).contains(&dy);
         if seen.health == 0
             || now - seen.at > 2.0
@@ -319,7 +328,7 @@ impl Watch {
 mod tests {
     use super::*;
 
-    fn mob(id: u16, pos: [f32; 3]) -> Mob {
+    fn mob(id: u16, pos: [f64; 3]) -> Mob {
         Mob {
             id,
             pos,
@@ -353,8 +362,11 @@ mod tests {
         long.push(0);
         assert_eq!(unpack(&long), None);
         assert_eq!(unpack(&pack(&[b.clone(), b.clone()])), None);
-        assert_eq!(unpack(&pack(&[mob(1, [f32::NAN, 0.0, 0.0])])), None);
-        assert_eq!(unpack(&pack(&[mob(1, [1.0e9, 0.0, 0.0])])), None);
+        assert_eq!(unpack(&pack(&[mob(1, [f64::NAN, 0.0, 0.0])])), None);
+        // (v318) Hors de la carte bouclée (à un milliard de blocs, on y est encore).
+        assert_eq!(unpack(&pack(&[mob(1, [2.0e9, 0.0, 0.0])])), None);
+        let far = mob(1, [1.0e9 + 0.25, 64.0, -1_073_741_000.5]);
+        assert_eq!(unpack(&pack(std::slice::from_ref(&far))).unwrap()[0].pos, far.pos);
         // Un morceau impossible (pavé 9), une vie de trop, un drapeau inconnu.
         let mut bad = mob(1, [0.0; 3]);
         bad.bites = vec![[9, 0, 0, 0]];
@@ -395,7 +407,11 @@ mod tests {
         assert_eq!(first[0].pos, [5.0, 64.0, 0.0]);
         // 0,05 s plus tard, il serait 30 blocs plus loin : il n'a avancé que d'un bloc.
         let jump = read(w.states("op", lead, 0.05, &pack(&[mob(1, [35.0, 64.0, 0.0])])));
-        assert!((jump[0].pos[0] - (5.0 + SPEED_MAX * 0.05 + SLACK)).abs() < 1e-3, "{:?}", jump[0].pos);
+        assert!(
+            (jump[0].pos[0] - (5.0 + SPEED_MAX as f64 * 0.05 + SLACK as f64)).abs() < 1e-3,
+            "{:?}",
+            jump[0].pos
+        );
         // Une course normale passe telle quelle.
         let run = read(w.states("op", lead, 0.10, &pack(&[mob(1, [jump[0].pos[0] + 0.3, 64.0, 0.2])])));
         assert_eq!(run[0].pos, [jump[0].pos[0] + 0.3, 64.0, 0.2]);
@@ -424,8 +440,8 @@ mod tests {
         // Inconnu ; trop loin ; trop haut.
         assert!(!w.bite("op", 2, [5.0, 64.0, 0.0], 0.1));
         assert!(!w.bite("eve", 1, [5.0, 64.0, 0.0], 0.1));
-        assert!(!w.bite("op", 1, [5.0 + BITE_FLAT + 0.5, 64.0, 0.0], 0.1));
-        assert!(!w.bite("op", 1, [5.0, 64.0 + BITE_HIGH + 0.5, 0.0], 0.1));
+        assert!(!w.bite("op", 1, [5.0 + BITE_FLAT as f64 + 0.5, 64.0, 0.0], 0.1));
+        assert!(!w.bite("op", 1, [5.0, 64.0 + BITE_HIGH as f64 + 0.5, 0.0], 0.1));
         // À portée : permis, puis plus avant 1,4 s.
         assert!(w.bite("op", 1, [6.5, 64.0, 0.5], 0.1));
         assert!(!w.bite("op", 1, [6.5, 64.0, 0.5], 1.0));
@@ -449,8 +465,8 @@ mod tests {
         // Le même morceau ; un pavé impossible ; de trop loin ; un monstre inconnu.
         assert_eq!(w.eat("op", 1, 2, [1, 2, 3], me, 0.2), None);
         assert_eq!(w.eat("op", 1, 7, [0, 0, 0], me, 0.2), None);
-        assert_eq!(w.eat("op", 1, 2, [0, 0, 0], [5.0 + EAT_FLAT + 1.0, 64.0, 0.0], 0.2), None);
-        assert_eq!(w.eat("op", 1, 2, [0, 0, 0], [5.0, 64.0 + EAT_ABOVE + 1.0, 0.0], 0.2), None);
+        assert_eq!(w.eat("op", 1, 2, [0, 0, 0], [5.0 + EAT_FLAT as f64 + 1.0, 64.0, 0.0], 0.2), None);
+        assert_eq!(w.eat("op", 1, 2, [0, 0, 0], [5.0, 64.0 + EAT_ABOVE as f64 + 1.0, 0.0], 0.2), None);
         assert_eq!(w.eat("op", 7, 2, [0, 0, 0], me, 0.2), None);
         // Le meneur l'annonce entier : le relais publie sa vie à lui, et le morceau.
         let out = unpack(&w.states("op", lead, 0.3, &pack(&[mob(1, at)])).unwrap()).unwrap();

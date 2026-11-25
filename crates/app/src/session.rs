@@ -437,9 +437,13 @@ fn zeus_click(selected: Option<Item>, pressed: bool, held: bool) -> bool {
 pub struct SessionConfig {
     pub view_distance: i32,
     /// (v309) Partie solo : loin du centre du monde, elle compte depuis une origine proche du
-    /// joueur (`World::origin`, voir `origin_near`). Faux en ligne et en partie FPS : tout y
-    /// est compté depuis le centre, comme chez les autres joueurs.
+    /// joueur (`World::origin`, voir `origin_near`). Faux en partie FPS : tout y est compté
+    /// depuis le centre, comme chez les autres joueurs. (v318) Vrai aussi en construction en
+    /// ligne : ce qui part au réseau est en places absolues (`BuildNet`).
     pub far_origin: bool,
+    /// (v318) Monde de construction en ligne (le mode de jeu vient du serveur : la copie d'un
+    /// invité dit « fps », ce n'en est pas une partie).
+    pub online_build: bool,
 }
 
 /// (v309) « Aucun problème jusqu'à 16,7 millions » : à moins de tant de blocs du centre du
@@ -525,6 +529,48 @@ struct StopMeas {
     /// le freinage y est plus doux).
     other: bool,
     air: bool,
+}
+
+/// (v318) Ce qu'une partie garde quand elle repart d'une origine plus proche du joueur
+/// (`Session::take_carry`, `Game::rebase_world`).
+pub struct Carry {
+    chat: Chat,
+    vel: Vec3,
+    /// L'origine (blocs) depuis laquelle comptaient les places gardées.
+    from: [i32; 3],
+    online: Option<Box<Online>>,
+}
+
+impl Carry {
+    /// En ligne (construction) : la partie rouverte reprend la connexion au serveur.
+    pub fn online(&self) -> bool {
+        self.online.is_some()
+    }
+}
+
+/// (v318) En construction en ligne : la connexion au serveur et ce qu'on en sait.
+struct Online {
+    build: crate::buildnet::BuildNet,
+    voice: Option<crate::voice::Voice>,
+    skins: crate::skin::Skins,
+    items: crate::drops::Items,
+    items_ready: bool,
+    items_seeded: bool,
+    /// Modifications du joueur pas encore parties (places absolues).
+    journal: Vec<([i32; 3], BlockId, BlockId)>,
+    thor_seq: u32,
+    thor_refused: Option<std::time::Instant>,
+    zeus_online: crate::zeus::Online,
+    zeus_pending: Vec<ZeusPending>,
+    relay_cmds: Vec<minelib_net::client::Cmd>,
+    room_started: Option<bool>,
+    room_paused: Option<bool>,
+    build_match: Option<String>,
+    weather_synced: bool,
+    game: GameState,
+    saved_mode: Option<GameMode>,
+    friends_said: bool,
+    light_op: (bool, Option<std::time::Instant>),
 }
 
 pub struct Session {
@@ -816,6 +862,9 @@ pub struct Session {
     laps_seen: crate::laps::Laps,
     /// (v309) Ceux d'un `/tp` loin de l'origine (avec `teleport_to`), enregistrés tels quels.
     teleport_laps: Option<crate::laps::Laps>,
+    /// (v318) Notre dernier `/tp` en ligne : ses tours, la place sur la carte, quand (ils
+    /// comptent quand le relais nous y place, `BuildSpawn`).
+    tp_laps_online: Option<(crate::laps::Laps, [f64; 3], std::time::Instant)>,
     /// (v220) Monde pas encore chargé (voir `LOAD_MIN_S` et `loading_done`, la seule porte) :
     /// on n'y apparaît pas. Ni touches ni physique (le joueur reste où il arrive), sa position
     /// ne part pas aux autres (construction en ligne) et il ne se présente pas à l'hôte (partie
@@ -999,6 +1048,16 @@ pub fn ram_view_limit() -> i32 {
     r.clamp(2, MAX_VIEW_DISTANCE)
 }
 
+/// (v309) La partie peut-elle compter depuis une origine loin du centre du monde ? Pas en
+/// partie FPS (`far_origin` faux), ni en solo dans une carte FPS (réglages FPS `fps_map`, ou le
+/// mode FPS). (v318) En construction en ligne, toujours, même dans la copie du monde d'un
+/// serveur chez un invité : elle a toujours des réglages FPS et le mode FPS
+/// (`fpsmap::unpack`), mais le mode FPS y est refusé loin du centre (`set_mode`,
+/// `wants_rebase`).
+fn far_allowed_for(cfg: &SessionConfig, mode: GameMode, fps_map: bool) -> bool {
+    cfg.far_origin && (cfg.online_build || (mode != GameMode::Fps && !fps_map))
+}
+
 impl Session {
     /// Ouvre un monde enregistré.
     pub fn open(dir: PathBuf, cfg: SessionConfig) -> Result<Self> {
@@ -1044,9 +1103,7 @@ impl Session {
         // en solo (pas en ligne ni dans une carte FPS : `origin_near`, `World`). Tout ce que
         // la partie compte (joueur, chunks chargés, objets, lumières…) l'est depuis elle ; ce
         // qui est enregistré reste absolu.
-        let far = cfg.far_origin
-            && data.game.mode != GameMode::Fps
-            && !crate::fpsmap::exists(&dir);
+        let far = far_allowed_for(&cfg, data.game.mode, crate::fpsmap::exists(&dir));
         // (v309) Sur la carte bouclée (`laps`) : une place enregistrée ou donnée hors de la
         // carte (`MINELIB_START`, une partie d'avant) y est ramenée, ses tours comptés.
         let mut laps = if far { data.laps } else { [0, 0] };
@@ -1335,6 +1392,7 @@ impl Session {
             lap_base,
             laps_seen: laps,
             teleport_laps: None,
+            tp_laps_online: None,
             loading: Some(Loading::new()),
             items_seeded: false,
             delete_world_asked: false,
@@ -1531,9 +1589,7 @@ impl Session {
             generator: self.world.generator,
             meta: self.meta.clone(),
             player: Some(PlayerState {
-                pos: self
-                    .teleport_to
-                    .unwrap_or_else(|| self.abs_of(self.player.pos)),
+                pos: self.exact_place(),
                 yaw: self.player.yaw,
                 pitch: self.player.pitch,
                 flying: self.player.flying,
@@ -1609,6 +1665,7 @@ impl Session {
             // (Le choix d'une partie, pas un réglage : `Game::play_with` le donne à chaque
             // ouverture.)
             far_origin: true,
+            online_build: false,
         }
     }
 
@@ -1623,6 +1680,12 @@ impl Session {
             v.y as f64,
             wrap(v.z as f64 + o[2] as f64),
         ]
+    }
+
+    /// (v318) Place absolue exacte du joueur : celle d'un `/tp` lointain pas encore fait
+    /// (`teleport_to`, avant que la partie ne change d'origine), sinon la sienne.
+    pub fn exact_place(&self) -> [f64; 3] {
+        self.teleport_to.unwrap_or_else(|| self.abs_of(self.player.pos))
     }
 
     /// (v309) Tours de la carte bouclée du point `v` de la partie : ceux de l'origine, plus
@@ -1683,6 +1746,141 @@ impl Session {
         );
     }
 
+    /// (v318) Ce que la partie garde quand elle repart d'une origine plus proche
+    /// (`Game::rebase_world`) : ce qui ne s'enregistre pas avec le monde. En ligne, la
+    /// connexion au serveur et ce qu'on en sait (relais, joueurs proches, voix, skins, objets
+    /// au sol, foudre demandée…), en places absolues ou décalé jusqu'à la nouvelle origine
+    /// (`put_carry`) : on ne quitte pas le serveur.
+    pub fn take_carry(&mut self) -> Carry {
+        let from = self.world.origin_blocks();
+        let vel = self.player.vel;
+        let online = self.build.take().map(|mut build| {
+            // Ce que la partie n'a pas encore traité ou envoyé repart à `build`, en places
+            // absolues : lumières reçues, demandes d'objets.
+            build.untake_items(std::mem::take(&mut self.light_inbox));
+            for (chunk, req) in std::mem::take(&mut self.items.outbox) {
+                build.send_item(chunk, &req);
+            }
+            // Notre foule d'essai s'arrête (ses PNJ comptaient depuis l'ancienne origine).
+            if self.crowd_out.take().is_some() {
+                let stop = crate::crowd::stop_packet(self.player.pos);
+                build.send_crowd(minelib_net::crowd::pack(&stop));
+            }
+            // Les modifications du joueur pas encore parties (monde en pause), en places
+            // absolues.
+            let journal = self
+                .world
+                .journal
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(p, b, old)| (self.world.abs_block(p), b, old))
+                .collect();
+            Box::new(Online {
+                build,
+                voice: self.voice.take(),
+                skins: std::mem::take(&mut self.skins),
+                items: std::mem::replace(&mut self.items, crate::drops::Items::new(true)),
+                items_ready: self.items_ready,
+                items_seeded: self.items_seeded,
+                journal,
+                thor_seq: self.thor_seq,
+                thor_refused: self.thor_refused,
+                zeus_online: std::mem::take(&mut self.zeus_online),
+                zeus_pending: std::mem::take(&mut self.zeus_pending),
+                relay_cmds: std::mem::take(&mut self.relay_cmds),
+                room_started: self.room_started,
+                room_paused: self.room_paused,
+                build_match: self.build_match.take(),
+                weather_synced: self.weather_synced,
+                game: self.game,
+                saved_mode: self.saved_mode,
+                friends_said: self.friends_said,
+                light_op: (self.light_op_ok, self.light_op_probe),
+            })
+        });
+        Carry {
+            chat: std::mem::take(&mut self.chat),
+            vel,
+            from,
+            online,
+        }
+    }
+
+    /// (v318) La partie rouverte depuis une origine plus proche reprend ce qu'elle gardait
+    /// (`take_carry`) : ses places, décalées de l'ancienne origine à la nouvelle.
+    pub fn put_carry(&mut self, c: Carry) {
+        self.chat = c.chat;
+        self.player.vel = c.vel;
+        let Some(o) = c.online else {
+            return;
+        };
+        let Online {
+            mut build,
+            voice,
+            skins,
+            mut items,
+            items_ready,
+            items_seeded,
+            journal,
+            thor_seq,
+            thor_refused,
+            zeus_online,
+            mut zeus_pending,
+            relay_cmds,
+            room_started,
+            room_paused,
+            build_match,
+            weather_synced,
+            game,
+            saved_mode,
+            friends_said,
+            light_op,
+        } = *o;
+        let to = self.world.origin_blocks();
+        // L'écart le plus court entre les deux origines, sur la carte bouclée.
+        let w = minelib_world::lap::wrap_block;
+        let (dx, dz) = (
+            w(c.from[0] as i64 - to[0] as i64) as i64,
+            w(c.from[2] as i64 - to[2] as i64) as i64,
+        );
+        build.set_origin(to);
+        items.rebase(dx, dz);
+        let v = Vec3::new(dx as f32, 0.0, dz as f32);
+        for p in &mut zeus_pending {
+            p.pos += v;
+            p.to += v;
+        }
+        self.world.journal = Some(
+            journal
+                .into_iter()
+                .map(|(p, b, old)| (self.world.local_block(p), b, old))
+                .collect(),
+        );
+        self.build = Some(build);
+        self.voice = voice;
+        // (Le sien, donné par le jeu à l'ouverture, reste.)
+        let mine = self.skins.mine();
+        self.skins = skins;
+        self.skins.set_mine(mine);
+        self.items = items;
+        self.items_ready = items_ready;
+        self.items_seeded = items_seeded;
+        self.thor_seq = thor_seq;
+        self.thor_refused = thor_refused;
+        self.zeus_online = zeus_online;
+        self.zeus_pending = zeus_pending;
+        self.relay_cmds = relay_cmds;
+        self.room_started = room_started;
+        self.room_paused = room_paused;
+        self.build_match = build_match;
+        self.weather_synced = weather_synced;
+        self.game = game;
+        self.saved_mode = saved_mode;
+        self.friends_said = friends_said;
+        (self.light_op_ok, self.light_op_probe) = light_op;
+    }
+
     /// (v309) La partie doit-elle repartir d'une origine plus proche ? En solo, quand le joueur
     /// s'est éloigné de plus de `REBASE_AT` blocs de l'origine (sur x ou sur z) et qu'une autre
     /// lui conviendrait (`origin_near`). Le jeu enregistre alors la partie et la rouvre
@@ -1691,7 +1889,9 @@ impl Session {
     pub fn wants_rebase(&self) -> bool {
         // (Même pendant un chargement : un `/tp` au loin repart tout de suite de la bonne
         // origine, au lieu de charger d'abord autour d'une place arrondie.)
-        if !self.far_allowed || self.net.is_some() || self.build.is_some() {
+        // (v318) En construction en ligne aussi (sans quitter le serveur : `take_carry`) ; pas en
+        // mode FPS ni dans une partie FPS (leurs places sont celles de la partie partagée).
+        if !self.far_allowed || self.net.is_some() || self.game.mode == GameMode::Fps {
             return false;
         }
         let p = self.player.pos;
@@ -3273,6 +3473,8 @@ impl Session {
         if self.build.is_none() {
             self.party.clear();
         }
+        // (v318) Ses écrans partent à leur place absolue (voir `watch::Party::set_origin`).
+        self.party.set_origin(self.world.origin_blocks());
         self.shown = self.screens.iter().map(|s| (*s, None)).collect();
         self.shown.extend(
             self.party
@@ -3763,7 +3965,8 @@ impl Session {
             .map_or_else(|| "moi".to_string(), |b| b.pseudo().to_string());
         // Réponses et états publiés par le relais.
         if let Some(b) = self.build.as_mut() {
-            for m in std::mem::take(&mut b.item_inbox) {
+            // (v318) Comptés depuis l'origine de la partie (`BuildNet::take_items`).
+            for m in b.take_items() {
                 // (v224) Les lumières de l'éditeur arrivent par le même chemin : pour
                 // `update_light_sync`.
                 if matches!(
@@ -4062,7 +4265,7 @@ impl Session {
             );
         }
         let me = self.player.pos;
-        let hits = std::mem::take(&mut b.crowd_hits);
+        let hits = b.take_crowd_hits();
         if let (Some(c), Some(out)) = (self.crowd.as_mut(), self.crowd_out.as_mut()) {
             for (by, id, from) in hits {
                 let i = id as usize;
@@ -4095,7 +4298,7 @@ impl Session {
                 b.send_crowd(minelib_net::crowd::pack(&p));
             }
         }
-        for (owner, data) in std::mem::take(&mut b.crowd_inbox) {
+        for (owner, data) in b.take_crowds() {
             let Some(p) = minelib_net::crowd::unpack(&data) else {
                 continue;
             };
@@ -4119,7 +4322,7 @@ impl Session {
                         ),
                         chat::YELLOW,
                     );
-                } else if Vec3::from(at).distance(me) <= FOUND_NEAR {
+                } else if Vec3::from(at.map(|v| v as f32)).distance(me) <= FOUND_NEAR {
                     self.chat.say(
                         format!("{by} a trouvé {} !", crate::crowd::HIDDEN_NAME),
                         chat::YELLOW,
@@ -5332,17 +5535,21 @@ impl Session {
     /// ne la retient que de son créateur : il en tire la météo, dont l'orage qui la charge).
     fn zeus_cmd(&mut self, act: u8, charges: u8) {
         self.thor_seq = self.thor_seq.wrapping_add(1);
-        let p = self.player.pos;
+        let chunk = self.net_chunk(self.player.pos);
         self.relay_cmds.push(minelib_net::client::Cmd::Zeus {
             seq: self.thor_seq,
             act,
-            chunk: [
-                (p.x.floor() as i32).div_euclid(16),
-                (p.z.floor() as i32).div_euclid(16),
-            ],
+            chunk,
             seed: self.world.seed,
             charges,
         });
+    }
+
+    /// (v318) Le chunk absolu (sur la carte bouclée) du point `p` de la partie : celui que
+    /// les relais connaissent.
+    fn net_chunk(&self, p: Vec3) -> [i32; 2] {
+        let a = self.abs_of(p);
+        minelib_net::proto::chunk_at(a[0], a[2])
     }
 
     /// (v244) Un coup demandé au relais du monde : `act` (`proto::ZEUS_SKY`, `ZEUS_STRIKE`,
@@ -5352,10 +5559,9 @@ impl Session {
     fn zeus_ask(&mut self, act: u8, pos: Vec3, to: Vec3, npc: Option<NpcTarget>, hit: bool) {
         self.thor_seq = self.thor_seq.wrapping_add(1);
         let seq = self.thor_seq;
-        let chunk = [
-            (pos.x.floor() as i32).div_euclid(16),
-            (pos.z.floor() as i32).div_euclid(16),
-        ];
+        // (v318) Le chunk absolu : le laissez-passer du relais du monde est pour lui, et
+        // l'arbitre le compare à celui du coup (`BuildNet::send_thor`, en place absolue).
+        let chunk = self.net_chunk(pos);
         self.zeus_pending
             .retain(|p| p.at.elapsed().as_secs_f32() < 15.0);
         if self.zeus_pending.len() >= 8 {
@@ -5457,8 +5663,10 @@ impl Session {
                         seq,
                         chunk: p.chunk,
                         act: p.act,
-                        pos: p.pos.to_array(),
-                        to: p.to.to_array(),
+                        // (v318) Comptés depuis l'origine de la partie : `BuildNet::send_thor`
+                        // les met en places absolues.
+                        pos: p.pos.to_array().map(f64::from),
+                        to: p.to.to_array().map(f64::from),
                         seed: p.seed,
                         expires,
                         permit,
@@ -6109,7 +6317,9 @@ impl Session {
                 (pos.z.floor() as i32).div_euclid(16),
             ],
             up,
-            pos: pos.to_array(),
+            // (v318) Comptée depuis l'origine de la partie : `BuildNet::send_thor` la met en
+            // place absolue.
+            pos: pos.to_array().map(f64::from),
             dir: dir.to_array(),
             seed: rand::random::<u32>(),
         };
@@ -6125,11 +6335,13 @@ impl Session {
         let Some(b) = self.build.as_mut() else {
             return;
         };
-        if b.thor_inbox.is_empty() {
+        // (v318) Comptées depuis l'origine de la partie (`BuildNet::take_thor`).
+        let inbox = b.take_thor();
+        if inbox.is_empty() {
             return;
         }
         let me = b.pseudo().to_string();
-        for m in std::mem::take(&mut b.thor_inbox) {
+        for m in inbox {
             match m {
                 BuildMsg::Thor {
                     up,
@@ -6140,7 +6352,7 @@ impl Session {
                     seq,
                     ..
                 } => {
-                    let (pos, dir) = (Vec3::from(pos), Vec3::from(dir));
+                    let (pos, dir) = (Vec3::from(pos.map(|v| v as f32)), Vec3::from(dir));
                     if !pos.is_finite() || !dir.is_finite() {
                         continue;
                     }
@@ -6179,7 +6391,8 @@ impl Session {
                     ..
                 } => {
                     use minelib_net::proto::{ZEUS_ARC, ZEUS_SKY, ZEUS_STRIKE};
-                    let (pos, to) = (Vec3::from(pos), Vec3::from(to));
+                    let f = |a: [f64; 3]| Vec3::from(a.map(|v| v as f32));
+                    let (pos, to) = (f(pos), f(to));
                     if !pos.is_finite() || !to.is_finite() {
                         continue;
                     }
@@ -6563,10 +6776,12 @@ impl Session {
             .light_sync
             .get_or_insert_with(|| crate::lightnet::LightSync::new(b.pseudo(), scene));
         // (Celles que `update_items` a mises de côté d'abord : elles sont arrivées avant.)
-        let (more, rest): (Vec<BuildMsg>, Vec<BuildMsg>) = std::mem::take(&mut b.item_inbox)
+        // (v318) Comptées depuis l'origine de la partie (`BuildNet::take_items`).
+        let (more, rest): (Vec<BuildMsg>, Vec<BuildMsg>) = b
+            .take_items()
             .into_iter()
             .partition(|m| matches!(m, BuildMsg::Light { .. } | BuildMsg::LightDenied { .. }));
-        b.item_inbox = rest;
+        b.untake_items(rest);
         let mut msgs = std::mem::take(&mut self.light_inbox);
         msgs.extend(more);
         let mut heard = crate::lightnet::Heard::default();
@@ -7891,7 +8106,8 @@ impl Session {
                 });
             }
         }
-        for (owner, data) in std::mem::take(&mut b.evide_inbox) {
+        // (v318) Comptés depuis l'origine de la partie (`BuildNet::take_evides`).
+        for (owner, data) in b.take_evides() {
             if let Some(mobs) = minelib_net::evide::unpack(&data) {
                 self.evides.remote(&owner, mobs);
             }
@@ -8082,28 +8298,23 @@ impl Session {
             _ => return self.chat.say(usage, chat::RED),
         };
         if self.build.is_some() {
-            // En ligne : places comptées depuis le centre (le relais vérifie, puis place celui
-            // qui part : `BuildSpawn`).
-            let here = self.player.pos;
+            // En ligne : le relais vérifie, puis place celui qui part (`BuildSpawn`). (v318)
+            // Places absolues lues exactement et ramenées sur la carte bouclée, comme en solo
+            // (`tp_target`) ; les tours d'un `/tp` de soi-même comptent à l'arrivée.
             let to = match (at, other) {
                 (Some(a), _) => {
-                    let mut out = [0.0f32; 3];
-                    for (k, t) in a.iter().enumerate() {
-                        let (rel, rest) = match t.strip_prefix('~') {
-                            Some(r) => (true, r),
-                            None => (false, *t),
-                        };
-                        let Ok(v) = (if rest.is_empty() { Ok(0.0) } else { rest.parse::<f32>() })
-                        else {
-                            return self.chat.say(usage, chat::RED);
-                        };
-                        out[k] = if rel { here[k] + v } else { v };
-                    }
-                    let p = Vec3::from(out);
-                    if !(p.is_finite() && p.y.abs() <= 4096.0) {
-                        return self.chat.say(usage, chat::RED);
-                    }
-                    format!("{} {} {}", p.x, p.y, p.z)
+                    let Some((laps, p)) = self.tp_target(&a) else {
+                        return self.chat.say(
+                            format!(
+                                "{usage}. Coordonnées : des nombres (« 12 », « -3.5 »), {}                                  chiffres au plus avant la virgule ; hauteur entre -4096 et 4096.",
+                                crate::laps::MAX_DIGITS
+                            ),
+                            chat::RED,
+                        );
+                    };
+                    let me = who.is_empty() || who.eq_ignore_ascii_case(&self.pseudo);
+                    self.tp_laps_online = me.then(|| (laps, p, std::time::Instant::now()));
+                    format!("{} {} {}", p[0], p[1], p[2])
                 }
                 (None, Some(o)) => format!("@{o}"),
                 (None, None) => return self.chat.say(usage, chat::RED),
@@ -8136,7 +8347,7 @@ impl Session {
             return;
         };
         let before = self.laps();
-        self.teleport_abs(p);
+        self.teleport_abs(p, None);
         if self.teleport_to.is_some() {
             self.teleport_laps = Some(laps);
             self.laps_seen = laps;
@@ -8189,12 +8400,14 @@ impl Session {
     /// (v309) `/tp` vers la place absolue `a`. Loin de l'origine de la partie (solo), la place
     /// exacte est gardée pour l'enregistrement : la partie repart aussitôt d'une origine proche
     /// d'elle (`wants_rebase`), sans l'arrondi d'un f32 loin de l'origine.
-    fn teleport_abs(&mut self, a: [f64; 3]) {
+    /// (v318) En ligne aussi (arrivée sur un serveur de construction, `/tp` d'un OP) : la
+    /// partie repart d'une origine proche sans quitter le serveur (`Game::rebase_world`).
+    fn teleport_abs(&mut self, a: [f64; 3], look: Option<(f32, f32)>) {
         let local = self.local_of(a);
         self.teleport_to = (self.far_allowed
             && (local.x.abs() > REBASE_AT || local.z.abs() > REBASE_AT))
             .then_some(a);
-        self.teleport(local, None);
+        self.teleport(local, look);
     }
 
     /// (v223) Placé ailleurs (`/tp`, arrivée sur un serveur) : sans vitesse ni chute en cours.
@@ -8217,12 +8430,14 @@ impl Session {
     fn setspawn(&mut self) {
         let p = self.player.pos;
         if self.build.is_some() {
+            // (v318) À sa place absolue (en double précision).
+            let a = self.abs_of(p);
             self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
                 action: minelib_net::proto::SERVER_SETSPAWN,
                 pseudo: String::new(),
                 reason: format!(
                     "{} {} {} {} {}",
-                    p.x, p.y, p.z, self.player.yaw, self.player.pitch
+                    a[0], a[1], a[2], self.player.yaw, self.player.pitch
                 ),
             });
             return;
@@ -8332,7 +8547,35 @@ impl Session {
                 Event::BuildSpawn { pos, yaw, pitch } => {
                     // (À l'arrivée : sa dernière position ici ; (v223) `/tp`.)
                     let look = (yaw.is_finite() && pitch.is_finite()).then_some((*yaw, *pitch));
-                    self.teleport(Vec3::from(*pos), look);
+                    // (v318) Place absolue, en double précision : loin de l'origine de la
+                    // partie, elle en change (sans quitter le serveur).
+                    if pos.iter().all(|v| v.is_finite()) {
+                        let at = [
+                            minelib_net::proto::wrap_place(pos[0]),
+                            pos[1],
+                            minelib_net::proto::wrap_place(pos[2]),
+                        ];
+                        // (v318) Notre `/tp` (récent, vers cette place) : ses tours comptent.
+                        let laps = self.tp_laps_online.take().and_then(|(l, p, t)| {
+                            let close = (minelib_net::proto::place_gap(p[0], at[0]).abs() < 1.0)
+                                && (minelib_net::proto::place_gap(p[2], at[2]).abs() < 1.0);
+                            (close && t.elapsed().as_secs_f32() < 15.0).then_some(l)
+                        });
+                        let before = self.laps();
+                        self.teleport_abs(at, look);
+                        // (Placé par le relais, à l'arrivée ou par un OP : pas un tour de la
+                        // carte, même de l'autre côté de sa limite.)
+                        let target = laps.unwrap_or(before);
+                        if self.teleport_to.is_some() {
+                            self.teleport_laps = Some(target);
+                            self.laps_seen = target;
+                        } else {
+                            self.set_laps(target);
+                        }
+                        if target != before {
+                            self.chat.say(laps_said(target), chat::YELLOW);
+                        }
+                    }
                     return;
                 }
                 Event::BulkDone { id, error } => {
@@ -14895,6 +15138,29 @@ mod loading_tests {
 #[cfg(test)]
 mod far_origin_tests {
     use super::*;
+
+    /// (v318) Qui compte depuis une origine loin du centre du monde : une partie solo (pas une
+    /// carte FPS), un serveur de construction (son hôte, et chacun de ses invités dans sa copie
+    /// du monde, qui a toujours des réglages FPS et le mode FPS : sans quoi un invité téléporté
+    /// loin restait compté depuis le centre, dans les terres lointaines) ; jamais une partie FPS.
+    #[test]
+    fn online_build_guests_count_from_a_far_origin_too() {
+        let cfg = |far_origin, online_build| SessionConfig {
+            view_distance: 4,
+            far_origin,
+            online_build,
+        };
+        // Solo : un monde ordinaire, oui ; une carte FPS, ou le mode FPS, non.
+        assert!(far_allowed_for(&cfg(true, false), GameMode::Creative, false));
+        assert!(!far_allowed_for(&cfg(true, false), GameMode::Creative, true));
+        assert!(!far_allowed_for(&cfg(true, false), GameMode::Fps, false));
+        // Construction en ligne : l'hôte, et l'invité dans sa copie (réglages FPS, mode FPS).
+        assert!(far_allowed_for(&cfg(true, true), GameMode::Creative, false));
+        assert!(far_allowed_for(&cfg(true, true), GameMode::Fps, true));
+        // Partie FPS (en ligne, ou contre des bots) : jamais.
+        assert!(!far_allowed_for(&cfg(false, false), GameMode::Creative, false));
+        assert!(!far_allowed_for(&cfg(false, false), GameMode::Fps, true));
+    }
 
     /// (v309) L'origine des coordonnées d'une partie solo : le centre du monde à moins de
     /// 32 768 blocs (rien ne change pour les mondes d'avant), sinon le multiple de 4 096 blocs

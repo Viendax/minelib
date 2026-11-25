@@ -287,6 +287,39 @@ pub struct Party {
     /// (v293) Pubs des autres sur le Short d'un écran : (le Short, qui (minuscules) → depuis
     /// quand sans nouvelle).
     attentes: HashMap<u32, (String, HashMap<String, f32>)>,
+    /// (v318) Origine de la partie (`World::origin_blocks`) : les écrans d'ici en comptent ;
+    /// ceux qui partent sur le réseau, et leurs numéros, sont à leur place absolue (deux
+    /// joueurs dont les parties comptent depuis des origines différentes parlent des mêmes
+    /// écrans).
+    origin: [i32; 3],
+}
+
+/// (v318) L'écran `s` (compté depuis `origin`) à sa place absolue, sur la carte bouclée : ce
+/// qui part sur le réseau ; son numéro (`Placed::id`) est celui que tous connaissent.
+fn abs_placed(s: &Placed, origin: [i32; 3]) -> Placed {
+    let w = minelib_world::lap::wrap_block;
+    Placed {
+        block: [
+            w(s.block[0] as i64 + origin[0] as i64),
+            s.block[1],
+            w(s.block[2] as i64 + origin[2] as i64),
+        ],
+        ..*s
+    }
+}
+
+/// (v318) L'écran absolu `s` (reçu), compté depuis `origin` : le plus proche d'elle sur la
+/// carte bouclée.
+fn local_placed(s: &Placed, origin: [i32; 3]) -> Placed {
+    let w = minelib_world::lap::wrap_block;
+    Placed {
+        block: [
+            w(s.block[0] as i64 - origin[0] as i64),
+            s.block[1],
+            w(s.block[2] as i64 - origin[2] as i64),
+        ],
+        ..*s
+    }
 }
 
 impl Party {
@@ -302,7 +335,24 @@ impl Party {
             corrections: Vec::new(),
             out: Vec::new(),
             attentes: HashMap::new(),
+            origin: [0; 3],
         }
+    }
+
+    /// (v318) La partie compte depuis `origin` (`World::origin_blocks`).
+    pub fn set_origin(&mut self, origin: [i32; 3]) {
+        self.origin = origin;
+    }
+
+    /// (v318) Le numéro, ici, de l'écran dont le numéro absolu (sur le réseau) est `wire` :
+    /// un des siens (`local`) ou un de ceux des autres.
+    fn local_id(&self, wire: u32, local: &[Placed]) -> Option<u32> {
+        let o = self.origin;
+        local
+            .iter()
+            .chain(self.remote.values().flat_map(|r| r.screens.iter()))
+            .find(|s| abs_placed(s, o).id() == wire)
+            .map(Placed::id)
     }
 
     /// Hors ligne : on oublie tout.
@@ -850,12 +900,16 @@ impl Party {
                 };
                 let mut screens: Vec<Placed> = Vec::new();
                 for s in list.into_iter().take(MAX_PER_MSG) {
-                    let p = Placed {
-                        block: s.block,
-                        normal: s.normal,
-                        facing: s.facing,
-                        size: s.size,
-                    };
+                    // (v318) Reçu à sa place absolue : compté depuis l'origine de la partie.
+                    let p = local_placed(
+                        &Placed {
+                            block: s.block,
+                            normal: s.normal,
+                            facing: s.facing,
+                            size: s.size,
+                        },
+                        self.origin,
+                    );
                     if !valid_place(&p)
                         || (center(&p) - pos).length() > ACCEPT_RANGE
                         || local_ids.contains(&p.id())
@@ -878,16 +932,15 @@ impl Party {
                 );
             }
             Msg::Video { screen, video } => {
-                let known = local_ids.contains(&screen)
-                    || self
-                        .remote
-                        .values()
-                        .any(|r| r.screens.iter().any(|s| s.id() == screen));
-                if known {
+                // (v318) Son numéro absolu : celui de l'écran ici (des siens ou des autres).
+                if let Some(screen) = self.local_id(screen, local) {
                     self.offer(screen, video, from);
                 }
             }
             Msg::Pub { screen, video, on } => {
+                let Some(screen) = self.local_id(screen, local) else {
+                    return true;
+                };
                 // Seulement sur le Short que montre l'écran chez nous.
                 let sur = self
                     .tracks
@@ -1020,16 +1073,17 @@ impl Party {
                     to.push(o.clone());
                 }
             }
+            // (v318) Le numéro absolu de l'écran (celui que tous connaissent).
             let msg = Msg::Video {
-                screen: id,
+                screen: abs_placed(s, self.origin).id(),
                 video: t.at_now(),
             };
             self.send(to, &msg);
         }
         for (who, id) in std::mem::take(&mut self.corrections) {
-            if let Some(t) = self.tracks.get(&id) {
+            if let (Some(t), Some((s, _))) = (self.tracks.get(&id), shown.get(&id)) {
                 let msg = Msg::Video {
-                    screen: id,
+                    screen: abs_placed(s, self.origin).id(),
                     video: t.at_now(),
                 };
                 self.send(vec![who], &msg);
@@ -1069,7 +1123,11 @@ impl Party {
                     if let Some(o) = owner.as_ref().filter(|o| !to.iter().any(|p| p.eq_ignore_ascii_case(o))) {
                         to.push(o.clone());
                     }
-                    let msg = Msg::Pub { screen: id, video: t.video.id.clone(), on: ma_pub };
+                    let msg = Msg::Pub {
+                        screen: abs_placed(s, self.origin).id(),
+                        video: t.video.id.clone(),
+                        on: ma_pub,
+                    };
                     pubs.push((to, msg));
                 }
             }
@@ -1194,8 +1252,9 @@ impl Party {
             let list: Vec<Shared> = ids
                 .iter()
                 .filter_map(|id| local.iter().find(|s| s.id() == *id))
+                // (v318) À sa place absolue.
                 .map(|s| Shared {
-                    block: s.block,
+                    block: abs_placed(s, self.origin).block,
                     normal: s.normal,
                     facing: s.facing,
                     size: s.size,
@@ -1657,6 +1716,8 @@ mod tests {
         local: Vec<Placed>,
         party: Party,
         pages: HashMap<u32, FakePage>,
+        /// (v318) L'origine de sa partie : ses places (`pos`, `local`) en comptent.
+        origin: [i32; 3],
     }
 
     impl Player {
@@ -1667,6 +1728,7 @@ mod tests {
                 local: Vec::new(),
                 party: Party::new(),
                 pages: HashMap::new(),
+                origin: [0; 3],
             }
         }
 
@@ -1682,13 +1744,23 @@ mod tests {
     }
 
     /// Fait tourner les joueurs `secs` secondes (pas de 50 ms), messages remis tout de suite.
+    /// (v318) La place `v` d'une partie qui compte depuis `from`, dans une qui compte depuis
+    /// `to` (sur la carte bouclée).
+    fn moved(v: Vec3, from: [i32; 3], to: [i32; 3]) -> Vec3 {
+        let w = |a: i32, b: i32| minelib_world::lap::wrap_block(a as i64 - b as i64) as f32;
+        Vec3::new(v.x + w(from[0], to[0]), v.y, v.z + w(from[2], to[2]))
+    }
+
     fn run(players: &mut [Player], secs: f32) {
         let dt = 0.05;
         for _ in 0..(secs / dt).round() as usize {
-            let seen: Vec<(String, Vec3)> =
-                players.iter().map(|p| (p.name.to_string(), p.pos)).collect();
+            let seen: Vec<(String, Vec3, [i32; 3])> = players
+                .iter()
+                .map(|p| (p.name.to_string(), p.pos, p.origin))
+                .collect();
             let mut mail = Vec::new();
             for p in players.iter_mut() {
+                p.party.set_origin(p.origin);
                 let ids = p.shown();
                 p.pages.retain(|id, _| ids.contains(id));
                 for id in &ids {
@@ -1699,8 +1771,11 @@ mod tests {
                         p.party.observe(id, &r, p.name);
                     }
                 }
-                let others: Vec<(String, Vec3)> =
-                    seen.iter().filter(|s| s.0 != p.name).cloned().collect();
+                let others: Vec<(String, Vec3)> = seen
+                    .iter()
+                    .filter(|s| s.0 != p.name)
+                    .map(|s| (s.0.clone(), moved(s.1, s.2, p.origin)))
+                    .collect();
                 for a in p.party.update(dt, &p.local, &others) {
                     let (Act::Open(id, _) | Act::Eval(id, _)) = &a;
                     if let Some(page) = p.pages.get_mut(id) {
@@ -1708,13 +1783,14 @@ mod tests {
                     }
                 }
                 for (to, data) in p.party.take_out() {
-                    mail.push((p.name, p.pos, to, data));
+                    mail.push((p.name, p.pos, p.origin, to, data));
                 }
             }
-            for (from, pos, to, data) in mail {
+            for (from, pos, origin, to, data) in mail {
                 for q in players.iter_mut() {
                     if to.iter().any(|n| n.eq_ignore_ascii_case(q.name)) {
                         let local = q.local.clone();
+                        let pos = moved(pos, origin, q.origin);
                         assert!(q.party.receive(from, &data, Some(pos), &local));
                     }
                 }
@@ -2109,6 +2185,50 @@ mod tests {
 
     fn close(a: f32, b: f32, tol: f32) -> bool {
         (a - b).abs() <= tol
+    }
+
+    /// (v318) Deux joueurs dont les parties comptent depuis des origines différentes (loin du
+    /// centre du monde, et de part et d'autre de la limite de la carte bouclée) regardent
+    /// ensemble : l'écran de l'un est chez l'autre à sa place, et la vidéo suit.
+    #[test]
+    fn des_parties_comptees_de_loin_regardent_ensemble() {
+        let half = minelib_world::lap::HALF as i32;
+        for (oa, ob, at, bob) in [
+            ([0, 0, 0], [4096, 0, 0], 0, Vec3::new(-4093.0, 65.0, 8.0)),
+            (
+                [half - 4096, 0, 0],
+                [-half + 4096, 0, 0],
+                4090,
+                Vec3::new(-4094.0, 65.0, 8.0),
+            ),
+        ] {
+            let s = screen_at(at);
+            let mut ps = vec![
+                Player::new(A, Vec3::new(at as f32, 65.0, 6.0)),
+                Player::new(B, bob),
+            ];
+            ps[0].origin = oa;
+            ps[1].origin = ob;
+            ps[0].local.push(s);
+            ps[0].party.screens_changed();
+            run(&mut ps, 1.0);
+            // Chez Bob, l'écran d'Alice est à sa place (comptée depuis l'origine de Bob).
+            let theirs = ps[1].party.screens(&[]);
+            assert_eq!(theirs.len(), 1, "{theirs:?}");
+            let seen = theirs[0].0;
+            let want = moved(Vec3::new(at as f32, 64.0, 0.0), oa, ob);
+            assert_eq!(seen.block, [want.x as i32, 64, 0]);
+            assert!((want.x - bob.x).abs() < 16.0, "près de Bob");
+            // Alice ouvre une vidéo : Bob l'ouvre aussi, sur son écran à lui (son numéro ici).
+            let (ida, idb) = (s.id(), seen.id());
+            ps[0].page(ida).act(&Act::Open(ida, watch_url(X, 0.0)));
+            run(&mut ps, 6.0);
+            assert_eq!(ps[1].page(idb).video().as_deref(), Some(X));
+            // Bob met en pause : Alice aussi.
+            ps[1].page(idb).paused = true;
+            run(&mut ps, 2.0);
+            assert!(ps[0].page(ida).paused, "pause de Bob pas suivie");
+        }
     }
 
     #[test]
