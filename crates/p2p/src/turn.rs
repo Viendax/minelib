@@ -2043,6 +2043,16 @@ mod tests {
             phase("256/s gros", 3, 512, Duration::from_micros(3906), 600);
             phase("512/s", 4, 512, Duration::from_micros(1953), 60);
             phase("rafale", 5, 100, Duration::ZERO, 60);
+            // (v336) Ce qu'envoie l'hôte d'une partie à 10 dont les 9 joueurs passent par
+            // TURN, à 128 mises à jour par seconde : ~1 150 paquets par seconde de 230 à
+            // 410 octets (~320 Ko/s), par sa seule allocation ; ici 2 s, dans chaque sens.
+            phase(
+                "hôte de 10 (320 Ko/s)",
+                7,
+                2300,
+                Duration::from_micros(870),
+                280,
+            );
             // Deux messages collés dans un même envoi (TCP seulement).
             if tcp.0 {
                 let ch = a.st.lock().unwrap().peers[&rb].channel;

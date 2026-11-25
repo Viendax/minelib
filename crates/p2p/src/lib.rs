@@ -1634,19 +1634,28 @@ mod tests {
     /// 4 au plus : ces serveurs sont partagés par tout le monde, on ne les charge pas pour
     /// voir quand ils cèdent), chacun avec son propre nœud ; l'hôte, lui, n'a qu'une
     /// connexion à son serveur.
+    /// (v336) `MINELIB_ESSAI_PAR_S` (16 à 512, 256 sans la variable) et
+    /// `MINELIB_ESSAI_OCTETS` (5 à 1200, 5 sans la variable) : la cadence et la taille des
+    /// messages, pour faire passer ce qu'envoie l'hôte d'une partie FPS (128 par seconde de
+    /// 260 octets en moyenne, en-têtes compris).
     #[test]
     #[ignore = "réseau"]
     fn on_the_real_network_256_messages_a_second_through_iroh_servers() {
         use std::io::{Read, Write};
-        let players: usize = std::env::var("MINELIB_ESSAI_JOUEURS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1)
-            .clamp(1, 4);
+        let env = |k: &str, d: usize, lo: usize, hi: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+                .clamp(lo, hi)
+        };
+        let players = env("MINELIB_ESSAI_JOUEURS", 1, 1, 4);
+        let rate = env("MINELIB_ESSAI_PAR_S", 256, 16, 512) as u32;
+        let size = env("MINELIB_ESSAI_OCTETS", 5, 5, 1200);
         let host = Node::start_private().unwrap();
         host.serve(echo());
         std::thread::sleep(Duration::from_secs(4));
-        const N: u32 = 256 * 20;
+        let n_msgs: u32 = rate * 20;
         let remote = host.id();
         let runs: Vec<_> = (0..players)
             .map(|_| {
@@ -1667,24 +1676,24 @@ mod tests {
                     let started = std::time::Instant::now();
                     let reader = std::thread::spawn(move || {
                         // Chaque message porte son numéro : son temps d'aller-retour.
-                        let mut times = Vec::with_capacity(N as usize);
-                        let mut b = [0u8; 5];
-                        for _ in 0..N {
+                        let mut times = Vec::with_capacity(n_msgs as usize);
+                        let mut b = vec![0u8; size];
+                        for _ in 0..n_msgs {
                             if back.read_exact(&mut b).is_err() {
                                 break;
                             }
                             let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                            let sent = Duration::from_secs_f64(f64::from(n) / 256.0);
+                            let sent = Duration::from_secs_f64(f64::from(n) / f64::from(rate));
                             times.push(started.elapsed().saturating_sub(sent));
                         }
                         times
                     });
-                    for n in 0..N {
-                        let due = Duration::from_secs_f64(f64::from(n) / 256.0);
+                    for n in 0..n_msgs {
+                        let due = Duration::from_secs_f64(f64::from(n) / f64::from(rate));
                         if let Some(wait) = due.checked_sub(started.elapsed()) {
                             std::thread::sleep(wait);
                         }
-                        let mut m = [0u8; 5];
+                        let mut m = vec![0u8; size];
                         m[..4].copy_from_slice(&n.to_le_bytes());
                         if c.write_all(&m).is_err() {
                             break;
@@ -1707,17 +1716,21 @@ mod tests {
         times.sort();
         let at = |q: f64| times.get(((got as f64 - 1.0) * q) as usize).copied().unwrap_or_default();
         eprintln!(
-            "RESEAU 256 : {players} joueur(s), {} messages envoyés, {got} revenus, en {longest:?} \
-             au plus ; aller-retour médian {:?}, 95 % sous {:?}, pire {:?}",
-            N as usize * players,
+            "RESEAU {rate}/s de {size} o : {players} joueur(s), {} messages envoyés, {got} revenus, \
+             en {longest:?} au plus ; aller-retour médian {:?}, 95 % sous {:?}, pire {:?}",
+            n_msgs as usize * players,
             at(0.5),
             at(0.95),
             at(1.0)
         );
         let (relay, paths) = paths_of(remote, 0);
-        eprintln!("RESEAU 256 : chemins {paths:?}");
+        eprintln!("RESEAU : chemins {paths:?}");
         assert_eq!(relay, Some(true));
-        assert_eq!(got, N as usize * players, "des messages ne sont pas revenus");
+        assert_eq!(
+            got,
+            n_msgs as usize * players,
+            "des messages ne sont pas revenus"
+        );
     }
 
     /// Deux nœuds iroh sur cette machine : un relais TCP local joint par le tunnel.

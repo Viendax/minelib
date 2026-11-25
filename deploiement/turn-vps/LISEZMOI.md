@@ -2,9 +2,9 @@
 
 (v334) Le service TURN gratuit (ExpressTURN) donne 1 000 Go par mois. Quand ils sont
 épuisés, ou si le service tombe, les joueurs sans passeur repassent par les serveurs relais
-d'iroh : 45 Ko/s mesurés, trop peu pour qu'un hôte tienne 128 mises à jour par seconde
-pour ses joueurs. Un serveur TURN sur une machine à soi qui a du débit (un VPS au trafic
-illimité, par exemple) prend alors la suite, tout seul :
+d'iroh : environ 120 Ko/s par connexion (mesuré en v336), de quoi tenir 128 mises à jour par
+seconde pour 2 ou 3 joueurs, pas pour 9. Un serveur TURN sur une machine à soi qui a du débit
+(un VPS au trafic illimité, par exemple) prend alors la suite, tout seul :
 
 - le Worker (`deploiement/cloudflare-turn`) donne aux jeux tous les services configurés,
   dans l'ordre : ExpressTURN, puis ce serveur ;

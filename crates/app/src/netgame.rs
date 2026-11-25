@@ -73,6 +73,15 @@ const LOW_RATE_FOR: f32 = 60.0;
 /// `LOW_RATE_HOLD_MAX`).
 const STARVED_PERCENT: u32 = 55;
 const LOW_RATE_HOLD_MAX: f32 = 600.0;
+/// (v336) Paliers sous 64 : 32 puis 16 mises à jour par seconde (une tous les 8 ou 16 pas,
+/// états complets à 8 puis 4 par seconde). Pour le pire chemin : sans TURN ni passeur, tout
+/// ce que l'hôte envoie passe par sa seule connexion aux serveurs relais d'iroh (environ
+/// 120 Ko/s mesurés ; 3 joueurs à 128 par seconde la saturent) ; 9 joueurs à 64 par seconde
+/// en demandent environ 150. Sans ces
+/// paliers, le retard s'accumulait sans fin ; avec, la partie ralentit mais reste à jour. On
+/// en remonte plus vite (`DEEP_HOLD_DIV` fois moins d'attente) : l'essai coûte peu.
+const MAX_EVERY: u8 = 16;
+const DEEP_HOLD_DIV: f32 = 3.0;
 /// (v334) Par TURN, l'hôte envoie au plus 128 mises à jour par seconde (une tous les deux
 /// pas) et l'invité 128 paquets d'entrées : chaque octet par TURN passe deux fois par le
 /// serveur et compte dans son quota du mois ; 128 suffisent.
@@ -1666,9 +1675,15 @@ pub struct Guest {
 /// voie rapide reprend (`fresh`) ; un de moins après `LOW_RATE_STRIKES` secondes de suite
 /// où le lien ne suit pas ; un de plus après `hold` secondes au même palier sans souci.
 fn next_every(every: u8, at: f32, hold: f32, strikes: u8, fresh: bool, trouble: bool) -> u8 {
+    // (v336) Sous 64 par seconde, on réessaie plus tôt.
+    let hold = if every > 4 {
+        hold / DEEP_HOLD_DIV
+    } else {
+        hold
+    };
     if fresh {
         1
-    } else if strikes >= LOW_RATE_STRIKES && every < 4 {
+    } else if strikes >= LOW_RATE_STRIKES && every < MAX_EVERY {
         every * 2
     } else if every > 1 && at >= hold && !trouble {
         every / 2
@@ -1686,8 +1701,8 @@ struct RateWindow {
     first: Option<u32>,
     last: u32,
     pairs: u32,
-    one: u32,
-    two: u32,
+    /// Écarts de 1, 2, 4, 8 et 16 pas.
+    steps: [u32; 5],
 }
 
 impl RateWindow {
@@ -1695,8 +1710,9 @@ impl RateWindow {
         if self.first.is_some() {
             let d = tick.wrapping_sub(self.last);
             self.pairs += 1;
-            self.one += u32::from(d == 1);
-            self.two += u32::from(d == 2);
+            if let Some(k) = [1, 2, 4, 8, 16].iter().position(|s| *s == d) {
+                self.steps[k] += 1;
+            }
         } else {
             self.first = Some(tick);
         }
@@ -1705,20 +1721,23 @@ impl RateWindow {
     }
 
     /// (Reçues, envoyées selon l'écart ordinaire) pour la seconde écoulée, et on repart à
-    /// zéro. Rien si trop peu est arrivé pour juger.
+    /// zéro. Rien si trop peu est arrivé pour juger. L'écart ordinaire : le plus petit
+    /// (1, 2, 4, 8, 16) qui, avec les plus petits, fait au moins un écart sur dix.
     fn take(&mut self) -> Option<(u32, u32)> {
         let w = std::mem::take(self);
         let first = w.first?;
         if w.pairs < 8 {
             return None;
         }
-        let step = if w.one * 10 >= w.pairs {
-            1
-        } else if (w.one + w.two) * 10 >= w.pairs {
-            2
-        } else {
-            4
-        };
+        let mut seen = 0;
+        let mut step = 16;
+        for (k, n) in w.steps.iter().enumerate() {
+            seen += n;
+            if seen * 10 >= w.pairs {
+                step = 1 << k;
+                break;
+            }
+        }
         let sent = w.last.wrapping_sub(first) / step + 1;
         Some((w.got, sent.max(w.got)))
     }
@@ -4384,7 +4403,8 @@ impl Host {
             // (v333) Son lien ne suit pas (ou de nouveau) : une mise à jour de positions
             // tous les `every` pas (1, 2 ou 4 : les états complets seuls).
             ToHost::Rate { every } => {
-                if matches!(every, 2 | 4) {
+                // (v336) 2, 4, 8 ou 16 ; autre chose : tout.
+                if matches!(every, 2 | 4 | 8 | 16) {
                     self.low_rate.insert(peer, every);
                 } else {
                     self.low_rate.remove(&peer);
@@ -7264,20 +7284,38 @@ mod tests {
             gs.watch_rate();
         }
         assert_eq!(gs.rate.0, 4, "64 par seconde");
+        // (v336) Puis 32 et 16 (le pire chemin), jamais moins.
+        for _ in 0..2 {
+            gs.watch_rate();
+        }
+        assert_eq!(gs.rate.0, 8, "32 par seconde");
+        for _ in 0..2 {
+            gs.watch_rate();
+        }
+        assert_eq!(gs.rate.0, 16, "16 par seconde");
         for _ in 0..3 {
             gs.watch_rate();
         }
-        assert_eq!(gs.rate.0, 4, "jamais moins");
-        assert_eq!(said(&rx), vec![2, 4]);
-        // Le lien suit de nouveau : un palier par minute.
+        assert_eq!(gs.rate.0, 16, "jamais moins");
+        assert_eq!(said(&rx), vec![2, 4, 8, 16]);
+        // Le lien suit de nouveau : un palier par minute (par 20 secondes sous 64).
         gs.ping = Some(60.0);
+        gs.rate.1 = LOW_RATE_FOR / DEEP_HOLD_DIV;
+        gs.watch_rate();
+        assert_eq!(gs.rate.0, 8);
+        gs.rate.1 = LOW_RATE_FOR / DEEP_HOLD_DIV;
+        gs.watch_rate();
+        assert_eq!(gs.rate.0, 4);
+        gs.rate.1 = LOW_RATE_FOR / DEEP_HOLD_DIV;
+        gs.watch_rate();
+        assert_eq!(gs.rate.0, 4, "à 64, une minute");
         gs.rate.1 = LOW_RATE_FOR;
         gs.watch_rate();
         assert_eq!(gs.rate.0, 2);
         gs.rate.1 = LOW_RATE_FOR;
         gs.watch_rate();
         assert_eq!(gs.rate.0, 1);
-        assert_eq!(said(&rx), vec![2, 1]);
+        assert_eq!(said(&rx), vec![8, 4, 2, 1]);
         // Chez l'hôte.
         let (htx, _hrx) = std::sync::mpsc::channel();
         let mut h = NetGame::host(htx, "Hote".into(), FpsMap::default(), [0; 32], Vec3::ZERO);
@@ -7286,8 +7324,12 @@ mod tests {
         let rate = |every: u8| game::encode(&ToHost::Rate { every });
         h.receive(Some(9), &rate(4), &mut world);
         assert_eq!(host(&mut h).low_rate.get(&9), Some(&4));
+        h.receive(Some(9), &rate(16), &mut world);
+        assert_eq!(host(&mut h).low_rate.get(&9), Some(&16));
         h.receive(Some(9), &rate(1), &mut world);
         assert!(host(&mut h).low_rate.is_empty());
+        h.receive(Some(9), &rate(3), &mut world);
+        assert!(host(&mut h).low_rate.is_empty(), "palier inconnu : tout");
     }
 
     /// (v334) Ce que l'invité compte en une seconde : 256 pas tous là, un sur deux (l'hôte
@@ -7325,6 +7367,18 @@ mod tests {
         }
         let (got, sent) = w.take().unwrap();
         assert!(got * 100 >= sent * STARVED_PERCENT, "{got} sur {sent}");
+        // (v336) Une tous les 16 pas (16 par seconde), et une sur trois perdue à 32.
+        for t in (6000..6256).step_by(16) {
+            w.note(t);
+        }
+        assert_eq!(w.take(), Some((16, 16)));
+        for (i, t) in (7000..7256).step_by(8).enumerate() {
+            if i % 3 != 1 {
+                w.note(t);
+            }
+        }
+        // (La dernière est perdue : la fenêtre s'arrête à celle d'avant.)
+        assert_eq!(w.take(), Some((21, 31)), "une tous les 8 pas");
         w.note(5000);
         w.note(5001);
         assert_eq!(w.take(), None, "trop peu pour juger");
@@ -7342,11 +7396,16 @@ mod tests {
         );
         assert_eq!(next_every(1, 5.0, 60.0, 2, false, true), 2);
         assert_eq!(next_every(2, 5.0, 60.0, 2, false, true), 4);
+        assert_eq!(next_every(4, 5.0, 60.0, 2, false, true), 8);
+        assert_eq!(next_every(8, 5.0, 60.0, 2, false, true), 16);
         assert_eq!(
-            next_every(4, 5.0, 60.0, 9, false, true),
-            4,
-            "jamais moins de 64"
+            next_every(16, 5.0, 60.0, 9, false, true),
+            16,
+            "jamais moins de 16"
         );
+        // (v336) Sous 64, on réessaie trois fois plus tôt.
+        assert_eq!(next_every(16, 20.0, 60.0, 0, false, false), 8);
+        assert_eq!(next_every(4, 20.0, 60.0, 0, false, false), 4);
         assert_eq!(next_every(2, 59.0, 60.0, 0, false, false), 2);
         assert_eq!(next_every(2, 60.0, 60.0, 0, false, false), 1);
         assert_eq!(
