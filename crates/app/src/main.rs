@@ -171,6 +171,8 @@ enum Screen {
     Sound,
     /// (v307) Paramètres → Paramètres avancés : journal réseau (partage, réception).
     Advanced,
+    /// (v311) `/deleteworld` : le créateur confirme la suppression de son monde.
+    DeleteWorld,
     /// Conversion d'un monde Minecraft en cours (une image affichée avant de bloquer).
     Loading,
     Playing,
@@ -297,6 +299,10 @@ struct Game {
     /// Recherche dans la liste des serveurs, et dans celle des mondes solo.
     server_search: multiplayer::ListSearch,
     world_search: multiplayer::ListSearch,
+    /// (v311) Suppression du monde : le code de double authentification en cours de
+    /// frappe, et s'il en faut un (le relais l'a dit).
+    delete_code: String,
+    delete_code_needed: bool,
     /// Garant indépendant (au menu : sert ou vérifie la partie d'autres joueurs).
     garant: Option<garant::Garant>,
     /// Garant pendant qu'on joue sa propre partie FPS (deuxième connexion, son propre fil),
@@ -506,6 +512,8 @@ impl Game {
             was_playing: false,
             server_search: Default::default(),
             world_search: Default::default(),
+            delete_code: String::new(),
+            delete_code_needed: false,
             garant: None,
             garant_worker: None,
             garant_worker_tried: false,
@@ -1659,6 +1667,15 @@ impl Game {
                     }
                     self.notify(reason);
                 }
+                // (v311) Suppression du monde : le compte a la double authentification,
+                // le relais veut un code (ou celui donné était faux).
+                Event::DeleteWorldCode => {
+                    if self.session.as_ref().is_some_and(|s| s.build.is_some()) {
+                        self.delete_code.clear();
+                        self.delete_code_needed = true;
+                        self.screen = Screen::DeleteWorld;
+                    }
+                }
                 Event::BanDone(p) => {
                     if let Some(s) = &mut self.session {
                         s.chat.say(
@@ -2788,6 +2805,10 @@ impl Game {
                 max_players: e.max_players,
                 ping: 0,
                 region: e.region.clone(),
+                peak: e.peak,
+                active: e.active,
+                asleep: e.asleep,
+                keeper: e.keeper.clone(),
             })
             .collect();
         let time = self.time;
@@ -2804,7 +2825,7 @@ impl Game {
         match action {
             multiplayer::Action::Refresh => self.accounts.refresh_servers(kind as u8),
             multiplayer::Action::Join(i) => {
-                if let Some(e) = self.accounts.servers.get(i).cloned() {
+                if let Some(e) = self.accounts.servers.get(i).cloned().filter(|e| !e.asleep) {
                     if e.elsewhere() {
                         self.accounts.join_elsewhere(&e);
                     } else {
@@ -3346,6 +3367,64 @@ impl Game {
                 log::error!("options : {e:#}");
             }
             self.screen = self.settings_return;
+        }
+    }
+
+    /// (v311) `/deleteworld` : le créateur d'un monde en ligne confirme d'un clic qu'il le
+    /// supprime ; si son compte a la double authentification, le relais demande un code,
+    /// tapé ici. Le relais vérifie que c'est bien le créateur.
+    fn delete_world_screen(&mut self, input: &Input, size: (u32, u32)) {
+        let time = self.time;
+        if self.delete_code_needed {
+            menu::edit_text(&mut self.delete_code, input, 6);
+            self.delete_code.retain(|c| c.is_ascii_digit());
+        }
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        c.dim(0.7);
+        let s = c.s;
+        let ds = (s / 2.0).floor().max(1.0);
+        c.text_center("Supprimer ce monde ?", c.h * 0.2, s * 2.0, WHITE);
+        let cx = c.w / 2.0;
+        let mut y = c.h * 0.32;
+        for line in [
+            "Tous ses joueurs en sortent, et le relais oublie ses OP, ses bannis, sa liste blanche",
+            "et les positions de ses joueurs. C'est définitif. Les copies du monde enregistrées",
+            "sur les PC (la tienne aussi) ne sont pas touchées.",
+        ] {
+            c.text_center(line, y, ds, GREY);
+            y += 7.0 * ds;
+        }
+        y += 22.0 * s;
+        if self.delete_code_needed {
+            c.text_field(
+                "Code de double authentification",
+                &self.delete_code,
+                "6 chiffres",
+                cx,
+                y,
+                120.0,
+                true,
+                time,
+            );
+            y += 30.0 * s;
+        }
+        let ready = !self.delete_code_needed || self.delete_code.len() == 6;
+        let confirm = c.button("Supprimer définitivement", cx, y, 200.0, ready);
+        y += 24.0 * s;
+        let cancel = c.button("Annuler", cx, y, 200.0, true);
+        if confirm {
+            let code = self
+                .delete_code
+                .parse::<u32>()
+                .ok()
+                .filter(|_| self.delete_code_needed);
+            self.accounts
+                .room(minelib_net::client::Cmd::DeleteWorld(code));
+            self.delete_code.clear();
+            self.screen = Screen::Playing;
+        } else if cancel || input.pressed(KeyCode::Escape) {
+            self.delete_code.clear();
+            self.screen = Screen::Playing;
         }
     }
 
@@ -4680,6 +4759,7 @@ impl GameLoop for Game {
                     | Screen::Controls
                     | Screen::Sound
                     | Screen::Advanced
+                    | Screen::DeleteWorld
             );
         if in_world {
             let active = self.screen == Screen::Playing;
@@ -4713,7 +4793,18 @@ impl GameLoop for Game {
             if let Some((part, shaders)) = loading {
                 world_loading_screen(&mut self.ui, input, size, part, shaders);
             }
+            // (v311) `/deleteworld` vient d'être tapé : l'écran de confirmation.
+            if self
+                .session
+                .as_mut()
+                .is_some_and(|s| std::mem::take(&mut s.delete_world_asked))
+            {
+                self.delete_code.clear();
+                self.delete_code_needed = false;
+                self.screen = Screen::DeleteWorld;
+            }
             match self.screen {
+                Screen::DeleteWorld => self.delete_world_screen(input, size),
                 Screen::Paused => self.pause_menu(input, size),
                 Screen::Packs => self.packs_screen(input, size, true),
                 Screen::Settings => self.settings_screen(input, size, true),
@@ -4765,6 +4856,8 @@ impl GameLoop for Game {
                 Screen::Controls => self.controls_screen(input, size, false),
                 Screen::Sound => self.sound_screen(input, size, false),
                 Screen::Advanced => self.advanced_screen(input, size, false),
+                // (Seulement dans un monde : hors d'un monde, retour à l'accueil.)
+                Screen::DeleteWorld => self.screen = Screen::Title,
                 Screen::Loading => self.loading_screen(input, size),
                 Screen::Multiplayer => self.multiplayer_screen(input, size),
                 Screen::Servers(kind) => self.servers_screen(input, size, kind),

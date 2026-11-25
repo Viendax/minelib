@@ -15,6 +15,7 @@ mod invites;
 mod journaux;
 mod limits;
 mod maps;
+mod mondes;
 mod passeurs;
 mod provinces;
 mod registry;
@@ -1422,6 +1423,8 @@ struct State {
     maps: maps::Store,
     hardware: hardware::Store,
     servers: servers::Store,
+    /// (v311) Mondes de construction connus de ce relais, ouverts ou endormis (`mondes`).
+    worlds: mondes::Store,
     /// Inventaires des joueurs en survie (voir `bags`).
     bags: bags::Store,
     /// Clé du relais (la même que pour le registre) : certifie les clés des comptes et
@@ -1575,6 +1578,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         maps,
         hardware: hardware::Store::open(cfg_dir.join("hardware.bin")),
         servers: servers::Store::open(cfg_dir.join("serveurs.bin")),
+        worlds: mondes::Store::open(cfg_dir.join("mondes.bin")),
         bags: bags::Store::open(cfg_dir.join("sacs.bin")),
         cert_key,
         root_t: 0,
@@ -2178,6 +2182,11 @@ fn leave_room(st: &mut State, id: u64) {
     if room.host == id {
         let mut room = st.rooms.remove(&room_id).expect("partie");
         passeurs::room_gone(st, room_id);
+        // (v311) Un monde de construction s'endort : son dernier propriétaire, dont le
+        // jeu l'enregistre en partant, en garde le dernier état.
+        if room.kind == 1 {
+            st.worlds.asleep(&room.server, &room.host_pseudo);
+        }
         settle_absences(st, &mut room, &[]);
         for m in room.members {
             if let Some(c) = st.conns.get_mut(&m) {
@@ -4230,29 +4239,114 @@ fn local_servers(st: &State, kind: u8, who: Option<&str>) -> Vec<proto::ServerEn
                     None => !st.servers.whitelist_on(&r.server),
                 }
         })
-        .map(|(&rid, r)| proto::ServerEntry {
-            id: rid,
-            // Garant : jamais nommé aux joueurs.
-            host: if r.garant_hosted {
-                GARANT_NAME.to_string()
-            } else {
-                r.host_pseudo.clone()
-            },
-            name: r.name.clone(),
-            map: r.map.clone(),
-            // (v146) Au fond d'un pays, les joueurs ne sont plus connectés ici : comptés par
-            // les provinces.
-            players: provinces::world_players(r) as u32,
-            max_players: r.max_players,
-            region: st.cfg.name.clone(),
-            relay_node: [0; 32],
-            relay_key: [0; 32],
-            relay_addr: String::new(),
+        .map(|(&rid, r)| {
+            let players = provinces::world_players(r) as u32;
+            let w = st.worlds.get(&r.server).filter(|_| r.kind == 1);
+            proto::ServerEntry {
+                id: rid,
+                // Garant : jamais nommé aux joueurs.
+                host: if r.garant_hosted {
+                    GARANT_NAME.to_string()
+                } else {
+                    r.host_pseudo.clone()
+                },
+                name: r.name.clone(),
+                map: r.map.clone(),
+                // (v146) Au fond d'un pays, les joueurs ne sont plus connectés ici : comptés
+                // par les provinces.
+                players,
+                max_players: r.max_players,
+                region: st.cfg.name.clone(),
+                relay_node: [0; 32],
+                relay_key: [0; 32],
+                relay_addr: String::new(),
+                peak: w.map_or(0, |w| w.peak).max(if r.kind == 1 { players } else { 0 }),
+                active: w.map_or(0, |w| w.active),
+                opened: w.map_or(0, |w| w.opened),
+                asleep: false,
+                keeper: String::new(),
+            }
         })
         .collect();
-    list.sort_by_key(|e| e.id);
+    // (v311) Les parties où il y a le plus de joueurs d'abord ; à égalité, celles qui en
+    // ont eu le plus.
+    list.sort_by(|a, b| {
+        b.players
+            .cmp(&a.players)
+            .then(b.peak.cmp(&a.peak))
+            .then(a.id.cmp(&b.id))
+    });
+    // (v311) En dessous, les mondes endormis (leur dernier joueur est parti), ceux qui
+    // ont eu le plus de joueurs d'abord. On n'y entre pas : `asleep`.
+    if kind == 1 {
+        for w in st.worlds.sleeping().into_iter().take(mondes::SLEEPING_SHOWN) {
+            let hidden = match who {
+                Some(p) => st.servers.whitelisted_out(&w.key, &w.creator, p),
+                None => st.servers.whitelist_on(&w.key),
+            };
+            if hidden {
+                continue;
+            }
+            list.push(proto::ServerEntry {
+                id: 0,
+                host: w.creator.clone(),
+                name: w.name.clone(),
+                map: w.map.clone(),
+                players: 0,
+                max_players: 0,
+                region: st.cfg.name.clone(),
+                relay_node: [0; 32],
+                relay_key: [0; 32],
+                relay_addr: String::new(),
+                peak: w.peak,
+                active: w.active,
+                opened: w.opened,
+                asleep: true,
+                keeper: w.keeper.clone(),
+            });
+        }
+    }
     list.truncate(200);
     list
+}
+
+/// (v311) Le créateur supprime son monde (`Request::DeleteWorld`) : ses joueurs en sortent
+/// (comme exclus, avec la raison), lui en dernier, ce qui ferme le monde par le chemin
+/// ordinaire ; puis le relais oublie ses réglages et il quitte le registre.
+fn delete_world(st: &mut State, rid: u64, creator: u64, key: &str) {
+    let others: Vec<u64> = st
+        .conns
+        .iter()
+        .filter(|(i, c)| c.room == Some(rid) && **i != creator)
+        .map(|(&i, _)| i)
+        .collect();
+    for i in others.into_iter().chain(std::iter::once(creator)) {
+        leave_room(st, i);
+        if let Some(c) = st.conns.get(&i) {
+            let reason = "Ce monde a été supprimé par son créateur.".to_string();
+            transport::push(&c.tx, &Response::Kicked { reason });
+        }
+    }
+    // (Encore là : il était tenu par quelqu'un qui n'y jouait pas.)
+    if st.rooms.remove(&rid).is_some() {
+        passeurs::room_gone(st, rid);
+    }
+    st.worlds.delete(key);
+    st.servers.forget(key);
+}
+
+/// (v311) Le registre des mondes suit ce qui s'y passe : joueurs présents (record,
+/// dernière activité).
+fn note_worlds(st: &mut State) {
+    let seen: Vec<(String, u32)> = st
+        .rooms
+        .values()
+        .filter(|r| r.kind == 1)
+        .map(|r| (r.server.clone(), provinces::world_players(r) as u32))
+        .collect();
+    for (key, players) in seen {
+        st.worlds.seen(&key, players);
+    }
 }
 
 /// Ce joueur est-il en survie sur ce serveur, d'après le relais (mode donné par un OP,
@@ -6117,6 +6211,15 @@ fn open_room(
         st.maps.mark_fps(map_sig);
     }
     let name: String = name.chars().take(32).collect();
+    // (v311) Monde endormi que ce joueur réveille (il en est le créateur, ou il en garde
+    // le dernier état) : il garde son créateur, donc ses OP, ses bannis, sa liste blanche.
+    let woken = if kind == 1 {
+        st.worlds.wakes(pseudo, &map)
+    } else {
+        None
+    };
+    let (creator, server) =
+        woken.unwrap_or_else(|| (pseudo.to_string(), servers::key(pseudo, &map)));
     // FPS : 10 joueurs ; construction : sans limite (0).
     let max_players = if kind == 0 {
         (max_players.clamp(2, proto::FPS_MAX_PLAYERS) & !1) as u32
@@ -6194,8 +6297,8 @@ fn open_room(
             evidence_parts: Vec::new(),
             arbitration: None,
             ban_review: None,
-            creator: pseudo.to_string(),
-            server: servers::key(pseudo, &map),
+            creator: creator.clone(),
+            server: server.clone(),
             fps_match: None,
             provinces: HashMap::new(),
             provinces_sent: HashMap::new(),
@@ -6218,6 +6321,9 @@ fn open_room(
             room.build.set_page_dir(dir);
             room.name_player(id, pseudo);
         }
+        // (v311) Au registre des mondes : ouvert, ou réveillé.
+        let name = st.rooms.get(&rid).map(|r| r.name.clone()).unwrap_or_default();
+        st.worlds.opened(&server, &name, &map, &creator, pseudo);
     }
     log::info!("partie {rid} ouverte par « {pseudo} »");
     rid
@@ -6737,6 +6843,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
     let my_room = st.conns.get(&id).and_then(|c| c.room);
     Some(match req {
         Request::Servers { kind } => {
+            note_worlds(st);
             let mut list = local_servers(st, kind, Some(pseudo));
             // Relais fédérés : les parties des autres relais connus, après celles d'ici
             // (le jeu s'y connecte avec le même compte pour les rejoindre).
@@ -6756,8 +6863,56 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             map_sig,
             max_players,
         } => {
+            // (v311) Pas d'ouvertures en rafale (la liste des parties et des mondes ne se
+            // remplit pas à la chaîne).
+            if let Err(wait) = st.worlds.may_open(pseudo) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    format!("Trop de parties ouvertes coup sur coup : réessaie dans {wait} s."),
+                ));
+            }
             let rid = open_room(st, id, pseudo, kind, name, map, map_sig, max_players);
             Response::Hosted { room: rid }
+        }
+        Request::DeleteWorld { code } => {
+            let room = st
+                .conns
+                .get(&id)
+                .and_then(|c| c.room)
+                .and_then(|rid| st.rooms.get(&rid).map(|r| (rid, r)))
+                .filter(|(_, r)| r.kind == 1);
+            let Some((rid, r)) = room else {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "On ne supprime un monde que depuis ce monde, quand il est en ligne.",
+                ));
+            };
+            if !r.creator.eq_ignore_ascii_case(pseudo) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Seul le créateur du monde peut le supprimer.",
+                ));
+            }
+            let key = r.server.clone();
+            // Double authentification du compte, s'il en a une : un code valable, jamais
+            // déjà servi.
+            if let Some(mut record) = st.accounts.load(pseudo) {
+                if let Some(sealed) = record.totp.clone() {
+                    let secret = crypto::open(&st.id.vault_key, &sealed).ok();
+                    let step = code
+                        .zip(secret)
+                        .and_then(|(c, s)| totp::check(&s, c, totp::now_step()))
+                        .filter(|s| *s > record.last_totp_step);
+                    let Some(step) = step else {
+                        return Some(err(ErrorCode::WrongTotp, ""));
+                    };
+                    record.last_totp_step = step;
+                    let _ = st.accounts.save(&record);
+                }
+            }
+            delete_world(st, rid, id, &key);
+            log::info!("monde supprimé par son créateur");
+            Response::Done
         }
         Request::Search {
             map_sig,
@@ -8848,6 +9003,7 @@ fn health_report(st: &mut State) {
     );
     log::info!("{line}");
     journaux::own(st, &line);
+    note_worlds(st);
     // (v307) Ce qui ressemble à une tentative de faire tomber le relais.
     let refused = std::mem::take(&mut st.fast.refused);
     let conns = (st.fast.conns_before, st.conns.len());
@@ -8902,6 +9058,7 @@ fn handle_locked(
         req,
         Request::Servers { .. }
             | Request::Host { .. }
+            | Request::DeleteWorld { .. }
             | Request::Search { .. }
             | Request::Report { .. }
             | Request::Unreport { .. }

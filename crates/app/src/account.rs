@@ -1201,6 +1201,7 @@ impl Accounts {
                 | Event::Arbitrate { .. }
                 | Event::Evidence { .. }
                 | Event::Kicked(_)
+                | Event::DeleteWorldCode
                 | Event::Slain(_)
                 | Event::SetGamemode { .. }
                 | Event::BulkDone { .. }

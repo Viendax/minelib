@@ -60,6 +60,9 @@ use serde::{Deserialize, Serialize};
 /// pavés du modèle (onze : chaque jambe et chaque bras en deux), doivent être les mêmes chez
 /// l'hôte, ses invités et le vérificateur.
 /// (v301) 75 : tunnels iroh par les passeurs (`Request::TunnelWant`, `Response::TunnelWay`).
+/// (v304-v311, toujours 75 : pas encore publié) chaînes de deux passeurs (`PasseurLink`),
+/// journal réseau (`NetLog`, `NetLogWanted`), signalement d'une carte (`MapReport`), mondes
+/// endormis (`ServerEntry` : record, dernière activité, gardien) et `DeleteWorld`.
 pub const PROTOCOL: u32 = 75;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
@@ -942,6 +945,15 @@ pub enum Request {
     /// carte FPS, ou elle est faite pour gonfler un classement). Une fois par compte et
     /// par carte ; voir `maps::Store::rankable` côté relais.
     MapReport,
+    /// (v311) Le créateur d'un monde de construction, qui y est, le supprime : tous ses
+    /// joueurs en sortent, le relais oublie ses réglages (OP, bannis, liste blanche,
+    /// positions) et il quitte la liste des mondes. Si le compte a la double
+    /// authentification, `code` doit en être un code valable (sinon `WrongTotp`) ; sinon
+    /// le jeu fait confirmer d'un clic avant d'envoyer. Les copies enregistrées sur les PC
+    /// ne sont pas touchées.
+    DeleteWorld {
+        code: Option<u32>,
+    },
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -1107,6 +1119,15 @@ pub struct ServerEntry {
     pub relay_node: [u8; 32],
     pub relay_key: [u8; 32],
     pub relay_addr: String,
+    /// (v311) Mondes de construction : plus grand nombre de joueurs présents en même
+    /// temps, dernière activité et première ouverture (secondes depuis 1970 ; 0 : inconnu).
+    pub peak: u32,
+    pub active: u64,
+    pub opened: u64,
+    /// (v311) Monde endormi : son dernier joueur est parti, on n'y entre pas tant que
+    /// celui qui en garde le dernier état (`keeper`), ou son créateur, ne l'a pas rouvert.
+    pub asleep: bool,
+    pub keeper: String,
 }
 
 impl ServerEntry {

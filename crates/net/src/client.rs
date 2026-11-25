@@ -143,6 +143,9 @@ pub enum Cmd {
     Report(String),
     /// (v307) Signale la carte de la partie FPS en cours.
     MapReport,
+    /// (v311) Le créateur supprime le monde de construction où il est (code de double
+    /// authentification si son compte en a une).
+    DeleteWorld(Option<u32>),
     Unreport(String),
     GarantAvailable(bool),
     /// Hôte d'une partie FPS : demande des passeurs pour ses joueurs (groupés par équipe).
@@ -325,6 +328,9 @@ pub enum Event {
     ServerAdmin(String),
     /// Exclu du serveur (banni), avec la raison.
     Kicked(String),
+    /// (v311) Suppression du monde : le compte a la double authentification, il faut un
+    /// code (ou celui donné est faux).
+    DeleteWorldCode,
     /// Tué par un OP du serveur (`/kill`).
     Slain(String),
     /// Mode de jeu imposé par un OP (`by`), ou par défaut du serveur (`by` vide).
@@ -1984,6 +1990,19 @@ impl Worker {
                 }
             }
             Cmd::MapReport => self.oneway(&Request::MapReport),
+            // (v311) Accepté : le relais nous sort du monde (`Kicked` suit). Code demandé
+            // ou faux : le jeu le (re)demande.
+            Cmd::DeleteWorld(code) => match self.request(&Request::DeleteWorld { code })? {
+                Response::Done => Ok(()),
+                Response::Error {
+                    code: ErrorCode::WrongTotp,
+                    ..
+                } => {
+                    self.emit(Event::DeleteWorldCode);
+                    Ok(())
+                }
+                r => self.unexpected(r),
+            },
             Cmd::Report(pseudo) => match self.request(&Request::Report {
                 pseudo: pseudo.clone(),
             })? {

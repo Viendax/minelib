@@ -35,6 +35,51 @@ pub struct ServerInfo {
     /// Latence mesurée vers le relais de la partie (ms).
     pub ping: u32,
     pub region: String,
+    /// (v311) Mondes de construction : record de joueurs présents en même temps, dernière
+    /// activité (secondes depuis 1970 ; 0 : inconnue), monde endormi (on n'y entre pas) et
+    /// qui en garde le dernier état.
+    pub peak: u32,
+    pub active: u64,
+    pub asleep: bool,
+    pub keeper: String,
+}
+
+/// (v311) « à l'instant », « il y a 5 min », « il y a 3 h », « il y a 12 j ».
+pub fn ago(now: u64, then: u64) -> String {
+    let d = now.saturating_sub(then);
+    match d {
+        0..=89 => "à l'instant".to_string(),
+        90..=5399 => format!("il y a {} min", (d + 30) / 60),
+        5400..=129_599 => format!("il y a {} h", (d + 1800) / 3600),
+        _ => format!("il y a {} j", (d + 43_200) / 86_400),
+    }
+}
+
+/// (v311) Ce qui est écrit sous le nom d'une partie : sa carte et son relais ; pour un
+/// monde de construction, son record de joueurs et sa dernière activité ; pour un monde
+/// endormi, depuis quand et chez qui est son dernier état.
+pub fn detail(sv: &ServerInfo, now: u64) -> String {
+    if sv.asleep {
+        let mut d = format!("{} - endormi", sv.map);
+        if sv.active > 0 {
+            d += &format!(", {}", ago(now, sv.active));
+        }
+        if sv.peak > 0 {
+            d += &format!(" - record {}", sv.peak);
+        }
+        if !sv.keeper.is_empty() {
+            d += &format!(" - dernier état chez {}", sv.keeper);
+        }
+        return d;
+    }
+    let mut d = format!("{} - {}", sv.map, sv.region);
+    if sv.peak > sv.players {
+        d += &format!(" - record {}", sv.peak);
+    }
+    if sv.active > 0 {
+        d += &format!(" - actif {}", ago(now, sv.active));
+    }
+    d
 }
 
 /// Ce que l'écran demande au jeu.
@@ -292,10 +337,13 @@ pub fn list_screen(
         );
     }
     let visible = ((list_h - 18.0 * s) / row_h).floor().max(0.0) as usize;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     for (row, &i) in shown.iter().take(visible).enumerate() {
         let sv = &servers[i];
         let y = top + row as f32 * row_h;
-        let detail = format!("{} - {}", sv.map, sv.region);
+        let detail = detail(sv, now);
         if c.list_row(
             list_x + 2.0 * s,
             y,
@@ -307,7 +355,9 @@ pub fn list_screen(
         ) {
             *selected = Some(i);
         }
-        let info = if sv.max_players == 0 {
+        let info = if sv.asleep {
+            "endormi".to_string()
+        } else if sv.max_players == 0 {
             format!("{}", sv.players)
         } else {
             format!("{}/{}", sv.players, sv.max_players)
@@ -329,7 +379,10 @@ pub fn list_screen(
     let cx = c.w / 2.0;
     let bw = 150.0;
     let half = (bw / 2.0 + 3.0) * s;
-    let join = c.button("Rejoindre", cx - half, by, bw, selected.is_some());
+    // (v311) Un monde endormi ne se rejoint pas : celui qui en garde le dernier état, ou
+    // son créateur, doit le rouvrir (« Ouvrir un monde », avec le même monde).
+    let awake = selected.is_some_and(|i| servers.get(i).is_some_and(|sv| !sv.asleep));
+    let join = c.button("Rejoindre", cx - half, by, bw, awake);
     let label = if kind == Kind::Build {
         "Ouvrir un monde"
     } else {
@@ -1204,6 +1257,38 @@ mod tests {
             players: 10,
             stored: true,
         }
+    }
+
+    /// (v311) La fiche d'un monde : record et dernière activité ; endormi, chez qui est
+    /// son dernier état.
+    #[test]
+    fn a_world_row_tells_its_record_its_last_activity_and_who_keeps_it() {
+        let mut sv = ServerInfo {
+            name: "L'île".into(),
+            map: "ile".into(),
+            players: 2,
+            max_players: 0,
+            ping: 0,
+            region: "Relais".into(),
+            peak: 9,
+            active: 10_000,
+            asleep: false,
+            keeper: String::new(),
+        };
+        assert_eq!(detail(&sv, 10_030), "ile - Relais - record 9 - actif à l'instant");
+        sv.players = 9;
+        assert_eq!(detail(&sv, 10_000 + 600), "ile - Relais - actif il y a 10 min");
+        sv.asleep = true;
+        sv.keeper = "Bob".into();
+        assert_eq!(
+            detail(&sv, 10_000 + 3 * 86_400),
+            "ile - endormi, il y a 3 j - record 9 - dernier état chez Bob"
+        );
+        assert_eq!(ago(7200, 0), "il y a 2 h");
+        sv.active = 0;
+        sv.peak = 0;
+        sv.keeper.clear();
+        assert_eq!(detail(&sv, 5), "ile - endormi");
     }
 
     #[test]

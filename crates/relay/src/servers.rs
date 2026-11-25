@@ -372,6 +372,26 @@ impl Store {
         path.with_extension("whitelist")
     }
 
+    /// (v311) Le monde `server` est supprimé par son créateur : ses OP, ses bannis, sa
+    /// liste blanche, son mode par défaut, son point d'apparition et les positions de ses
+    /// joueurs sont oubliés. (Son heure, sa météo et sa Foudre de Zeus le sont en mémoire ;
+    /// leurs fichiers le seront à leur prochain enregistrement.)
+    pub fn forget(&mut self, server: &str) {
+        self.servers.remove(server);
+        self.whitelists.remove(server);
+        self.defaults.remove(server);
+        self.spawns.remove(server);
+        self.times.remove(server);
+        self.weathers.remove(server);
+        self.legends.remove(server);
+        self.op_ready.remove(server);
+        if self.positions.remove(server).is_some() {
+            self.positions_dirty = true;
+            self.save_positions_now();
+        }
+        self.save();
+    }
+
     fn save(&self) {
         if let Ok(b) = postcard::to_allocvec(&self.servers) {
             let _ = crate::accounts::write_atomic(&self.path, &b);

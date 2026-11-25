@@ -817,6 +817,8 @@ pub struct Session {
     /// réapparition là où le monde n'est pas chargé (`arrive_elsewhere`).
     loading: Option<Loading>,
     items_seeded: bool,
+    /// (v311) `/deleteworld` vient d'être tapé : le jeu ouvre l'écran de confirmation.
+    pub delete_world_asked: bool,
     /// Horloge du ciel : n'avance qu'avec l'heure (nuages immobiles à heure fixe).
     sky_clock: f32,
     overlay: Overlay,
@@ -1328,6 +1330,7 @@ impl Session {
             teleport_laps: None,
             loading: Some(Loading::new()),
             items_seeded: false,
+            delete_world_asked: false,
             sky_clock: 0.0,
             overlay: Overlay::default(),
             chat: Chat::default(),
@@ -9118,6 +9121,20 @@ impl Session {
             return false;
         };
         match first.to_lowercase().as_str() {
+            // (v311) Supprimer le monde en ligne où l'on est (son créateur seulement : le
+            // relais le vérifie). Un écran fait confirmer d'un clic, et demande le code de
+            // double authentification si le compte en a une.
+            "deleteworld" | "supprimermonde" => {
+                if self.build.is_none() {
+                    self.chat.say(
+                        "/deleteworld supprime un monde en ligne, depuis ce monde, par son créateur.",
+                        chat::RED,
+                    );
+                    return true;
+                }
+                self.delete_world_asked = true;
+                true
+            }
             // (v307) Signaler la carte de la partie FPS en cours.
             "reportmap" | "signalercarte" => {
                 if self.net.is_none() {

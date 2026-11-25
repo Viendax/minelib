@@ -217,6 +217,11 @@ pub const HELP: &[Help] = &[
         forms: &[("/report <pseudo>", ""), ("/unreport <pseudo>", "annule")],
     },
     Help {
+        names: &["deleteworld", "supprimermonde"],
+        what: "Supprime ce monde en ligne (son créateur seulement)",
+        forms: &[("/deleteworld", "")],
+    },
+    Help {
         names: &["reportmap", "signalercarte"],
         what: "Signale la carte de la partie FPS en cours",
         forms: &[("/reportmap", "")],
