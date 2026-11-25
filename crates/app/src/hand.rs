@@ -70,12 +70,8 @@ pub struct Hand {
 
 // Rotation de chaque objet tenu par rapport au regard (x à droite, y en haut, −z
 // devant). La même sert à la 1re personne et sur le modèle du joueur (F5, reflets,
-// les autres joueurs) : changer l'une change l'autre.
-
-/// Bloc tenu.
-pub fn block_rotation() -> Mat4 {
-    Mat4::from_rotation_y(0.8) * Mat4::from_rotation_x(0.12)
-}
+// les autres joueurs) : changer l'une change l'autre. (v335) Un bloc tenu n'est plus tourné :
+// il fait face au regard, au bout du poing (`player_model::held_block_frame`).
 
 /// Torche tenue.
 pub fn torch_rotation() -> Mat4 {

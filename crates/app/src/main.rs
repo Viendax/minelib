@@ -1666,12 +1666,9 @@ impl Game {
                     // maintenant, avec celle du relais ; s'il ne l'a pas, on n'y reste pas.
                     if let Some(h) = hosting.as_ref().filter(|h| h.deferred) {
                         let link = self.accounts.link.clone();
-                        match (self.world_terrain, link) {
-                            (Some(t), Some(link)) => {
-                                self.play_with_terrain(h.dir.clone(), true, Some(t));
-                                self.attach_host_net(link);
-                            }
-                            _ => {}
+                        if let (Some(t), Some(link)) = (self.world_terrain, link) {
+                            self.play_with_terrain(h.dir.clone(), true, Some(t));
+                            self.attach_host_net(link);
                         }
                         if self.session.is_none() {
                             hosting = None;

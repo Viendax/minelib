@@ -1570,7 +1570,7 @@ fn hand_frame(pose: &Pose) -> Option<Mat4> {
 }
 
 /// Repère d'un objet tenu (pixels → monde) : au poing (`fwd` pixels devant), tourné
-/// comme à la 1re personne par rapport au regard (`rot`, voir `hand::block_rotation`).
+/// comme à la 1re personne par rapport au regard (`rot`, voir `hand::torch_rotation`).
 fn item_frame(pose: &Pose, hand: Mat4, rot: Mat4, fwd: f32) -> Mat4 {
     let at = hand.transform_point3(Vec3::new(0.0, 0.0, -fwd));
     Mat4::from_translation(at)
@@ -1580,23 +1580,66 @@ fn item_frame(pose: &Pose, hand: Mat4, rot: Mat4, fwd: f32) -> Mat4 {
         * Mat4::from_scale(Vec3::splat(PX))
 }
 
+/// (v335) « Les items dans ma main en première personne ou en F5 doivent faire la même taille
+/// que droppés au sol » (Viendax, 24 novembre) : côté d'un bloc tenu, en pixels du modèle, celui
+/// d'un bloc posé au sol comme objet (`drops::BLOCK_SIZE`, 0,28 bloc ; 6 pixels avant, 0,34).
+const HELD_BLOCK: f32 = crate::drops::BLOCK_SIZE / PX;
+/// (v335) De combien le bloc tenu est devant le bout du poing (pixels du modèle) : le bout de
+/// la main le tient (« plus au bout de ma main »).
+const HELD_AHEAD: f32 = 1.0;
+
+/// (v335) Repère d'un bloc tenu (son cube 0..1, y en haut) au monde, à partir du repère de la
+/// main (`hand_frame`). « Replace le placement par défaut dans la main, que ce soit plus au bout
+/// de ma main vers le milieu gauche, et les items par défaut tourne-les pour que je tienne la
+/// partie en bas à droite du cube de face avec cette partie de ma main, donc alignés avec
+/// l'avant-bras : les 3/4 du cube doivent être visibles de la première personne, un peu plus
+/// avec la perspective » (Viendax, 24 novembre). Le cube fait face au regard (avant : tourné de
+/// 46°, sous le poing et à côté) ; le coin du bas à droite de sa face qu'on voit est sur le bout
+/// du poing : son côté droit sur le bord extérieur du poing, son bas à mi-hauteur du poing,
+/// `HELD_AHEAD` devant lui. Il s'étend de là vers le haut et vers le milieu ; à la première
+/// personne, le bras et le poing en cachent le quart du bas, à droite (essayé à l'écran entre
+/// cinq placements : celui-ci, le cube en entier au-dessus du bord de l'écran).
+fn held_block_frame(pose: &Pose, hand: Mat4) -> Mat4 {
+    let s = HELD_BLOCK;
+    let e = ARM_W / 2.0;
+    item_frame(pose, hand, Mat4::IDENTITY, 0.0)
+        * Mat4::from_translation(Vec3::new(e - s, -0.5 * e, -HELD_AHEAD - s))
+        * Mat4::from_scale(Vec3::splat(s))
+}
+
 /// (v201) Repère d'une lampe torche tenue : au poing, pointée où l'on regarde (−z).
 fn flashlight_frame(pose: &Pose, hand: Mat4) -> Mat4 {
     // (v264) Tenue 0,6 pixel sous l'axe du poing : le corps a grandi sous une tête plus
     // petite, l'épaule est montée de 0,06 bloc vers les yeux ; à la première personne, la
-    // lampe montait devant le viseur.
+    // lampe montait devant le viseur. (v335) Plus grande, plus bas (`FLASHLIGHT_LOW`).
     item_frame(pose, hand, Mat4::IDENTITY, 2.0)
         * Mat4::from_translation(Vec3::new(0.0, -FLASHLIGHT_LOW, 0.0))
 }
 
+/// (v335) Haut de la tête de la lampe torche tenue au-dessus de l'axe du poing (pixels du
+/// modèle) : celui de la v264 (lampe à 0,5 pixel par seizième, tête de 6 seizièmes de large,
+/// 0,6 pixel sous l'axe du poing). Plus haut, elle montait devant le viseur à la première
+/// personne : la lampe plus grande (`HELD_LAMP`) est tenue plus bas dans le poing.
+const LAMP_TOP: f32 = 3.0 * 0.5 - 0.6;
 /// (v264) De combien la lampe torche tenue est sous l'axe du poing (pixels du modèle).
-const FLASHLIGHT_LOW: f32 = 0.6;
+/// (v335) Tiré de `LAMP_TOP` (tête de la lampe : 3 seizièmes de part et d'autre de son axe) :
+/// 1,1 (0,6 avant).
+const FLASHLIGHT_LOW: f32 = 3.0 * HELD_LAMP - LAMP_TOP;
+
+/// (v335) Lampe torche tenue : pixels du modèle par seizième de bloc, pour qu'elle ait la
+/// taille d'une lampe au sol (`drops::FLASHLIGHT_SIZE`, 0,6 fois sa taille en bloc ; 0,45
+/// avant).
+const HELD_LAMP: f32 = crate::drops::FLASHLIGHT_SIZE / 16.0 / PX;
 
 /// (v201) Point de la lampe debout (`flashlight::parts`, seizièmes de bloc) dans son repère
-/// tenu (pixels) : couchée vers l'avant, prise au milieu du manche, à la moitié de sa taille
-/// en bloc (comme à la première personne : environ 40 cm de long).
+/// tenu (pixels) : couchée vers l'avant, prise au milieu du manche, (v335) à la taille d'une
+/// lampe au sol.
 fn flashlight_lay(p: [f32; 3]) -> [f32; 3] {
-    [(p[0] - 8.0) * 0.5, (p[2] - 8.0) * 0.5, -(p[1] - 4.0) * 0.5]
+    [
+        (p[0] - 8.0) * HELD_LAMP,
+        (p[2] - 8.0) * HELD_LAMP,
+        -(p[1] - 4.0) * HELD_LAMP,
+    ]
 }
 
 /// (v215) Ampoule d'une lampe torche tenue par le modèle (monde), d'où part sa lumière :
@@ -1634,11 +1677,12 @@ pub fn right_arm_matrix(pose: &Pose) -> Option<Mat4> {
 pub fn flashlight_matrix(pose: &Pose) -> Option<Mat4> {
     let frame = flashlight_frame(pose, hand_frame(pose)?);
     // `flashlight_lay` en matrice, sur des coordonnées de bloc (seizièmes / 16).
+    let k = HELD_LAMP;
     let lay = Mat4::from_cols(
-        glam::Vec4::new(8.0, 0.0, 0.0, 0.0),
-        glam::Vec4::new(0.0, 0.0, -8.0, 0.0),
-        glam::Vec4::new(0.0, 8.0, 0.0, 0.0),
-        glam::Vec4::new(-4.0, -4.0, 2.0, 1.0),
+        glam::Vec4::new(16.0 * k, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, 0.0, -16.0 * k, 0.0),
+        glam::Vec4::new(0.0, 16.0 * k, 0.0, 0.0),
+        glam::Vec4::new(-8.0 * k, -8.0 * k, 4.0 * k, 1.0),
     );
     Some(frame * lay)
 }
@@ -1650,15 +1694,21 @@ fn torch_frame(pose: &Pose, hand: Mat4) -> Mat4 {
 
 /// (v239) Baguette ou écran tenu (objet plat, une image 16 × 16 en relief) : de cette taille
 /// (pixels du modèle), debout, centré sur la prise (plus haut, il cachait le viseur à la
-/// première personne).
-const FLAT_ITEM: f32 = 6.0;
-/// (v239) Torche tenue : à cette part de la taille du monde (celle de la première personne
-/// jusqu'ici), tenue par le haut de son bâton (le bas à `TORCH_LOW` pixels sous le poing).
-/// Entière, ou tenue plus bas, sa flamme montait au-dessus du viseur à la première personne.
-const HELD_TORCH: f32 = 0.5;
+/// première personne). (v335) Celle d'un objet au sol (`drops::BLOCK_SIZE` ; 6 pixels avant).
+const FLAT_ITEM: f32 = crate::drops::BLOCK_SIZE / PX;
+/// (v239) Torche tenue : à cette part de la taille du monde, tenue par le haut de son bâton
+/// (le bas à `TORCH_LOW` pixels sous le poing). (v335) Celle d'une torche au sol
+/// (`drops::TORCH_SIZE` ; 0,5 avant).
+const HELD_TORCH: f32 = crate::drops::TORCH_SIZE;
+/// (v335) Haut de la flamme de la torche tenue au-dessus du poing (pixels du modèle) : celui de
+/// la v264 (torche à 0,5, bas du bâton 5,4 pixels sous le poing). Plus haut, la flamme passait
+/// au-dessus du viseur à la première personne ; la torche plus grande est donc tenue plus bas
+/// sur son bâton.
+const TORCH_TOP: f32 = 13.0 * (32.0 / 1.8 / 16.0) * 0.5 - 5.4;
 /// (v264) 5,4 (5 avant) : le corps a grandi sous une tête plus petite, l'épaule est montée
-/// de 0,06 bloc vers les yeux et la flamme repassait d'un cheveu au-dessus du viseur.
-const TORCH_LOW: f32 = 5.4;
+/// de 0,06 bloc vers les yeux et la flamme repassait d'un cheveu au-dessus du viseur. (v335)
+/// Tiré de `TORCH_TOP` (bâton de 8 seizièmes et flamme de 5, à la taille `HELD_TORCH`).
+const TORCH_LOW: f32 = 13.0 * (32.0 / 1.8 / 16.0) * HELD_TORCH - TORCH_TOP;
 
 /// (v239) Repère du maillage de l'objet tenu à la première personne (`hand::item_mesh`), au
 /// monde : là où le modèle le tient, à sa taille (voir `held_parts`). Un bloc ou une tête : son
@@ -1667,11 +1717,7 @@ const TORCH_LOW: f32 = 5.4;
 pub fn held_item_matrix(pose: &Pose) -> Option<Mat4> {
     let hand = hand_frame(pose)?;
     match pose.held? {
-        Held::Block(_) => Some(
-            item_frame(pose, hand, crate::hand::block_rotation(), 0.0)
-                * Mat4::from_translation(Vec3::new(-3.0, -5.0, -7.0))
-                * Mat4::from_scale(Vec3::splat(6.0)),
-        ),
+        Held::Block(_) => Some(held_block_frame(pose, hand)),
         // Bâton de 2 × 8 seizièmes de bloc, à la moitié de la taille du monde (un bloc :
         // 32 / 1,8 pixels).
         Held::Torch(_) => Some(
@@ -1853,20 +1899,13 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
     if held == Held::Block(BlockId::AIR) {
         return Vec::new();
     }
-    // Un bloc tenu fait 6 pixels de côté (≈ un tiers de bloc), posé devant le poing.
+    // (v335) Un bloc tenu : son cube 0..1 dans `held_block_frame` (de la taille d'un bloc au
+    // sol comme objet) ; `dy` : de combien de blocs plus bas (le bas d'une porte).
     let block_box = |a: [u8; 3], b: [u8; 3], dy: f32| {
-        let k = 6.0 / 16.0;
+        let k = 1.0 / 16.0;
         (
-            [
-                -3.0 + a[0] as f32 * k,
-                -5.0 + dy + a[1] as f32 * k,
-                -7.0 + a[2] as f32 * k,
-            ],
-            [
-                -3.0 + b[0] as f32 * k,
-                -5.0 + dy + b[1] as f32 * k,
-                -7.0 + b[2] as f32 * k,
-            ],
+            [a[0] as f32 * k, dy + a[1] as f32 * k, a[2] as f32 * k],
+            [b[0] as f32 * k, dy + b[1] as f32 * k, b[2] as f32 * k],
         )
     };
     match held {
@@ -1905,7 +1944,7 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
             } else {
                 def.boxes()
             };
-            let frame = item_frame(pose, hand, crate::hand::block_rotation(), 0.0);
+            let frame = held_block_frame(pose, hand);
             let part = |a: [u8; 3], b: [u8; 3], dy: f32, layer: u16| {
                 let (min, max) = block_box(a, b, dy);
                 (
@@ -1948,7 +1987,7 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
                 // Bannière, porte : deux blocs de haut, comme posées (panneau fin, deux
                 // moitiés).
                 let (a, b) = boxes[0];
-                vec![part(a, b, 0.0, top as u16), part(a, b, -6.0, bottom as u16)]
+                vec![part(a, b, 0.0, top as u16), part(a, b, -1.0, bottom as u16)]
             } else {
                 // Au plus deux morceaux (escalier) : le reste des pavés est pour le corps.
                 boxes
@@ -4176,6 +4215,60 @@ mod tests {
         for (unit, px) in [(Vec3::ZERO, Vec3::from(min)), (Vec3::ONE, Vec3::from(max))] {
             let (a, b) = (m.transform_point3(unit), frame.transform_point3(px));
             assert!(a.distance(b) < 1e-4, "{a} {b}");
+        }
+    }
+
+    /// (v335) « Les items dans ma main en première personne ou en F5 doivent faire la même
+    /// taille que droppés au sol ; plus au bout de ma main vers le milieu gauche ; tourne-les
+    /// pour que je tienne la partie en bas à droite du cube de face » : le bloc tenu a le côté
+    /// d'un bloc au sol ; il fait face au regard ; le bout du poing est devant sa face, dans
+    /// son quart du bas à droite ; le cube est au bout du bras (au-delà du poing), et monte
+    /// vers le milieu. Quel que soit le regard, accroupi ou non.
+    #[test]
+    fn a_held_block_is_the_size_of_a_dropped_one_held_by_its_corner() {
+        for (pitch, crouch) in [(0.0f32, 0.0f32), (-0.7, 0.0), (0.6, 1.0)] {
+            let pose = Pose {
+                feet: Vec3::new(3.0, 70.0, -2.0),
+                yaw: 0.9,
+                pitch,
+                walk: 0.0,
+                swing: 0.0,
+                crouch,
+                light: [1.0; 3],
+                held: Some(Held::Block(BlockId::STONE)),
+                skin: None,
+                bow: 0.0,
+                air: 0.0,
+                dir: 0.0,
+                run: 0.0,
+            };
+            let m = held_item_matrix(&pose).unwrap();
+            for v in [Vec3::X, Vec3::Y, Vec3::Z] {
+                let edge = m.transform_vector3(v).length();
+                assert!((edge - crate::drops::BLOCK_SIZE).abs() < 1e-4, "{edge}");
+            }
+            // Face au regard : ses arêtes sont celles de la vue.
+            let view = Mat4::from_rotation_y(-pose.yaw) * Mat4::from_rotation_x(pitch);
+            for v in [Vec3::X, Vec3::Y, Vec3::Z] {
+                let d = m.transform_vector3(v).normalize().dot(view.transform_vector3(v));
+                assert!(d > 0.9999, "{v} {d}");
+            }
+            // Le bout du poing : devant sa face, dans le quart du bas à droite.
+            let arm = right_arm_matrix(&pose).unwrap();
+            let fist = arm.transform_point3(Vec3::new(0.5, 0.5, 0.0));
+            let f = m.inverse().transform_point3(fist);
+            assert!(f.x > 0.5 && f.x < 1.0, "{f}");
+            assert!(f.y > 0.0 && f.y < 0.5, "{f}");
+            assert!(f.z > 1.0 && f.z < 1.6, "{f}");
+            // Au bout du bras : plus loin de l'épaule que le poing.
+            let shoulder = arm.transform_point3(Vec3::new(0.5, 0.5, 1.0));
+            let center = m.transform_point3(Vec3::splat(0.5));
+            assert!(center.distance(shoulder) > fist.distance(shoulder));
+            // La boîte de F5 est ce cube.
+            let (frame, min, max, _) = held_parts(&pose)[0];
+            for (unit, local) in [(Vec3::ZERO, Vec3::from(min)), (Vec3::ONE, Vec3::from(max))] {
+                assert!(m.transform_point3(unit).distance(frame.transform_point3(local)) < 1e-4);
+            }
         }
     }
 
