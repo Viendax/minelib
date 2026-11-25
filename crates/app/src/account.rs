@@ -1373,6 +1373,8 @@ impl Accounts {
                 | Event::BuildMatch { .. }
                 | Event::MatchPeer { .. }
                 | Event::Fast(_)
+                | Event::Near(_)
+                | Event::NearPos { .. }
                 | Event::FromHost(_)) => self.game_events.push(e),
             }
         }

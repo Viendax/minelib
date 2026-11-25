@@ -470,6 +470,21 @@ pub fn turn_received(from: SocketAddr, p: &[u8]) -> bool {
 }
 
 
+/// (v333) Le lien de ce jeu avec un relais (joint à l'adresse locale `addr` de son tunnel
+/// iroh) passe-t-il en ce moment par un serveur TURN ? Rien : on ne sait pas (relais joint
+/// sans tunnel, sur ce réseau ou cette machine). Fourni par le nœud iroh du jeu.
+pub type LinkProbe = fn(&str) -> Option<bool>;
+
+static LINK_PROBE: OnceLock<LinkProbe> = OnceLock::new();
+
+pub fn set_link_probe(f: LinkProbe) {
+    let _ = LINK_PROBE.set(f);
+}
+
+pub fn link_on_turn(addr: &str) -> Option<bool> {
+    LINK_PROBE.get()?(addr)
+}
+
 /// (v308) Le joueur a-t-il accepté que son jeu serve de passeur ? Un passeur montre son
 /// adresse IP à ceux à qui il remet des paquets (un bout de route et un autre passeur) :
 /// ce n'est plus fait d'office pour tout jeu qui peut être garant, seulement pour qui l'a
@@ -1093,6 +1108,8 @@ pub struct PathInfo {
 }
 
 struct Live {
+    /// (v333) La route telle que donnée : redonnée à l'identique, elle garde son état.
+    spec: Way,
     route: u64,
     cipher: ChaCha20Poly1305,
     vias: Vec<LiveVia>,
@@ -1280,9 +1297,11 @@ impl Endpoint {
     }
 
     /// Remplace toutes les routes (nouvelle attribution du relais ; aucune : voie fermée).
+    /// (v333) Une route redonnée à l'identique garde son état (numéros, mesures, ce que
+    /// l'autre bout dit recevoir) : la voie directe des voisins change ses routes une à une.
     pub fn set_ways(&self, ways: Vec<Way>) {
         let mut st = self.inner.st.lock().unwrap();
-        st.ways.clear();
+        let mut before = std::mem::take(&mut st.ways);
         st.by_route.clear();
         // (v331) Les routes qui ont un chemin par TURN : ce qui en vient nous est remis
         // par le client TURN du nœud iroh du jeu (`turn_received`).
@@ -1304,6 +1323,10 @@ impl Endpoint {
         }
         for w in ways {
             st.by_route.insert(w.route, w.peer);
+            if let Some(l) = before.remove(&w.peer).filter(|l| l.spec == w) {
+                st.ways.insert(w.peer, l);
+                continue;
+            }
             let mut vias: Vec<LiveVia> = w
                 .vias
                 .iter()
@@ -1318,6 +1341,7 @@ impl Endpoint {
             st.ways.insert(
                 w.peer,
                 Live {
+                    spec: w.clone(),
                     route: w.route,
                     cipher: cipher(&w.key),
                     vias,
@@ -1612,6 +1636,141 @@ impl EndInner {
                 let p = l.packet(self.dir, i, seq, FLAG_KEEP, &[], now);
                 l.out(&self.sock, i, &p, now);
             }
+        }
+    }
+}
+
+// ─────────────── (v333) Voie directe des voisins d'un monde de construction ───────────────
+
+/// Voie directe des voisins : dans un monde de construction, les positions rapides (256 par
+/// seconde) d'un joueur partaient au relais, qui les remettait à ses voisins les plus
+/// proches. Quand les liens de tous avec le relais passent par TURN, chaque position y
+/// passait deux fois de plus que nécessaire (montée, puis descente vers chacun). Le relais
+/// donne alors à deux voisins proches une route par TURN de l'un à l'autre
+/// (`Response::NearWay`), sur laquelle les positions vont directement.
+///
+/// Les routes d'un joueur sont tenues par deux bouts de voie rapide, un par sens (celui des
+/// deux qui a le plus petit numéro sur le relais écrit dans le sens `TO_GUEST`) ; chacune
+/// garde son état quand les autres changent.
+#[derive(Clone)]
+pub struct Near {
+    inner: Arc<NearInner>,
+}
+
+struct NearInner {
+    /// Bouts qui écrivent dans le sens `TO_GUEST`, puis `TO_HOST`.
+    ends: [Endpoint; 2],
+    peers: Mutex<HashMap<u64, NearPeer>>,
+}
+
+#[derive(Clone)]
+struct NearPeer {
+    way: Way,
+    end: usize,
+    /// Nos positions rapides lui vont (il est parmi nos voisins les plus proches).
+    send: bool,
+}
+
+impl std::fmt::Debug for Near {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Near ({} voisins)",
+            self.inner.peers.lock().unwrap().len()
+        )
+    }
+}
+
+impl Near {
+    /// Ce qui arrive des voisins est remis à `out` : (son numéro sur le relais, message).
+    pub fn start(out: Deliver) -> std::io::Result<Self> {
+        let out: Arc<Deliver> = Arc::new(out);
+        let mk = |dir: u8| {
+            let o = out.clone();
+            Endpoint::start(dir, Box::new(move |peer, msg| (o)(peer, msg)))
+        };
+        Ok(Near {
+            inner: Arc::new(NearInner {
+                ends: [mk(TO_GUEST)?, mk(TO_HOST)?],
+                peers: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    /// La route vers le voisin `peer` : donnée ou changée (`way`, notre sens `dir`, `send`),
+    /// ou reprise (rien).
+    pub fn set(&self, peer: u64, way: Option<(Way, u8, bool)>) {
+        let mut peers = self.inner.peers.lock().unwrap();
+        let old = peers.get(&peer).map(|p| p.end);
+        match way {
+            Some((way, dir, send)) => {
+                let end = usize::from(dir != TO_GUEST);
+                peers.insert(peer, NearPeer { way, end, send });
+                self.reload(&peers, end);
+            }
+            None => {
+                peers.remove(&peer);
+            }
+        }
+        if let Some(e) = old {
+            self.reload(&peers, e);
+        }
+    }
+
+    fn reload(&self, peers: &HashMap<u64, NearPeer>, end: usize) {
+        let ways = peers
+            .values()
+            .filter(|p| p.end == end)
+            .map(|p| p.way.clone())
+            .collect();
+        self.inner.ends[end].set_ways(ways);
+    }
+
+    /// Les voisins à qui nos positions rapides doivent aller.
+    pub fn wanted(&self) -> Vec<u64> {
+        let peers = self.inner.peers.lock().unwrap();
+        let mut v: Vec<u64> = peers
+            .iter()
+            .filter(|(_, p)| p.send)
+            .map(|(k, _)| *k)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// La route vers ce voisin passe (il dit recevoir par elle).
+    pub fn open(&self, peer: u64) -> bool {
+        let end = self.inner.peers.lock().unwrap().get(&peer).map(|p| p.end);
+        end.is_some_and(|e| self.inner.ends[e].open(peer))
+    }
+
+    /// Le message part à chaque voisin qui le veut et dont la route passe ; rend ceux-là.
+    pub fn send(&self, msg: &[u8]) -> Vec<u64> {
+        let targets: Vec<(u64, usize)> = {
+            let peers = self.inner.peers.lock().unwrap();
+            peers
+                .iter()
+                .filter(|(_, p)| p.send)
+                .map(|(k, p)| (*k, p.end))
+                .collect()
+        };
+        targets
+            .into_iter()
+            .filter(|(peer, end)| self.inner.ends[*end].send_one(*peer, msg))
+            .map(|(peer, _)| peer)
+            .collect()
+    }
+
+    /// Routes en place.
+    pub fn peers(&self) -> usize {
+        self.inner.peers.lock().unwrap().len()
+    }
+
+    /// Ferme tout (la connexion au relais s'en va).
+    pub fn close(&self) {
+        self.inner.peers.lock().unwrap().clear();
+        for e in &self.inner.ends {
+            e.close();
         }
     }
 }
@@ -2375,5 +2534,74 @@ mod tests {
         assert!(host.on_turn(7), "40 ms d'écart : TURN");
         assert!(host.send_one(7, b"vite"));
         assert!(drain(&grx) >= 1);
+    }
+
+    /// (v333) Voie directe des voisins : deux joueurs (numéros 11 et 22 sur le relais), une
+    /// route par TURN de l'un à l'autre ; les positions vont à ceux qui les veulent, et une
+    /// route de plus ou de moins ne coupe pas celles qui restent.
+    #[test]
+    fn neighbours_get_positions_directly_and_routes_change_one_by_one() {
+        let (ta, tb, tc) = (fake_turn(), fake_turn(), fake_turn());
+        let inbox = || {
+            let (tx, rx) = channel::<(u64, Vec<u8>)>();
+            let tx = Mutex::new(tx);
+            let out: Deliver = Box::new(move |peer, m| {
+                let _ = tx.lock().unwrap().send((peer, m));
+            });
+            (out, rx)
+        };
+        let (oa, ra) = inbox();
+        let (ob, rb) = inbox();
+        let (oc, _rc) = inbox();
+        let (a, b, c) = (
+            Near::start(oa).unwrap(),
+            Near::start(ob).unwrap(),
+            Near::start(oc).unwrap(),
+        );
+        let way = |peer, route, mine: &FakeTurn, other: &FakeTurn| Way {
+            peer,
+            route,
+            key: key(30),
+            vias: Vec::new(),
+            turn: Some(TurnPair {
+                mine: mine.mine,
+                peer: other.mine,
+            }),
+        };
+        let r1: u64 = 0x5100_0000 + u64::from(rand_u16());
+        a.set(22, Some((way(22, r1, &ta, &tb), TO_GUEST, true)));
+        b.set(11, Some((way(11, r1, &tb, &ta), TO_HOST, false)));
+        assert_eq!(a.wanted(), vec![22]);
+        assert!(
+            b.wanted().is_empty(),
+            "11 n'est pas parmi les plus proches de 22"
+        );
+        assert!(wait(|| a.open(22) && b.open(11)), "route ouverte");
+        for i in 0..50u8 {
+            assert_eq!(a.send(&[i]), vec![22]);
+        }
+        let mut got = 0;
+        while let Ok((peer, _)) = rb.recv_timeout(Duration::from_millis(300)) {
+            assert_eq!(peer, 11);
+            got += 1;
+        }
+        assert_eq!(got, 50);
+        assert!(b.send(b"rien").is_empty(), "22 n'envoie à personne");
+        assert!(ra.try_recv().is_err());
+        // Un troisième voisin pour 11, dans l'autre sens : la route vers 22 ne s'interrompt
+        // pas (son état est gardé).
+        let r2 = r1 + 1;
+        a.set(33, Some((way(33, r2, &ta, &tc), TO_HOST, true)));
+        c.set(11, Some((way(11, r2, &tc, &ta), TO_GUEST, false)));
+        assert!(a.open(22), "la route vers 22 est restée ouverte");
+        assert_eq!(a.wanted(), vec![22, 33]);
+        assert!(wait(|| a.open(33)));
+        assert_eq!(a.send(b"deux").len(), 2);
+        // Reprise : il n'en reste qu'une.
+        a.set(22, None);
+        assert_eq!(a.wanted(), vec![33]);
+        assert_eq!(a.peers(), 1);
+        a.close();
+        assert_eq!(a.peers(), 0);
     }
 }

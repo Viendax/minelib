@@ -8981,6 +8981,10 @@ impl Session {
                     let dirty = b.receive(*peer, *chunk, data, &mut self.world);
                     self.dirty.extend(dirty);
                 }
+                // (v333) Voie directe des voisins : routes données par le relais du monde,
+                // et positions venues par elles.
+                Event::Near(near) => b.set_near(near.clone()),
+                Event::NearPos { peer, data } => b.near_pose(*peer, data),
                 _ => {}
             }
             return;

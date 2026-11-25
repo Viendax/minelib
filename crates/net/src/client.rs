@@ -705,6 +705,16 @@ pub enum Event {
     /// (rien : voie fermée). Ce qui en arrive est remis comme le reste, par `FromHost` et
     /// `FromPeer`.
     Fast(Option<crate::fast::Endpoint>),
+    /// (v333) Voie directe des voisins d'un monde de construction (`crate::fast::Near`) :
+    /// de quoi envoyer nos positions rapides à nos plus proches voisins par TURN (rien :
+    /// plus de route). Ce qui en arrive vient par `NearPos`.
+    Near(Option<crate::fast::Near>),
+    /// (v333) Une position venue directement d'un voisin (`peer` : son numéro sur ce
+    /// relais).
+    NearPos {
+        peer: u64,
+        data: Vec<u8>,
+    },
     /// Garant vérificateur : copie d'une demande d'un joueur à l'hôte.
     Witness {
         peer: u64,
@@ -940,6 +950,11 @@ struct Worker {
     tunnel_seen: u64,
     /// (v329) Dernières adresses TURN dites à ce relais (`crate::fast::turn_addrs`).
     turn_seen: u64,
+    /// (v333) Voie directe des voisins donnée par ce relais ; ce qu'on lui a dit de notre
+    /// lien (par TURN ou non), et quand on l'a regardé.
+    near: Option<crate::fast::Near>,
+    link_turn: Option<bool>,
+    link_at: Instant,
 }
 
 /// Passeur tenu par une connexion au relais. Il est gardé quand le jeu cesse de s'annoncer
@@ -963,6 +978,8 @@ struct Passeur {
 /// nous joint plus (adresse changée, port refermé par la box). On redemande le port à la box
 /// et on se réannonce.
 const PASSEUR_SILENCE: Duration = Duration::from_secs(75);
+/// (v333) Le chemin de notre lien avec le relais (par TURN ou non) est regardé à ce rythme.
+const LINK_EVERY: Duration = Duration::from_secs(2);
 
 /// Demande à la box d'ouvrir `port`, dans un fil à part (elle peut mettre plusieurs
 /// secondes à répondre).
@@ -1001,6 +1018,9 @@ impl Worker {
             // (Les demandes d'avant cette connexion ne la regardent pas.)
             tunnel_seen: crate::fast::tunnel_wants(u64::MAX, "").1,
             turn_seen: 0,
+            near: None,
+            link_turn: None,
+            link_at: Instant::now(),
         }
     }
 
@@ -1050,6 +1070,40 @@ impl Worker {
         if let Some((_, e)) = self.fast.take() {
             e.close();
             self.emit(Event::Fast(None));
+        }
+    }
+
+    /// (v333) Route de la voie directe vers le voisin `peer` (rien : reprise).
+    fn set_near(&mut self, peer: u64, way: Option<(crate::fast::Way, u8, bool)>) {
+        if way.is_none() && self.near.is_none() {
+            return;
+        }
+        if self.near.is_none() {
+            let out = self.out.clone();
+            match crate::fast::Near::start(Box::new(move |peer, data| {
+                let _ = out.send(Event::NearPos { peer, data });
+            })) {
+                Ok(n) => {
+                    self.near = Some(n.clone());
+                    self.emit(Event::Near(Some(n)));
+                }
+                Err(e) => {
+                    log::warn!("voie directe des voisins : {e}");
+                    return;
+                }
+            }
+        }
+        let Some(n) = &self.near else { return };
+        n.set(peer, way);
+        if n.peers() == 0 {
+            self.close_near();
+        }
+    }
+
+    fn close_near(&mut self) {
+        if let Some(n) = self.near.take() {
+            n.close();
+            self.emit(Event::Near(None));
         }
     }
 
@@ -1128,6 +1182,20 @@ impl Worker {
         if self.chan.is_none() {
             self.relay_passeurs = false;
             self.relay_logs = false;
+            // (v333) Ses routes de voie directe ne valaient que pour cette connexion.
+            self.close_near();
+            self.link_turn = None;
+        }
+        // (v333) Notre lien avec ce relais passe-t-il par TURN ? Dit à chaque connexion et
+        // quand cela change (regardé toutes les deux secondes). Relais joint sans tunnel de
+        // ce jeu (réseau local, cette machine) : rien n'est dit, le relais compte que non.
+        if self.chan.is_some() && !self.pseudo.is_empty() && self.link_at.elapsed() >= LINK_EVERY {
+            self.link_at = Instant::now();
+            if let Some(on) = crate::fast::link_on_turn(&self.addr) {
+                if self.link_turn != Some(on) && self.oneway(&Request::LinkTurn { on }).is_ok() {
+                    self.link_turn = Some(on);
+                }
+            }
         }
         // (v307) Journal réseau partagé : quelques lignes toutes les 10 s, au relais qui
         // les demande.
@@ -1399,6 +1467,27 @@ impl Worker {
             Response::FastHost { ways } => {
                 let ways = ways.iter().map(|w| w.way()).collect();
                 self.set_fast(crate::fast::TO_GUEST, ways);
+                return;
+            }
+            Response::NearWay {
+                peer,
+                route,
+                key,
+                dir,
+                send,
+                turn,
+            } => {
+                let way = turn.map(|t| {
+                    let w = crate::proto::FastWay {
+                        peer,
+                        route,
+                        key,
+                        passeurs: Vec::new(),
+                        turn: Some(t),
+                    };
+                    (w.way(), dir, send)
+                });
+                self.set_near(peer, way);
                 return;
             }
             Response::TunnelWay {

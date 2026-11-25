@@ -9503,13 +9503,15 @@ fn health_report(st: &mut State) {
     let (offers, verified, carried) = st.fast.counts();
     let (turn_nodes, turn_tunnels) = st.fast.turn_counts();
     let (fps_turn, fps_turn_only) = st.fast.fps_turns();
+    let (near_links, near_routes) = st.fast.near_counts();
     let line = format!(
         "relais (santé, {:.0} s) : {} connexions, {fps} parties FPS, {build} mondes ; {} demandes, \
          attente la plus longue {:.0} ms, traitement le plus long {:.0} ms ; {} positions \
          écartées ; {} connexions de compte (refusées {}, relais occupé {}) ; passeurs : \
          {offers} annoncés, {verified} vérifiés, {carried} parties portées, {} tunnels portés ; \
          TURN : {turn_nodes} nœuds, {turn_tunnels} tunnels, {fps_turn} joueurs FPS (dont \
-         {fps_turn_only} sans passeur)",
+         {fps_turn_only} sans passeur), {near_links} liens par TURN, {near_routes} routes \
+         directes entre voisins",
         since.elapsed().as_secs_f32(),
         st.conns.len(),
         h.requests,
@@ -9673,6 +9675,7 @@ fn handle_locked(
             | Request::TunnelWant { .. }
             | Request::TunnelBad { .. }
             | Request::TurnAt { .. }
+            | Request::LinkTurn { .. }
             | Request::NetLog { .. }
             | Request::MapReport
     ) {
@@ -9700,6 +9703,7 @@ fn handle_locked(
                     passeurs::tunnel_want(st, id, node, turn.map(v4))
                 }
                 Request::TurnAt { node, turn } => passeurs::turn_at(st, id, node, turn.map(v4)),
+                Request::LinkTurn { on } => passeurs::link_turn(st, id, on),
                 Request::TunnelBad { route } => passeurs::tunnel_bad(st, id, route),
                 Request::PasseurOffer { port, external } => {
                     passeurs::offer(st, id, peer, port, external)

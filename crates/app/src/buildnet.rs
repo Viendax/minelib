@@ -64,6 +64,13 @@ const POS_EVERY: f32 = 0.1;
 const POS_CROWD: f32 = 1.0 / 60.0;
 /// (v275) Avec peu de voisins (`POS_CLOSE` au plus) : voir `pos_every`.
 const POS_FASTEST: f32 = 1.0 / 256.0;
+/// (v333) Positions par le relais quand toutes nos positions rapides vont directement à nos
+/// plus proches voisins (`minelib_net::fast::Near`) : de quoi tenir le relais au courant
+/// (place gardée, modifications en retard) et les joueurs plus loin, 16 par seconde.
+const POS_RELAY_DIRECT: f32 = 1.0 / 16.0;
+/// (v333) Tant qu'une position d'un joueur est venue directement il y a moins de ce temps,
+/// celles du relais (plus vieilles, et plus rares) ne comptent pas pour lui.
+const DIRECT_FRESH: f32 = 0.25;
 const POS_CLOSE: usize = 3;
 /// Positions reçues par seconde qu'on vise au plus (tous les voisins proches réunis) : le
 /// rythme d'envoi de chacun baisse quand il y a du monde autour.
@@ -138,6 +145,8 @@ pub struct Other {
     #[allow(dead_code)]
     pub speed: f32,
     seen: f32,
+    /// (v333) Depuis quand rien n'est venu de lui directement (voie directe des voisins).
+    direct: f32,
     /// (v165) Son ping avec son relais (ms), s'il est connu.
     pub ping: Option<u16>,
     /// (v222) Ce qu'il tient en main et qu'on voit (lampe torche, Foudre de Zeus).
@@ -297,10 +306,17 @@ pub struct BuildNet {
     /// une fois par seconde.
     close_timer: f32,
     slow_link: (f32, bool),
+    /// (v333) Voie directe des voisins donnée par le relais du monde (routes par TURN vers
+    /// nos plus proches voisins), prochaine position par elle, et si toutes nos positions
+    /// rapides y passaient à la dernière (le relais n'en reçoit alors plus que
+    /// `POS_RELAY_DIRECT`).
+    near: Option<minelib_net::fast::Near>,
+    near_timer: f32,
+    direct_all: bool,
     /// (v287) Relevé du réseau, écrit au journal chaque minute sans rien qui désigne un
     /// joueur : positions parties (pour tous, rapprochées), positions reçues, modifications
     /// annulées faute de réponse, blocs remis comme avant, et depuis quand on compte.
-    net: [u32; 5],
+    net: [u32; 6],
     net_since: std::time::Instant,
     /// Rang (ordre du relais du monde) de la dernière modification appliquée à chaque
     /// case, et relais de région qui l'a remise (son numéro de connexion ; aucun : le
@@ -755,7 +771,10 @@ impl BuildNet {
             pos_timer: 0.0,
             close_timer: 0.0,
             slow_link: (0.0, false),
-            net: [0; 5],
+            near: None,
+            near_timer: 0.0,
+            direct_all: false,
+            net: [0; 6],
             net_since: std::time::Instant::now(),
             seen: HashMap::new(),
             names: HashMap::new(),
@@ -2371,6 +2390,7 @@ impl BuildNet {
         self.pos_timer -= dt;
         self.spot_timer -= dt;
         self.close_timer -= dt;
+        self.near_timer -= dt;
         // (v285) Le relais qui reçoit nos positions est-il joint par les serveurs relais
         // d'iroh ? (v320) Le relais du monde aussi : depuis que le jeu ne montre plus son
         // adresse IP (v313), il est joint par eux tant qu'il n'a pas de passeurs.
@@ -2397,12 +2417,22 @@ impl BuildNet {
             // (v275) Le retard pris est reporté sur l'envoi suivant : à 300 images par
             // seconde il en part bien 256, et non une image sur deux (150).
             let slow = self.slow_link.1;
-            self.pos_timer = (self.pos_timer + pos_every(self.others.len(), slow)).max(0.0);
+            // (v333) Toutes nos positions rapides vont directement à nos plus proches
+            // voisins : au relais, 16 par seconde suffisent.
+            let every = if self.direct_all {
+                pos_every(self.others.len(), slow).max(POS_RELAY_DIRECT)
+            } else {
+                pos_every(self.others.len(), slow)
+            };
+            self.pos_timer = (self.pos_timer + every).max(0.0);
             self.close_timer = (self.close_timer + POS_FASTEST).max(0.0);
             sent = true;
             self.net[0] += 1;
+            // (v333) Sans pseudo : les relais mettent celui de la session (le relais du monde
+            // l'ignore, ceux de région et de province le remplacent), 10 octets de moins par
+            // position, jusqu'à 256 fois par seconde.
             let msg = BuildMsg::Player {
-                pseudo: self.pseudo.clone(),
+                pseudo: String::new(),
                 pos: at,
                 yaw: look.0,
                 pitch: look.1,
@@ -2442,12 +2472,13 @@ impl BuildNet {
             && self.close_timer <= 0.0
             && !self.hidden
             && !self.slow_link.1
+            && !self.direct_all
             && self.others.len() > POS_CLOSE
         {
             self.close_timer = (self.close_timer + POS_FASTEST).max(0.0);
             self.net[1] += 1;
             let msg = BuildMsg::Player {
-                pseudo: self.pseudo.clone(),
+                pseudo: String::new(),
                 pos: at,
                 yaw: look.0,
                 pitch: look.1,
@@ -2463,6 +2494,36 @@ impl BuildNet {
                     data: game::encode(&msg),
                 },
             );
+        }
+        // (v333) Voie directe des voisins : nos positions rapides (256 par seconde) vont par
+        // TURN à ceux de nos plus proches voisins dont la route passe, quand nos positions
+        // vont au relais du monde (c'est lui qui donne ces routes). Si elles leur vont à
+        // tous, le relais n'en reçoit plus que 16 par seconde (`direct_all`).
+        let to_world = self.shards.link(proto::region_of(chunk)).is_none()
+            && self.province_link(chunk).is_none();
+        match self.near.as_ref().filter(|_| to_world && !self.hidden) {
+            Some(n) if self.near_timer <= 0.0 => {
+                self.near_timer = (self.near_timer + POS_FASTEST).max(0.0);
+                let wanted = n.wanted();
+                let mut served = Vec::new();
+                if !wanted.is_empty() {
+                    let msg = BuildMsg::Player {
+                        pseudo: String::new(),
+                        pos: at,
+                        yaw: look.0,
+                        pitch: look.1,
+                        crouch,
+                        speed,
+                        ping: self.ping,
+                        held: minelib_net::poses::Held::pack(self.held, self.back),
+                    };
+                    served = n.send(&game::encode(&msg));
+                    self.net[5] += served.len() as u32;
+                }
+                self.direct_all = !wanted.is_empty() && served.len() == wanted.len();
+            }
+            Some(_) => {}
+            None => self.direct_all = false,
         }
         // (v287) Une ligne par minute au journal : de quoi constater un problème de réseau
         // (positions qui n'arrivent pas, lien lent, modifications sans réponse).
@@ -2483,7 +2544,7 @@ impl BuildNet {
                 "réseau (construction, {since:.0} s) : {:.0} positions envoyées par seconde \
                  (dont {:.0} rapprochées), {:.0} reçues par seconde de {} voisins ; {link} ; \
                  {} modifications annulées faute de réponse, {} blocs remis comme avant, {} \
-                 en attente",
+                 en attente ; voie directe : {:.0} positions par seconde à {} voisins",
                 (self.net[0] + self.net[1]) as f32 / since,
                 self.net[1] as f32 / since,
                 self.net[2] as f32 / since,
@@ -2491,13 +2552,16 @@ impl BuildNet {
                 self.net[3],
                 self.net[4],
                 self.pending.len(),
+                self.net[5] as f32 / since,
+                self.near.as_ref().map_or(0, |n| n.wanted().len()),
             );
-            self.net = [0; 5];
+            self.net = [0; 6];
             self.net_since = std::time::Instant::now();
         }
         let origin = self.origin;
         for o in self.others.values_mut() {
             o.seen += dt;
+            o.direct += dt;
             // Rejoint la dernière position reçue en un intervalle : vitesse régulière même
             // pour un joueur lointain (moins de messages). (v318) En places absolues (l'écart
             // le plus court sur la carte bouclée), montrée depuis l'origine de la partie.
@@ -2854,9 +2918,51 @@ impl BuildNet {
 
     /// Un autre joueur est vu à cette position (`home` : son numéro sur le relais du monde,
     /// si c'est lui qui le dit).
+    /// (v333) Voie directe des voisins donnée par le relais du monde (rien : plus de route).
+    pub fn set_near(&mut self, near: Option<minelib_net::fast::Near>) {
+        if near.is_none() {
+            self.direct_all = false;
+        }
+        self.near = near;
+    }
+
+    /// (v333) Une position venue directement d'un voisin (`peer` : son numéro sur le relais
+    /// du monde). Son pseudo est celui que le relais dit pour ce numéro, jamais celui qu'il
+    /// écrit lui-même ; inconnu (le relais ne l'a pas encore dit) : attendue.
+    pub fn near_pose(&mut self, peer: u64, data: &[u8]) {
+        let Some((_, pose)) = game::pose_of(data) else {
+            return;
+        };
+        let Some(pseudo) = self.names.get(&(None, peer)).cloned() else {
+            return;
+        };
+        self.player_seen_by(Some(peer), &pseudo, pose, true);
+    }
+
     fn player_seen(&mut self, home: Option<u64>, pseudo: &str, p: minelib_net::poses::Pose) {
+        self.player_seen_by(home, pseudo, p, false);
+    }
+
+    /// (v333) `direct` : venue directement de lui (voie directe des voisins) ; tant qu'il en
+    /// vient ainsi, celles du relais (plus vieilles, plus rares) ne comptent pas.
+    fn player_seen_by(
+        &mut self,
+        home: Option<u64>,
+        pseudo: &str,
+        p: minelib_net::poses::Pose,
+        direct: bool,
+    ) {
         // Valeurs d'un autre joueur : rien d'infini ni d'absurde n'entre dans le jeu.
         if !p.sane() {
+            return;
+        }
+        let key: String = pseudo.chars().take(16).collect();
+        if !direct
+            && self
+                .others
+                .get(&key)
+                .is_some_and(|o| o.direct < DIRECT_FRESH)
+        {
             return;
         }
         self.net[2] += 1;
@@ -2867,11 +2973,13 @@ impl BuildNet {
             proto::wrap_place(p.pos[2]),
         ];
         let origin = self.origin;
-        let key: String = pseudo.chars().take(16).collect();
         match self.others.get_mut(&key) {
             Some(o) => {
                 if home.is_some() {
                     o.id = home;
+                }
+                if direct {
+                    o.direct = 0.0;
                 }
                 // Intervalle mesuré (lissé) ; téléportation : on y va d'un coup.
                 o.interval = o.interval * 0.7 + o.seen.clamp(POS_FASTEST, 4.0) * 0.3;
@@ -2906,6 +3014,7 @@ impl BuildNet {
                         crouch: p.crouch,
                         speed: p.speed,
                         seen: 0.0,
+                        direct: if direct { 0.0 } else { f32::INFINITY },
                         ping: p.ping,
                         held: minelib_net::poses::Held::of(p.held),
                         back: minelib_net::poses::Held::back(p.held),
@@ -3109,6 +3218,198 @@ mod tests {
             let got = hz(others) as f32 * others as f32;
             assert!(got <= POS_BUDGET + 100.0 || hz(others) == 10, "{others} voisins : {got}");
         }
+    }
+
+    /// (v333) Voie directe des voisins : une position venue directement d'un voisin prend
+    /// le pseudo que le relais du monde donne à son numéro (pas celui qu'il écrit), et tant
+    /// qu'il en vient ainsi, les positions du relais (plus vieilles) ne comptent pas pour lui.
+    #[test]
+    fn positions_from_a_neighbour_directly_win_over_the_relay_copies() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut bn = BuildNet::new(tx, "Moi".into(), false);
+        let pose = |x: f64| minelib_net::poses::Pose {
+            pos: [x, 70.0, 10.0],
+            yaw: 0.5,
+            pitch: 0.1,
+            crouch: 0.0,
+            speed: 3.0,
+            ping: None,
+            held: 0,
+        };
+        let player = |x: f64| {
+            game::encode(&BuildMsg::Player {
+                pseudo: "Usurpateur".into(),
+                pos: [x, 70.0, 10.0],
+                yaw: 0.5,
+                pitch: 0.1,
+                crouch: 0.0,
+                speed: 3.0,
+                ping: 0,
+                held: 0,
+            })
+        };
+        // Numéro encore sans pseudo : attendue.
+        bn.near_pose(7, &player(10.0));
+        assert!(bn.others.is_empty());
+        bn.names.insert((None, 7), "Voisin".into());
+        bn.near_pose(7, &player(10.0));
+        assert!(!bn.others.contains_key("Usurpateur"));
+        let at = |bn: &BuildNet| bn.others.get("Voisin").map(|o| o.target[0]);
+        assert_eq!(at(&bn), Some(10.0));
+        // Copie du relais, plus vieille : ne compte pas.
+        bn.player_seen(Some(7), "Voisin", pose(9.0));
+        assert_eq!(at(&bn), Some(10.0));
+        // Plus rien de direct depuis un moment : le relais reprend.
+        bn.others.get_mut("Voisin").unwrap().direct = DIRECT_FRESH + 0.01;
+        bn.player_seen(Some(7), "Voisin", pose(12.0));
+        assert_eq!(at(&bn), Some(12.0));
+    }
+
+    /// (v333) Deux joueurs côte à côte dans un monde de construction, leurs liens avec le
+    /// relais par TURN : le relais leur donne une route directe ; chacun envoie alors ses
+    /// positions rapides par elle (256 par seconde), et au relais seulement 16 par seconde.
+    /// L'autre le voit par elle, sous le pseudo que le relais donne à son numéro.
+    #[test]
+    fn side_by_side_players_send_their_positions_directly_and_spare_the_relay() {
+        let _serial = crate::netgame::TURN_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (server, _engine) = minelib_p2p::turn::essai::MiniTurn::start_alone();
+        let nodes: Vec<minelib_p2p::Node> = (0..2)
+            .map(|_| {
+                let n = minelib_p2p::Node::start_offline().unwrap();
+                n.passeurs().start_turn(vec![server.source()]);
+                n
+            })
+            .collect();
+        let t = Instant::now();
+        while nodes.iter().any(|n| n.passeurs().turn_addr().is_none()) {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "pas d'adresse relayée"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let dir = std::env::temp_dir().join(format!("minelib-voisins-{}", rand::random::<u32>()));
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let login = |name: &str| {
+            let c = Client::spawn(h.addr.to_string(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: name.into(),
+                password: "motdepasse".into(),
+            });
+            let t = Instant::now();
+            let mut link = None;
+            loop {
+                match c.poll() {
+                    Some(Event::Link(l)) => link = Some(l),
+                    Some(Event::LoggedIn { .. }) => break,
+                    _ => std::thread::sleep(Duration::from_millis(2)),
+                }
+                assert!(t.elapsed() < Duration::from_secs(20), "connexion");
+            }
+            (c, link.expect("file d'envoi"))
+        };
+        let until = |c: &Client, f: &dyn Fn(&Event) -> bool| {
+            let t = Instant::now();
+            loop {
+                if let Some(e) = c.poll() {
+                    if f(&e) {
+                        return e;
+                    }
+                }
+                assert!(t.elapsed() < Duration::from_secs(20), "délai dépassé");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let (ca, la) = login("VoisinA");
+        ca.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [8; 32],
+            max_players: 0,
+            seed: 0,
+            terrain: 0,
+        });
+        let room = match until(&ca, &|e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let (cb, lb) = login("VoisinB");
+        cb.send(Cmd::Join(room));
+        until(&cb, &|e| matches!(e, Event::Joined { .. }));
+        for l in [&la, &lb] {
+            transport::push(l, &Request::LinkTurn { on: true });
+        }
+        let mut bots = [
+            (
+                ca,
+                BuildNet::new(la, "VoisinA".into(), true),
+                flat(),
+                Vec3::new(64.0, 11.0, 16.0),
+            ),
+            (
+                cb,
+                BuildNet::new(lb, "VoisinB".into(), false),
+                flat(),
+                Vec3::new(66.0, 11.0, 16.0),
+            ),
+        ];
+        let dt = 1.0 / 256.0;
+        let mut counted: Option<(Instant, [u32; 6])> = None;
+        let start = Instant::now();
+        let mut frame = 0u64;
+        while start.elapsed() < Duration::from_secs(12) {
+            for (c, bn, world, pos) in bots.iter_mut() {
+                while let Some(e) = c.poll() {
+                    match e {
+                        Event::FromZone { peer, chunk, data } => {
+                            bn.receive(peer, chunk, &data, world);
+                        }
+                        Event::Near(n) => bn.set_near(n),
+                        Event::NearPos { peer, data } => bn.near_pose(peer, &data),
+                        _ => {}
+                    }
+                }
+                let look = ((frame as f32 * 0.01).sin(), 0.0);
+                let _ = bn.update(world, *pos, look, 0.0, 0.0, 256.0, dt);
+            }
+            frame += 1;
+            // Une fois tout en place, deux secondes comptées chez A.
+            let ready = bots[0].1.direct_all && bots[1].1.direct_all;
+            match counted {
+                None if ready => counted = Some((Instant::now(), bots[0].1.net)),
+                Some((t, _)) if t.elapsed() >= Duration::from_secs(2) => break,
+                _ => {}
+            }
+            let pace = start + Duration::from_secs_f64(frame as f64 / 256.0);
+            if let Some(w) = pace.checked_duration_since(Instant::now()) {
+                std::thread::sleep(w);
+            }
+        }
+        let (t, before) = counted.expect("la voie directe ne s'est jamais ouverte");
+        let secs = t.elapsed().as_secs_f32();
+        let a = &bots[0].1;
+        let relay_hz = (a.net[0] + a.net[1] - before[0] - before[1]) as f32 / secs;
+        let direct_hz = (a.net[5] - before[5]) as f32 / secs;
+        eprintln!(
+            "VOISINS : {relay_hz:.0} positions par seconde au relais, {direct_hz:.0} en direct"
+        );
+        assert!(relay_hz < 24.0, "au relais : {relay_hz:.0} par seconde");
+        assert!(direct_hz > 150.0, "en direct : {direct_hz:.0} par seconde");
+        let b = &bots[1].1;
+        let seen = b.others.get("VoisinA").expect("B voit A");
+        assert!(seen.direct < DIRECT_FRESH, "B voit A par la voie directe");
+        drop(bots);
+        drop(nodes);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Un joueur simulé : sa connexion, son monde, ce qu'il a changé.

@@ -53,7 +53,7 @@ pub fn addr(route: u64) -> CustomAddr {
     CustomAddr::from_parts(TRANSPORT_ID, &route.to_le_bytes())
 }
 
-fn route_of(a: &CustomAddr) -> Option<u64> {
+pub(crate) fn route_of(a: &CustomAddr) -> Option<u64> {
     (a.id() == TRANSPORT_ID).then(|| a.data().try_into().ok().map(u64::from_le_bytes))?
 }
 
@@ -384,6 +384,7 @@ impl PasseurTransport {
     pub(crate) fn register(&self, node: [u8; 32]) {
         fast::set_tunnel_hook(on_route);
         fast::set_turn_find(turn_find);
+        fast::set_link_probe(crate::link_probe);
         NODES.lock().unwrap().push((node, Arc::downgrade(&self.0)));
         let _ = self.0.node.set(node);
         // (v329) Une adresse chez un serveur TURN, si ce programme en veut (`enable_turn`)

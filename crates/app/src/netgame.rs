@@ -10,7 +10,7 @@
 //! - Les grenades lancées sont envoyées à tous : chacun les simule (fumée, flash, feu au
 //!   même endroit) ; l'hôte en tire les dégâts.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::Sender;
 
 use glam::Vec3;
@@ -27,6 +27,11 @@ use crate::cs::{self, Ev, Hurt, Match, Place};
 use crate::player::{MoveInput, Other, Player, HALF_WIDTH, HEIGHT};
 use crate::player_model::HitZone;
 use crate::weapons::WEAPONS;
+
+/// (v333) Essais : ceux qui donnent des adresses relayées (TURN) aux nœuds du programme, un
+/// à la fois (voie rapide des parties FPS ici, voie directe des voisins dans `buildnet`).
+#[cfg(test)]
+pub(crate) static TURN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Un état envoyé aux invités tous les 4 pas (64 fois par seconde).
 const SNAPSHOT_EVERY: u32 = 4;
@@ -47,6 +52,20 @@ const FAST_INPUTS_TURN: usize = 4;
 /// Le relais en porte quatre fois moins, et le serveur TURN aussi quand ses liens passent
 /// par lui.
 const RELAY_SNAPSHOT_EVERY: u32 = 16;
+/// (v333) Les mêmes quand la voie rapide passe par TURN : un sur seize (4 par seconde). Ses
+/// liens avec le relais passent alors eux aussi par TURN : par lui, chaque copie compte
+/// quatre fois dans le quota, et il n'est jamais plus rapide qu'elle.
+const RELAY_SNAPSHOT_EVERY_TURN: u32 = 64;
+/// (v333) Voie rapide par TURN en bon état : les entrées partent par le relais tous les
+/// tant de pas (16 par seconde à 256 images ; elles arrivent par TURN entre-temps).
+const RELAY_INPUTS_EVERY_TURN: usize = 16;
+/// (v333) Lien qui ne suit pas : pas de voie rapide, et un ping par le relais au-dessus
+/// du double du meilleur vu (et de 80 ms de plus au moins) pendant deux secondes. Le joueur
+/// descend d'un palier (`ToHost::Rate` : 256, puis 128, puis 64 mises à jour par seconde,
+/// rien que les états complets), et remonte d'un palier après `LOW_RATE_FOR` secondes, ou
+/// d'un coup quand la voie rapide les porte.
+const LOW_RATE_STRIKES: u8 = 2;
+const LOW_RATE_FOR: f32 = 60.0;
 /// Voie rapide : messages venus des passeurs que l'invité regarde avant de dire s'il
 /// reçoit plus vite par eux ou par le relais (`Guest::fast_vote`).
 const FAST_VOTES: u8 = 32;
@@ -1514,6 +1533,11 @@ pub struct Host {
     /// (v274) Demi-secondes de suite où un passeur (joueur, numéro) a été trouvé muet ou
     /// lent (`fast_check`).
     fast_marks: HashMap<(u64, u8), u8>,
+    /// (v333) Joueurs dont chaque invité a reçu le pseudo par le relais (sans perte) : il ne
+    /// part plus dans ses états complets ; et invités qui ne reçoivent plus que les états
+    /// complets (`ToHost::Rate`).
+    named: std::sync::Mutex<HashMap<u64, HashSet<u64>>>,
+    low_rate: HashMap<u64, u8>,
 }
 
 pub struct Guest {
@@ -1602,6 +1626,14 @@ pub struct Guest {
     sent: VecDeque<(u32, std::time::Instant)>,
     ping: Option<f32>,
     ping_timer: f32,
+    /// (v333) Pseudos des joueurs : l'hôte ne les redit plus une fois qu'on les a.
+    pseudos: HashMap<u64, String>,
+    /// (v333) Meilleur ping vu (remonte doucement), secondes de suite où le lien ne suivait
+    /// pas, et le palier demandé à l'hôte : une mise à jour de positions tous les combien de
+    /// pas (1, 2, 4), depuis combien de temps.
+    ping_best: Option<f32>,
+    low_strikes: u8,
+    rate: (u8, f32),
 }
 
 pub enum NetGame {
@@ -1826,6 +1858,8 @@ impl NetGame {
             fast: None,
             fast_groups: Vec::new(),
             fast_marks: HashMap::new(),
+            named: Default::default(),
+            low_rate: HashMap::new(),
         };
         h.events(ev, &mut out);
         h.out = out;
@@ -2281,6 +2315,10 @@ impl NetGame {
             sent: VecDeque::new(),
             ping: None,
             ping_timer: 1.0,
+            pseudos: HashMap::new(),
+            ping_best: None,
+            low_strikes: 0,
+            rate: (1, 0.0),
             predicted: VecDeque::new(),
             fast: None,
             fast_votes: 0,
@@ -2730,9 +2768,16 @@ impl NetGame {
                 // image.
                 g.held_frames = g.held_frames.saturating_add(1);
                 let healthy = !g.fast_slow && g.fast.as_ref().is_some_and(|f| f.open(0));
-                let due = !healthy
-                    || g.outbox.len() >= RELAY_INPUTS_EVERY
-                    || usize::from(g.held_frames) >= RELAY_INPUTS_EVERY;
+                // (v333) Par TURN, 16 par seconde suffisent ; et un lien qui ne suit pas
+                // (`low`) les reçoit regroupées par 4, même sans voie rapide.
+                let every = if healthy && g.fast.as_ref().is_some_and(|f| f.on_turn(0)) {
+                    RELAY_INPUTS_EVERY_TURN
+                } else {
+                    RELAY_INPUTS_EVERY
+                };
+                let due = (!healthy && g.rate.0 == 1)
+                    || g.outbox.len() >= every
+                    || usize::from(g.held_frames) >= every;
                 if !g.outbox.is_empty() && !due {
                     g.fast_inputs(weapon);
                 }
@@ -2757,11 +2802,13 @@ impl NetGame {
                 g.count_stall(dt);
                 // (v165) Son ping, dit à l'hôte chaque seconde (tableau des scores).
                 g.ping_timer -= dt;
+                g.rate.1 += dt;
                 if g.ping_timer <= 0.0 {
                     g.ping_timer = 1.0;
                     if let Some(ms) = g.ping {
                         g.to_host(&ToHost::Ping(ms.round().clamp(1.0, 9999.0) as u16));
                     }
+                    g.watch_rate();
                 }
                 let view_tick = (g.clock - g.delay).max(0.0) as u32;
                 for (w, origin, dirs) in shots {
@@ -3038,6 +3085,8 @@ impl NetGame {
             fast: None,
             fast_groups: Vec::new(),
             fast_marks: HashMap::new(),
+            named: Default::default(),
+            low_rate: HashMap::new(),
         }));
         if let NetGame::Host(h) = self {
             h.playing = h.m.players.contains_key(&0);
@@ -4238,6 +4287,15 @@ impl Host {
             ToHost::Ping(ms) => {
                 self.pings.insert(peer, ms);
             }
+            // (v333) Son lien ne suit pas (ou de nouveau) : une mise à jour de positions
+            // tous les `every` pas (1, 2 ou 4 : les états complets seuls).
+            ToHost::Rate { every } => {
+                if matches!(every, 2 | 4) {
+                    self.low_rate.insert(peer, every);
+                } else {
+                    self.low_rate.remove(&peer);
+                }
+            }
             ToHost::Throw { nade, pos, vel } => {
                 let alive = self.m.players.get(&peer).is_some_and(|p| p.alive);
                 let near = self
@@ -4575,7 +4633,10 @@ impl Host {
                     .fast
                     .as_ref()
                     .is_some_and(|f| f.send_one(id, &game::encode(&moves)));
-                if !fast {
+                // (v333) Lien qui ne suit pas : par le relais, une sur `every` (128 par
+                // seconde avec les états complets), ou aucune (64).
+                let every = u32::from(self.low_rate.get(&id).copied().unwrap_or(1));
+                if !fast && self.tick.is_multiple_of(every) {
                     self.send_to(id, &moves);
                     // Ce joueur reçoit plus vite par le relais : une sonde de temps en
                     // temps par les passeurs, pour qu'il dise quand ce n'est plus vrai.
@@ -4587,6 +4648,14 @@ impl Host {
                 }
                 continue;
             }
+            // (v333) Le pseudo d'un joueur que cet invité a déjà (reçu par le relais, donc
+            // sans perte) ne part plus.
+            if let Some(named) = self.named.lock().unwrap().get(&id) {
+                for p in players.iter_mut().filter(|p| named.contains(&p.id)) {
+                    p.pseudo.clear();
+                }
+            }
+            let ids: Vec<u64> = players.iter().map(|p| p.id).collect();
             let state = ToPeer::Snapshot {
                 tick: self.tick,
                 ack: r.ack,
@@ -4604,9 +4673,21 @@ impl Host {
                 .as_ref()
                 .is_some_and(|f| f.send_one(id, &game::encode(&state)));
             // (v331) Parti par la voie rapide (elle est ouverte, et pas plus lente que le
-            // relais) : par le relais, seulement un sur quatre.
-            if !fast || self.tick.is_multiple_of(RELAY_SNAPSHOT_EVERY) {
+            // relais) : par le relais, seulement un sur quatre. (v333) Un sur seize quand
+            // elle passe par TURN.
+            let every = if self.fast.as_ref().is_some_and(|f| f.on_turn(id)) {
+                RELAY_SNAPSHOT_EVERY_TURN
+            } else {
+                RELAY_SNAPSHOT_EVERY
+            };
+            if !fast || self.tick.is_multiple_of(every) {
                 self.send_to(id, &state);
+                self.named
+                    .lock()
+                    .unwrap()
+                    .entry(id)
+                    .or_default()
+                    .extend(ids);
             }
         }
     }
@@ -4831,7 +4912,12 @@ impl Guest {
         // (v331) Les états complets ne viennent plus par le relais qu'aux pas multiples de
         // `RELAY_SNAPSHOT_EVERY` : seules votent les positions des trois pas qui précèdent
         // (celles qu'un relais plus rapide devance, comme avant d'un état sur quatre).
-        if !ping && tick % RELAY_SNAPSHOT_EVERY < RELAY_SNAPSHOT_EVERY - SNAPSHOT_EVERY + 1 {
+        let every = if self.fast.as_ref().is_some_and(|f| f.on_turn(0)) {
+            RELAY_SNAPSHOT_EVERY_TURN
+        } else {
+            RELAY_SNAPSHOT_EVERY
+        };
+        if !ping && tick % every < every - SNAPSHOT_EVERY + 1 {
             return;
         }
         self.fast_votes += 1;
@@ -4880,6 +4966,62 @@ impl Guest {
 
     /// (v165) L'hôte a pris en compte les entrées jusqu'au numéro `ack` : le temps depuis
     /// leur envoi donne le ping (lissé).
+    /// (v333) Une fois par seconde : le lien suit-il 256 positions par seconde ? Sans voie
+    /// rapide, tout vient par le relais, qui met en file ce qu'il ne peut pas passer : le
+    /// ping monte. Deux secondes au-dessus du double du meilleur (et de 80 ms de plus au
+    /// moins) : on ne demande plus que les états complets (64 par seconde) ; de nouveau tout
+    /// quand la voie rapide les porte, ou au bout de `LOW_RATE_FOR` (si le lien ne suit
+    /// toujours pas, le ping remonte et on y revient).
+    fn watch_rate(&mut self) {
+        let Some(ms) = self.ping else { return };
+        let best = match self.ping_best {
+            // (Il remonte d'une milliseconde par seconde : un chemin qui change ne laisse pas
+            // un meilleur impossible.)
+            Some(b) => (b + 1.0).min(ms),
+            None => ms,
+        };
+        self.ping_best = Some(best);
+        let carried = !self.fast_slow && self.fast.as_ref().is_some_and(|f| f.open(0));
+        let behind = ms > (best * 2.0).max(best + 80.0);
+        self.low_strikes = if !carried && behind {
+            self.low_strikes + 1
+        } else {
+            0
+        };
+        let (every, at) = self.rate;
+        let next = if carried {
+            1
+        } else if self.low_strikes >= LOW_RATE_STRIKES && every < 4 {
+            every * 2
+        } else if every > 1 && at >= LOW_RATE_FOR && !behind {
+            every / 2
+        } else {
+            every
+        };
+        if next != every {
+            self.rate = (next, 0.0);
+            self.low_strikes = 0;
+            self.to_host(&ToHost::Rate { every: next });
+            log::info!(
+                "réseau (FPS) : {} mises à jour par seconde (ping {ms:.0} ms, meilleur {best:.0} ms)",
+                256 / u32::from(next)
+            );
+        }
+    }
+
+    /// (v333) Les pseudos qui manquent dans un état complet sont ceux qu'on a déjà.
+    fn fill_pseudos(&mut self, players: &mut [NetPlayer]) {
+        for p in players {
+            if p.pseudo.is_empty() {
+                if let Some(n) = self.pseudos.get(&p.id) {
+                    p.pseudo = n.clone();
+                }
+            } else {
+                self.pseudos.insert(p.id, p.pseudo.clone());
+            }
+        }
+    }
+
     fn acked(&mut self, ack: u32) {
         let mut rtt = None;
         while let Some(&(seq, t)) = self.sent.front() {
@@ -4936,9 +5078,11 @@ impl Guest {
                 you,
                 hp,
                 alive,
-                players,
+                mut players,
                 hud,
             } => {
+                // (v333) Pseudos déjà connus : l'hôte ne les redit pas.
+                self.fill_pseudos(&mut players);
                 // (v274) Déjà reçu par l'autre chemin (relais ou passeurs), ou dépassé par
                 // un état complet plus récent : rien à en tirer.
                 if self.snap_tick.is_some_and(|s| tick <= s) {
@@ -5522,8 +5666,8 @@ mod tests {
 
     /// (v331) Les essais de voie rapide qui ont des passeurs et ceux qui passent par TURN,
     /// un à la fois : les jeux d'essai disent au relais les adresses relayées de tous les
-    /// nœuds du programme.
-    static FAST_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// nœuds du programme. (v333 : partagé avec ceux de la voie directe des voisins.)
+    use super::TURN_TESTS as FAST_TESTS;
 
     /// Voie rapide (`minelib_net::fast`) : une partie à deux par un vrai relais, avec deux
     /// passeurs. Une fois la voie ouverte et la manche lancée :
@@ -6893,6 +7037,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// (v333) Un lien qui ne suit pas (pas de voie rapide, ping qui monte) : l'invité
+    /// descend d'un palier toutes les deux secondes, 128 puis 64 mises à jour par seconde,
+    /// et le dit à l'hôte ; il remonte d'un palier par minute quand le lien suit de nouveau.
+    /// L'hôte n'envoie plus de positions par le relais qu'une fois sur deux, puis jamais
+    /// (les états complets seuls).
+    #[test]
+    fn a_link_that_cannot_keep_up_steps_down_to_128_then_64_updates_and_back() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut g = NetGame::guest_quiet(tx, [0; 32]);
+        let NetGame::Guest(gs) = &mut g else {
+            unreachable!()
+        };
+        let said = |rx: &std::sync::mpsc::Receiver<Inbound>| -> Vec<u8> {
+            let mut out = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                let Inbound::Push(bytes) = m else { continue };
+                let Some(Request::ToHost { data }) = game::decode::<Request>(&bytes) else {
+                    continue;
+                };
+                if let Some(ToHost::Rate { every }) = game::decode::<ToHost>(&data) {
+                    out.push(every);
+                }
+            }
+            out
+        };
+        for ms in [40.0, 41.0, 45.0] {
+            gs.ping = Some(ms);
+            gs.watch_rate();
+        }
+        assert_eq!(gs.rate.0, 1, "le lien suit");
+        for _ in 0..2 {
+            gs.ping = Some(300.0);
+            gs.watch_rate();
+        }
+        assert_eq!(gs.rate.0, 2, "128 par seconde");
+        for _ in 0..2 {
+            gs.watch_rate();
+        }
+        assert_eq!(gs.rate.0, 4, "64 par seconde");
+        for _ in 0..3 {
+            gs.watch_rate();
+        }
+        assert_eq!(gs.rate.0, 4, "jamais moins");
+        assert_eq!(said(&rx), vec![2, 4]);
+        // Le lien suit de nouveau : un palier par minute.
+        gs.ping = Some(60.0);
+        gs.rate.1 = LOW_RATE_FOR;
+        gs.watch_rate();
+        assert_eq!(gs.rate.0, 2);
+        gs.rate.1 = LOW_RATE_FOR;
+        gs.watch_rate();
+        assert_eq!(gs.rate.0, 1);
+        assert_eq!(said(&rx), vec![2, 1]);
+        // Chez l'hôte.
+        let (htx, _hrx) = std::sync::mpsc::channel();
+        let mut h = NetGame::host(htx, "Hote".into(), FpsMap::default(), [0; 32], Vec3::ZERO);
+        let mut world = World::new(0);
+        h.peer_joined(9, "Invite".into());
+        let rate = |every: u8| game::encode(&ToHost::Rate { every });
+        h.receive(Some(9), &rate(4), &mut world);
+        assert_eq!(host(&mut h).low_rate.get(&9), Some(&4));
+        h.receive(Some(9), &rate(1), &mut world);
+        assert!(host(&mut h).low_rate.is_empty());
     }
 
     fn host(g: &mut NetGame) -> &mut Host {

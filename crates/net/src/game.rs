@@ -78,12 +78,19 @@ impl Pose {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct NetPlayer {
     pub id: u64,
+    /// (v333) Vide sur le fil quand celui qui reçoit l'a déjà (voir `Host::snapshots`).
     pub pseudo: String,
     pub pos: [f32; 3],
+    /// (v333) Sur le fil comme dans `Pose` : les angles en 65536e de tour, l'accroupi et la
+    /// vitesse sur un octet (16 octets de moins par joueur, 64 fois par seconde).
+    #[serde(with = "turn16")]
     pub yaw: f32,
+    #[serde(with = "turn16")]
     pub pitch: f32,
+    #[serde(with = "unit8")]
     pub crouch: f32,
     /// Vitesse au sol (animation de marche).
+    #[serde(with = "tenth8")]
     pub speed: f32,
     pub hp: u8,
     pub alive: bool,
@@ -96,6 +103,39 @@ pub struct NetPlayer {
     pub team: u8,
     /// `FLAG_BOMB`, `FLAG_KIT`, `FLAG_DEFUSING`, `FLAG_PLANTING`.
     pub flags: u8,
+}
+
+/// (v333) Un angle (radians) en 65536e de tour sur le fil, comme dans `Pose`.
+mod turn16 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(a: &f32, s: S) -> Result<S::Ok, S::Error> {
+        ((*a / std::f32::consts::TAU * 65536.0).round() as i64 as i16).serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+        Ok(i16::deserialize(d)? as f32 / 65536.0 * std::f32::consts::TAU)
+    }
+}
+
+/// (v333) Une valeur de 0 à 1 sur un octet.
+mod unit8 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+        ((v.clamp(0.0, 1.0) * 255.0).round() as u8).serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+        Ok(u8::deserialize(d)? as f32 / 255.0)
+    }
+}
+
+/// (v333) Une vitesse au dixième, sur un octet (25,5 au plus).
+mod tenth8 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+        ((v * 10.0).clamp(0.0, 255.0).round() as u8).serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+        Ok(u8::deserialize(d)? as f32 / 10.0)
+    }
 }
 
 pub const CT: u8 = 0;
@@ -502,6 +542,13 @@ pub enum ToHost {
         first_seq: u32,
         inputs: Vec<NetInput>,
         weapon: u8,
+    },
+    /// (v333) Le lien de ce joueur avec l'hôte ne suit pas 256 positions par seconde (pas de
+    /// voie rapide, et le relais prend du retard) : une mise à jour de positions tous les
+    /// `every` pas seulement (1 : 256 par seconde ; 2 : 128 ; 4 : plus que les états
+    /// complets, 64).
+    Rate {
+        every: u8,
     },
 }
 

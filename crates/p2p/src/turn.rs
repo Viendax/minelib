@@ -255,6 +255,15 @@ fn xor_decode(v: &[u8], tid: &[u8; 12]) -> Option<SocketAddr> {
 }
 
 /// ChannelData : numéro de canal, longueur, contenu (sans bourrage : c'est de l'UDP).
+/// (v333) Sur TCP, chaque message tient sur un multiple de 4 octets (RFC 8656, 12.5).
+fn pad4(p: &[u8]) -> Vec<u8> {
+    let mut v = p.to_vec();
+    while v.len() & 3 != 0 {
+        v.push(0);
+    }
+    v
+}
+
 fn channel_data(ch: u16, data: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(4 + data.len());
     p.extend_from_slice(&ch.to_be_bytes());
@@ -507,8 +516,17 @@ impl State {
 }
 
 /// Client TURN d'un transport : une allocation, chez le premier serveur qui en donne une.
+/// (v333) Par UDP, ou par TCP quand le serveur ne répond pas en UDP (réseau d'entreprise,
+/// d'école, qui ne laisse sortir que TCP) : l'adresse relayée reste en UDP, les autres
+/// bouts n'y voient aucune différence.
 pub struct TurnClient {
     sock: Arc<tokio::net::UdpSocket>,
+    /// (v333) Allocation par TCP : ce qui part au serveur passe par cette file (le fil
+    /// d'écriture de la connexion, avec son numéro), rien sinon. `via_tcp` : la dernière
+    /// allocation s'est faite par TCP, la suivante y va d'abord (sans attendre UDP).
+    tcp: Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Vec<u8>>)>>,
+    tcp_n: std::sync::atomic::AtomicU64,
+    via_tcp: std::sync::atomic::AtomicBool,
     st: Mutex<State>,
     wake: Notify,
     stop: watch::Sender<bool>,
@@ -550,6 +568,12 @@ impl TurnClient {
         let (stop, stopped) = watch::channel(false);
         let me = Arc::new(TurnClient {
             sock: sock.clone(),
+            tcp: Mutex::new(None),
+            tcp_n: Default::default(),
+            // (Réglage d'essai, ou de secours pour un réseau où UDP passe mal : TCP d'abord.)
+            via_tcp: std::sync::atomic::AtomicBool::new(
+                std::env::var_os("MINELIB_TURN_TCP").is_some_and(|v| !v.is_empty()),
+            ),
             st: Mutex::new(State {
                 retry: RETRY_MIN,
                 ..Default::default()
@@ -643,13 +667,111 @@ impl TurnClient {
             Some(ch) => {
                 st.sent += 1;
                 drop(st);
-                let _ = self.sock.try_send_to(&channel_data(ch, data), server);
+                self.to_server_now(&channel_data(ch, data), server);
             }
             None => {
                 drop(st);
                 self.wake.notify_one();
             }
         }
+    }
+
+    /// (v333) Un message au serveur, tout de suite : par la connexion TCP s'il y en a une
+    /// (complété à un multiple de 4 octets, comme le veut TURN sur TCP), sinon en UDP.
+    fn to_server_now(&self, p: &[u8], server: SocketAddr) {
+        if let Some((_, tx)) = self.tcp.lock().unwrap().as_ref() {
+            let _ = tx.send(pad4(p));
+            return;
+        }
+        let _ = self.sock.try_send_to(p, server);
+    }
+
+    async fn to_server(&self, p: &[u8], server: SocketAddr) {
+        let tx = self.tcp.lock().unwrap().as_ref().map(|(_, tx)| tx.clone());
+        match tx {
+            Some(tx) => {
+                let _ = tx.send(pad4(p));
+            }
+            None => {
+                let _ = self.sock.send_to(p, server).await;
+            }
+        }
+    }
+
+    /// (v333) Connexion TCP au serveur `server` : un fil écrit ce qui part (il s'arrête,
+    /// et ferme, quand la file est lâchée), un autre lit les messages (STUN, ou données
+    /// d'un canal complétées à 4 octets) et les traite comme ceux venus en UDP. Fermée par
+    /// le serveur : l'allocation est perdue, une autre est demandée.
+    async fn connect_tcp(self: &Arc<Self>, server: SocketAddr) -> bool {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(Ok(stream)) = tokio::time::timeout(
+            Duration::from_secs(4),
+            tokio::net::TcpStream::connect(server),
+        )
+        .await
+        else {
+            return false;
+        };
+        let _ = stream.set_nodelay(true);
+        let (mut rd, mut wr) = stream.into_split();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            while let Some(b) = rx.recv().await {
+                if wr.write_all(&b).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let n = self
+            .tcp_n
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.tcp.lock().unwrap() = Some((n, tx));
+        let weak = Arc::downgrade(self);
+        let mut stopped = self.stop.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let mut head = [0u8; 4];
+                tokio::select! {
+                    r = rd.read_exact(&mut head) => if r.is_err() { break },
+                    _ = stopped.changed() => return,
+                }
+                let len = u16::from_be_bytes([head[2], head[3]]) as usize;
+                let total = if (0x40..0x80).contains(&head[0]) {
+                    4 + ((len + 3) & !3)
+                } else {
+                    HEADER + len
+                };
+                let mut frame = vec![0u8; total];
+                frame[..4].copy_from_slice(&head);
+                tokio::select! {
+                    r = rd.read_exact(&mut frame[4..]) => if r.is_err() { break },
+                    _ = stopped.changed() => return,
+                }
+                match weak.upgrade() {
+                    Some(me) => me.on_packet(server, &frame),
+                    None => return,
+                }
+            }
+            // La connexion est tombée : si c'est toujours la nôtre, l'allocation est perdue.
+            let Some(me) = weak.upgrade() else { return };
+            let ours = me.tcp.lock().unwrap().as_ref().is_some_and(|t| t.0 == n);
+            if ours {
+                *me.tcp.lock().unwrap() = None;
+                let had = {
+                    let mut st = me.st.lock().unwrap();
+                    let had = st.relayed.is_some();
+                    st.lost();
+                    st.server = None;
+                    had
+                };
+                log::info!("TURN : connexion TCP fermée, nouvelle allocation");
+                if had {
+                    (me.told)(None);
+                }
+                me.wake.notify_one();
+            }
+        });
+        true
     }
 
     fn on_packet(&self, from: SocketAddr, p: &[u8]) {
@@ -715,8 +837,12 @@ impl TurnClient {
             };
             let mut rx = rx;
             let mut got = None;
-            for wait in RTO {
-                let _ = self.sock.send_to(&pkt, server).await;
+            // (v333) Par TCP, rien ne se perd : envoyée une fois, la réponse est attendue
+            // aussi longtemps qu'en UDP avec ses réémissions.
+            let tcp = self.tcp.lock().unwrap().is_some();
+            let waits: &[u64] = if tcp { &[7500] } else { &RTO };
+            for &wait in waits {
+                self.to_server(&pkt, server).await;
                 tokio::select! {
                     r = &mut rx => {
                         got = r.ok();
@@ -838,6 +964,8 @@ impl TurnClient {
             st.server = None;
             st.auth = None;
         }
+        // (v333) L'ancienne connexion TCP, s'il y en avait une, se ferme.
+        *self.tcp.lock().unwrap() = None;
         let Some(c) = creds.filter(|_| !servers.is_empty()) else {
             self.failed(had, "pas d'identifiants");
             return;
@@ -858,7 +986,32 @@ impl TurnClient {
                 (A_TRANSPORT, vec![17, 0, 0, 0]),
                 (A_LIFETIME, LIFETIME.to_be_bytes().to_vec()),
             ];
-            match self.transact(ALLOCATE, &attrs).await {
+            // (v333) UDP d'abord, puis TCP s'il ne répond pas (ou TCP d'abord, si c'est par
+            // là que la dernière allocation s'est faite). Un refus net (identifiants, quota)
+            // vaut pour les deux.
+            let tcp_first = self.via_tcp.load(std::sync::atomic::Ordering::Relaxed);
+            let mut got = Err(0);
+            for tcp in [tcp_first, !tcp_first] {
+                *self.tcp.lock().unwrap() = None;
+                if tcp && !self.connect_tcp(server).await {
+                    continue;
+                }
+                got = self.transact(ALLOCATE, &attrs).await;
+                if !matches!(got, Err(0)) {
+                    break;
+                }
+                if !tcp {
+                    log::info!("TURN : pas de réponse en UDP, essai par TCP");
+                }
+            }
+            let tcp = self.tcp.lock().unwrap().is_some();
+            if got.is_err() {
+                *self.tcp.lock().unwrap() = None;
+            } else {
+                self.via_tcp
+                    .store(tcp, std::sync::atomic::Ordering::Relaxed);
+            }
+            match got {
                 Ok(m) => {
                     let Some(SocketAddr::V4(relayed)) = m.addr(A_RELAYED) else {
                         continue;
@@ -890,6 +1043,7 @@ impl TurnClient {
             st.server = None;
             st.auth = None;
         }
+        *self.tcp.lock().unwrap() = None;
         self.failed(had, "aucun serveur ne répond");
     }
 
@@ -941,13 +1095,14 @@ impl TurnClient {
             }
             // Refusé pour de bon (adresse interdite, canal déjà pris ailleurs) : oublié.
             Err(400) | Err(403) => {
+                log::info!("TURN : canal refusé");
                 if st.peers.get(&peer).is_some_and(|p| p.channel == ch) {
                     st.peers.remove(&peer);
                     st.channels.remove(&ch);
                     st.freed.push((ch, Instant::now()));
                 }
             }
-            Err(_) => {}
+            Err(code) => log::info!("TURN : canal sans réponse ({code}), nouvel essai"),
         }
     }
 }
@@ -967,7 +1122,26 @@ pub mod essai {
         /// Allocations faites, et paquets relayés (essais).
         pub allocations: Arc<std::sync::atomic::AtomicUsize>,
         pub relayed: Arc<std::sync::atomic::AtomicUsize>,
+        /// (v333) Octets relayés (essais : ce qu'un serveur TURN compterait), et UDP coupé
+        /// (un réseau qui ne laisse sortir que TCP : le serveur ne répond plus en UDP).
+        pub bytes: Arc<std::sync::atomic::AtomicU64>,
+        pub udp_off: Arc<std::sync::atomic::AtomicBool>,
         _stop: watch::Sender<bool>,
+    }
+
+    /// (v333) Par où répondre à un client : UDP, ou sa connexion TCP.
+    type Backs = Arc<Mutex<HashMap<SocketAddr, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>;
+
+    async fn back(backs: &Backs, sock: &tokio::net::UdpSocket, to: SocketAddr, p: &[u8]) {
+        let tcp = backs.lock().unwrap().get(&to).cloned();
+        match tcp {
+            Some(tx) => {
+                let _ = tx.send(super::pad4(p));
+            }
+            None => {
+                let _ = sock.send_to(p, to).await;
+            }
+        }
     }
 
     struct Alloc {
@@ -984,24 +1158,97 @@ pub mod essai {
     impl MiniTurn {
         pub fn start(rt: &tokio::runtime::Handle) -> MiniTurn {
             let _g = rt.enter();
-            let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            // (v333) UDP et TCP sur le même numéro de port, comme un vrai serveur.
+            let (std_sock, tcp) = loop {
+                let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                let port = u.local_addr().unwrap().port();
+                if let Ok(t) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    break (u, t);
+                }
+            };
             std_sock.set_nonblocking(true).unwrap();
+            tcp.set_nonblocking(true).unwrap();
             let addr = std_sock.local_addr().unwrap();
             let sock = Arc::new(tokio::net::UdpSocket::from_std(std_sock).unwrap());
+            let tcp = tokio::net::TcpListener::from_std(tcp).unwrap();
             let (stop, mut stopped) = watch::channel(false);
             let allocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let relayed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let udp_off = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (allocs2, relayed2) = (allocations.clone(), relayed.clone());
+            let (bytes2, udp_off2) = (bytes.clone(), udp_off.clone());
+            let backs: Backs = Default::default();
+            // Connexions TCP : chacune lue dans son fil, ses messages traités comme ceux
+            // venus en UDP (par la même boucle).
+            let (frames_tx, mut frames) =
+                tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+            {
+                let backs = backs.clone();
+                let mut stopped = stopped.clone();
+                rt.spawn(async move {
+                    loop {
+                        let (stream, from) = tokio::select! {
+                            r = tcp.accept() => match r { Ok(x) => x, Err(_) => continue },
+                            _ = stopped.changed() => return,
+                        };
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let (mut rd, mut wr) = stream.into_split();
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                        backs.lock().unwrap().insert(from, tx);
+                        tokio::spawn(async move {
+                            while let Some(b) = rx.recv().await {
+                                if wr.write_all(&b).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        let frames_tx = frames_tx.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let mut head = [0u8; 4];
+                                if rd.read_exact(&mut head).await.is_err() {
+                                    return;
+                                }
+                                let len = u16::from_be_bytes([head[2], head[3]]) as usize;
+                                let total = if (0x40..0x80).contains(&head[0]) {
+                                    4 + ((len + 3) & !3)
+                                } else {
+                                    HEADER + len
+                                };
+                                let mut f = vec![0u8; total];
+                                f[..4].copy_from_slice(&head);
+                                if rd.read_exact(&mut f[4..]).await.is_err() {
+                                    return;
+                                }
+                                if frames_tx.send((f, from)).is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            let backs2 = backs.clone();
             rt.spawn(async move {
+                let backs = backs2;
                 let allocs: Arc<Mutex<HashMap<SocketAddr, Alloc>>> = Default::default();
                 let key = long_term_key(MINI_USER, MINI_REALM, MINI_PASS);
                 let mut buf = vec![0u8; 2048];
                 loop {
-                    let (n, from) = tokio::select! {
-                        r = sock.recv_from(&mut buf) => match r { Ok(x) => x, Err(_) => continue },
+                    let (p, from) = tokio::select! {
+                        r = sock.recv_from(&mut buf) => match r {
+                            Ok((n, from)) => {
+                                if udp_off2.load(std::sync::atomic::Ordering::Relaxed) {
+                                    continue;
+                                }
+                                (buf[..n].to_vec(), from)
+                            }
+                            Err(_) => continue,
+                        },
+                        f = frames.recv() => match f { Some(x) => x, None => continue },
                         _ = stopped.changed() => return,
                     };
-                    let p = buf[..n].to_vec();
                     if p.len() >= 4 && (0x40..0x80).contains(&p[0]) {
                         let ch = u16::from_be_bytes([p[0], p[1]]);
                         let len = u16::from_be_bytes([p[2], p[3]]) as usize;
@@ -1010,6 +1257,10 @@ pub mod essai {
                             if let Some(peer) = a.channels.get(&ch) {
                                 let _ = a.relay.try_send_to(data, *peer);
                                 relayed2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                bytes2.fetch_add(
+                                    data.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                         }
                         continue;
@@ -1036,7 +1287,7 @@ pub mod essai {
                         let mut a = err(401);
                         a.push((A_REALM, MINI_REALM.as_bytes().to_vec()));
                         a.push((A_NONCE, b"nonce-essai".to_vec()));
-                        let _ = sock.send_to(&reply(FAILURE, a, false), from).await;
+                        back(&backs, &sock, from, &reply(FAILURE, a, false)).await;
                         continue;
                     }
                     let out = match m.method {
@@ -1061,6 +1312,7 @@ pub mod essai {
                                 // a sa permission (canal, sinon indication Data).
                                 let (allocs, sock, client, relayed2) =
                                     (allocs.clone(), sock.clone(), from, relayed2.clone());
+                                let (backs, bytes2) = (backs.clone(), bytes2.clone());
                                 tokio::spawn(async move {
                                     let mut b = vec![0u8; 2048];
                                     while let Ok((n, peer)) = relay.recv_from(&mut b).await {
@@ -1082,7 +1334,11 @@ pub mod essai {
                                             }
                                         };
                                         relayed2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        let _ = sock.send_to(&out, client).await;
+                                        bytes2.fetch_add(
+                                            n as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        back(&backs, &sock, client, &out).await;
                                     }
                                 });
                                 reply(
@@ -1123,13 +1379,15 @@ pub mod essai {
                         }
                         _ => reply(FAILURE, err(400), true),
                     };
-                    let _ = sock.send_to(&out, from).await;
+                    back(&backs, &sock, from, &out).await;
                 }
             });
             MiniTurn {
                 addr,
                 allocations,
                 relayed,
+                bytes,
+                udp_off,
                 _stop: stop,
             }
         }
@@ -1360,6 +1618,110 @@ mod tests {
         assert!(sent >= 300 && received >= 1, "{sent} {received}");
     }
 
+    /// (v333) Un réseau qui ne laisse sortir que TCP (le serveur ne répond plus en UDP) :
+    /// les clients s'allouent leur adresse par TCP, s'échangent des paquets intacts, et
+    /// parlent aussi avec un client resté en UDP ; la prochaine allocation va droit à TCP.
+    #[test]
+    fn a_network_without_udp_gets_its_relayed_address_over_tcp() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = MiniTurn::start(rt.handle());
+        server
+            .udp_off
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        type Got = Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>;
+        let mk = |got: Got| {
+            TurnClient::start(
+                rt.handle(),
+                vec![server.source()],
+                Box::new(move |from, p| got.lock().unwrap().push((from, p.to_vec()))),
+                Box::new(|_| {}),
+            )
+            .unwrap()
+        };
+        let (got_a, got_b, got_c): (Got, Got, Got) = Default::default();
+        let (a, b) = (mk(got_a.clone()), mk(got_b.clone()));
+        wait_for("adresses relayées par TCP", || {
+            a.relayed().is_some() && b.relayed().is_some()
+        });
+        assert!(a.tcp.lock().unwrap().is_some() && b.tcp.lock().unwrap().is_some());
+        assert!(a.via_tcp.load(std::sync::atomic::Ordering::Relaxed));
+        let (ra, rb) = (
+            SocketAddr::V4(a.relayed().unwrap()),
+            SocketAddr::V4(b.relayed().unwrap()),
+        );
+        // Des tailles qui ne tombent pas sur 4 : le bourrage de TCP ne doit rien changer.
+        wait_for("de A à B et retour", || {
+            a.send(rb, b"bonjour");
+            b.send(ra, b"salut!");
+            std::thread::sleep(Duration::from_millis(20));
+            got_b
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(f, p)| *f == ra && p == b"bonjour")
+                && got_a
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(f, p)| *f == rb && p == b"salut!")
+        });
+        got_b.lock().unwrap().clear();
+        for i in 0..300u32 {
+            let mut p = i.to_le_bytes().to_vec();
+            p.extend(std::iter::repeat_n(i as u8, (i % 7) as usize));
+            a.send(rb, &p);
+        }
+        wait_for("300 paquets par TCP", || got_b.lock().unwrap().len() >= 300);
+        for (i, (f, p)) in got_b.lock().unwrap().iter().enumerate() {
+            let n = u32::from_le_bytes(p[..4].try_into().unwrap());
+            assert_eq!((*f, n as usize, p.len()), (ra, i, 4 + (n % 7) as usize));
+        }
+        // UDP revient (pour d'autres) : un client en UDP et un client en TCP se parlent.
+        server
+            .udp_off
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let c = mk(got_c.clone());
+        wait_for("adresse relayée en UDP", || c.relayed().is_some());
+        assert!(c.tcp.lock().unwrap().is_none());
+        let rc = SocketAddr::V4(c.relayed().unwrap());
+        wait_for("entre TCP et UDP", || {
+            a.send(rc, b"par tcp");
+            c.send(ra, b"par udp");
+            std::thread::sleep(Duration::from_millis(20));
+            got_c
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(f, p)| *f == ra && p == b"par tcp")
+                && got_a
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(f, p)| *f == rc && p == b"par udp")
+        });
+        // Nouvelle allocation (identifiants renouvelés) : droit à TCP, sans attendre UDP.
+        server
+            .udp_off
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let before = a.relayed();
+        a.st.lock().unwrap().renew_at = Some(Instant::now());
+        a.wake.notify_one();
+        let t = Instant::now();
+        wait_for("nouvelle adresse par TCP", || {
+            a.relayed().is_some_and(|r| Some(r) != before)
+        });
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "TCP d'abord : {:?}",
+            t.elapsed()
+        );
+        assert!(a.tcp.lock().unwrap().is_some());
+    }
+
     /// Avec un vrai serveur TURN (coturn sur cette machine, par exemple) : la variable
     /// `MINELIB_TURN_ESSAI` donne la source (`turn:127.0.0.1:3478 utilisateur motdepasse`).
     /// Deux clients s'y allouent une adresse et s'échangent des paquets.
@@ -1430,6 +1792,170 @@ mod tests {
         wait_for("rafraîchie", || a.st.lock().unwrap().refresh_at > before);
         assert!(a.relayed().is_some());
         eprintln!("TURN : {:?} {:?}", a.counts(), b.counts());
+    }
+
+    /// (v333) Mesure avec un vrai serveur TURN (`MINELIB_TURN_ESSAI`), par UDP puis par TCP :
+    /// paquets perdus selon la cadence (lente, 256/s, 512/s, rafale) et, par TCP, selon
+    /// qu'ils partent un par un ou collés dans un même envoi. Affiche les comptes.
+    #[test]
+    #[ignore = "serveur TURN réel (MINELIB_TURN_ESSAI)"]
+    fn real_turn_losses_by_pace() {
+        struct Say(Instant);
+        impl log::Log for Say {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, r: &log::Record) {
+                if r.target().contains("turn") {
+                    eprintln!("{:6.2} s  {}", self.0.elapsed().as_secs_f32(), r.args());
+                }
+            }
+            fn flush(&self) {}
+        }
+        let _ = log::set_boxed_logger(Box::new(Say(Instant::now())));
+        log::set_max_level(log::LevelFilter::Info);
+        let src = std::env::var("MINELIB_TURN_ESSAI").expect("MINELIB_TURN_ESSAI");
+        let source = parse_sources(&src).pop().expect("source");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        type Got = Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>;
+        let only = std::env::var("MINELIB_TURN_MODE").unwrap_or_default();
+        for want_tcp in [false, true] {
+            if (only == "tcp" && !want_tcp) || (only == "udp" && want_tcp) {
+                continue;
+            }
+            let (got_a, got_b): (Got, Got) = Default::default();
+            let mk = |got: Got| {
+                let c = TurnClient::start(
+                    rt.handle(),
+                    vec![source.clone()],
+                    Box::new(move |from, p| got.lock().unwrap().push((from, p.to_vec()))),
+                    Box::new(|_| {}),
+                )
+                .unwrap();
+                c.via_tcp
+                    .store(want_tcp, std::sync::atomic::Ordering::Relaxed);
+                c
+            };
+            let (a, b) = (mk(got_a.clone()), mk(got_b.clone()));
+            let t = Instant::now();
+            while !(a.relayed().is_some() && b.relayed().is_some()) {
+                assert!(t.elapsed() < Duration::from_secs(40), "pas d'allocation");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for c in [&a, &b] {
+                if c.tcp.lock().unwrap().is_some() != want_tcp {
+                    // Allouée avant que la préférence ne soit posée : une autre.
+                    let before = c.relayed();
+                    c.st.lock().unwrap().renew_at = Some(Instant::now());
+                    c.wake.notify_one();
+                    let t = Instant::now();
+                    while !c.relayed().is_some_and(|r| Some(r) != before) {
+                        assert!(t.elapsed() < Duration::from_secs(40), "pas de réallocation");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+            let tcp = (
+                a.tcp.lock().unwrap().is_some(),
+                b.tcp.lock().unwrap().is_some(),
+            );
+            let (ra, rb) = (
+                SocketAddr::V4(a.relayed().unwrap()),
+                SocketAddr::V4(b.relayed().unwrap()),
+            );
+            eprintln!("allocations en {:?} (TCP : {tcp:?})", t.elapsed());
+            let t = Instant::now();
+            loop {
+                a.send(rb, b"x");
+                b.send(ra, b"y");
+                std::thread::sleep(Duration::from_millis(30));
+                let (ga, gb) = (got_a.lock().unwrap().len(), got_b.lock().unwrap().len());
+                if ga > 0 && gb > 0 {
+                    eprintln!("canaux en {:?}", t.elapsed());
+                    break;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(45),
+                    "canaux : rien après 45 s ; reçus A {ga} B {gb} ; compteurs {:?} {:?}",
+                    a.counts(),
+                    b.counts()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            let count = |got: &Got, tag: u8| {
+                got.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, p)| p.first() == Some(&tag))
+                    .count()
+            };
+            let mut lines = Vec::new();
+            let mut phase = |name: &str, tag: u8, n: usize, every: Duration, size: usize| {
+                let t = Instant::now();
+                for i in 0..n {
+                    let mut p = vec![tag; size];
+                    p[1..3].copy_from_slice(&(i as u16).to_le_bytes());
+                    a.send(rb, &p);
+                    b.send(ra, &p);
+                    if !every.is_zero() {
+                        let due = t + every * (i as u32 + 1);
+                        if let Some(w) = due.checked_duration_since(Instant::now()) {
+                            std::thread::sleep(w);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(800));
+                lines.push(format!(
+                    "{name} ({size} o) : A→B {}/{n}, B→A {}/{n}",
+                    count(&got_b, tag),
+                    count(&got_a, tag)
+                ));
+            };
+            phase("lent 50/s", 1, 100, Duration::from_millis(20), 60);
+            phase("256/s", 2, 512, Duration::from_micros(3906), 60);
+            phase("256/s gros", 3, 512, Duration::from_micros(3906), 600);
+            phase("512/s", 4, 512, Duration::from_micros(1953), 60);
+            phase("rafale", 5, 100, Duration::ZERO, 60);
+            // Deux messages collés dans un même envoi (TCP seulement).
+            if tcp.0 {
+                let ch = a.st.lock().unwrap().peers[&rb].channel;
+                let tx = a.tcp.lock().unwrap().as_ref().unwrap().1.clone();
+                for i in 0..100u16 {
+                    let mut both = Vec::new();
+                    for k in 0..2u16 {
+                        let mut p = vec![6u8; 61];
+                        p[1..3].copy_from_slice(&(i * 2 + k).to_le_bytes());
+                        both.extend(pad4(&channel_data(ch, &p)));
+                    }
+                    let _ = tx.send(both);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(800));
+                let got: Vec<u16> = got_b
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, p)| p.first() == Some(&6))
+                    .map(|(_, p)| u16::from_le_bytes([p[1], p[2]]))
+                    .collect();
+                let firsts = got.iter().filter(|n| *n % 2 == 0).count();
+                lines.push(format!(
+                    "collés par deux : {}/200 (premiers {firsts}/100, seconds {}/100)",
+                    got.len(),
+                    got.len() - firsts
+                ));
+            }
+            eprintln!(
+                "TURN RÉEL par {} :\n  {}",
+                if tcp.0 { "TCP" } else { "UDP" },
+                lines.join("\n  ")
+            );
+            eprintln!("compteurs A {:?} B {:?}", a.counts(), b.counts());
+        }
     }
 
     /// Sans serveur qui réponde, ou avec de faux identifiants : pas d'adresse relayée, et

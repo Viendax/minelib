@@ -222,7 +222,33 @@ pub(crate) struct Fast {
     turns: HashMap<(u64, [u8; 32]), SocketAddrV4>,
     own_turns: HashMap<[u8; 32], SocketAddrV4>,
     turn_asks: HashMap<u64, (Instant, u8)>,
+    /// (v333) Connexions dont le lien avec ce relais passe par TURN (`Request::LinkTurn`),
+    /// routes directes entre voisins d'un monde de construction (par paire, le plus petit
+    /// numéro d'abord), et dernier passage de `near_upkeep`.
+    link_turn: std::collections::HashSet<u64>,
+    near: HashMap<(u64, u64), NearPair>,
+    near_at: Option<Instant>,
 }
+
+/// (v333) Route directe par TURN entre deux voisins d'un monde de construction.
+struct NearPair {
+    route: u64,
+    key: [u8; 32],
+    /// Ce que chacun en a reçu : son chemin par TURN (la sienne d'abord), et s'il y envoie
+    /// ses positions rapides.
+    turn: (FastTurn, FastTurn),
+    send: (bool, bool),
+    /// Passages de `near_upkeep` où la paire n'était plus voulue, de suite.
+    unwanted: u8,
+}
+
+/// (v333) Routes directes d'un joueur, au plus.
+const NEAR_MAX: usize = 6;
+/// (v333) Une paire qui n'est plus voulue est gardée ce nombre de passages (une seconde
+/// chacun) : un voisin qui passe d'un côté à l'autre d'une limite ne coupe rien.
+const NEAR_KEEP: u8 = 3;
+/// (v333) Annonces `LinkTurn` acceptées d'une connexion par minute.
+const LINKS_PER_MIN: u8 = 30;
 
 impl Fast {
     /// (v297) Cette connexion de garant est celle d'un passeur vérifié (sa box laisse
@@ -285,6 +311,12 @@ impl Fast {
             self.turns.len() + self.own_turns.len(),
             self.tunnels.values().filter(|t| t.turn.is_some()).count(),
         )
+    }
+
+    /// (v333) Connexions dont le lien passe par TURN, et routes directes entre voisins
+    /// (relevé de santé, essais).
+    pub(crate) fn near_counts(&self) -> (usize, usize) {
+        (self.link_turn.len(), self.near.len())
     }
 
     /// (v331) Joueurs de parties FPS dont la route a un chemin par TURN, et ceux de ces
@@ -424,6 +456,18 @@ pub(crate) fn echo(st: &mut State, id: u64, nonce: u64) {
 pub(crate) fn gone(st: &mut State, id: u64) {
     st.fast.tries.remove(&id);
     st.fast.asks.remove(&id);
+    // (v333) Ses routes directes : l'autre bout de chacune la perd aussi.
+    st.fast.link_turn.remove(&id);
+    let pairs: Vec<(u64, u64)> = st
+        .fast
+        .near
+        .keys()
+        .filter(|(a, b)| *a == id || *b == id)
+        .copied()
+        .collect();
+    for p in pairs {
+        near_close(st, p);
+    }
     st.fast.told.remove(&id);
     st.fast.log_rate.remove(&id);
     st.fast.turn_asks.remove(&id);
@@ -488,6 +532,7 @@ pub(crate) fn upkeep(st: &mut State) {
     own_reports(st);
     own_turns(st);
     probe_all(st);
+    near_upkeep(st);
     // (v301) Tunnels que leur joueur ne redemande plus.
     let old: Vec<u64> = st
         .fast
@@ -640,6 +685,181 @@ pub(crate) fn turn_at(st: &mut State, id: u64, node: [u8; 32], turn: Option<Sock
         }
     }
     announce(st);
+}
+
+/// (v333) `LinkTurn` : le lien de cette connexion avec ce relais passe (ou non) par TURN.
+pub(crate) fn link_turn(st: &mut State, id: u64, on: bool) {
+    let a = st.fast.turn_asks.entry(id).or_insert((Instant::now(), 0));
+    if a.0.elapsed() >= std::time::Duration::from_secs(60) {
+        *a = (Instant::now(), 0);
+    }
+    if a.1 >= LINKS_PER_MIN {
+        st.fast.refused[1] += 1;
+        return;
+    }
+    a.1 += 1;
+    if on {
+        st.fast.link_turn.insert(id);
+    } else {
+        st.fast.link_turn.remove(&id);
+    }
+}
+
+/// (v333) Voie directe des voisins d'un monde de construction (`minelib_net::fast::Near`),
+/// une fois par seconde : entre deux joueurs dont les liens avec ce relais passent tous
+/// deux par TURN, et dont l'un est parmi les plus proches voisins de l'autre (ceux à qui
+/// ses positions rapides vont, `zones::Build::closest`), une route par TURN de l'un à
+/// l'autre. Leurs positions y vont directement : deux passages par le serveur TURN au lieu
+/// de quatre (montée jusqu'ici, puis descente). Ailleurs (liens par des passeurs, en
+/// direct, ou sur cette machine), ce que ce relais remet ne coûte rien au quota : rien ne
+/// change. Une paire qui n'est plus voulue est reprise après `NEAR_KEEP` passages.
+fn near_upkeep(st: &mut State) {
+    if st
+        .fast
+        .near_at
+        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
+    {
+        return;
+    }
+    st.fast.near_at = Some(Instant::now());
+    if st.fast.link_turn.is_empty() && st.fast.near.is_empty() {
+        return;
+    }
+    let turning: std::collections::HashSet<u64> = st
+        .fast
+        .link_turn
+        .iter()
+        .copied()
+        .filter(|c| !conn_turns(st, *c).is_empty())
+        .collect();
+    // Paires voulues : (petit, grand) → (le petit envoie au grand, le grand au petit).
+    let mut want: HashMap<(u64, u64), (bool, bool)> = HashMap::new();
+    if turning.len() >= 2 {
+        for room in st.rooms.values_mut().filter(|r| r.kind == 1) {
+            let players: Vec<(u64, [i32; 2])> = room
+                .build
+                .positions
+                .iter()
+                .filter(|(id, _)| turning.contains(id))
+                .map(|(id, c)| (*id, *c))
+                .collect();
+            for (a, chunk) in players {
+                for b in room.build.closest(a, chunk, |m| turning.contains(&m)) {
+                    let e = want.entry((a.min(b), a.max(b))).or_default();
+                    if a < b {
+                        e.0 = true;
+                    } else {
+                        e.1 = true;
+                    }
+                }
+            }
+        }
+    }
+    // Paires qui ne sont plus voulues.
+    let old: Vec<(u64, u64)> = st.fast.near.keys().copied().collect();
+    for p in old {
+        if want.contains_key(&p) {
+            continue;
+        }
+        let gone = st.fast.near.get_mut(&p).is_some_and(|n| {
+            n.unwanted += 1;
+            n.unwanted >= NEAR_KEEP
+        });
+        if gone {
+            near_close(st, p);
+        }
+    }
+    let mut count: HashMap<u64, usize> = HashMap::new();
+    for (a, b) in st.fast.near.keys() {
+        *count.entry(*a).or_default() += 1;
+        *count.entry(*b).or_default() += 1;
+    }
+    let mut pairs: Vec<((u64, u64), (bool, bool))> = want.into_iter().collect();
+    pairs.sort_unstable();
+    for ((lo, hi), send) in pairs {
+        let Some(turn) = fps_turn(st, lo, hi) else {
+            continue;
+        };
+        let tell = match st.fast.near.get_mut(&(lo, hi)) {
+            Some(n) => {
+                n.unwanted = 0;
+                let changed = n.turn != turn || n.send != send;
+                n.turn = turn;
+                n.send = send;
+                changed
+            }
+            None => {
+                let full = |c: u64| count.get(&c).copied().unwrap_or(0) >= NEAR_MAX;
+                if full(lo) || full(hi) {
+                    continue;
+                }
+                *count.entry(lo).or_default() += 1;
+                *count.entry(hi).or_default() += 1;
+                st.fast.near.insert(
+                    (lo, hi),
+                    NearPair {
+                        route: rand::random(),
+                        key: rand::random(),
+                        turn,
+                        send,
+                        unwanted: 0,
+                    },
+                );
+                true
+            }
+        };
+        if tell {
+            near_tell(st, (lo, hi));
+        }
+    }
+}
+
+/// (v333) La route de la paire `p` à ses deux bouts.
+fn near_tell(st: &State, p: (u64, u64)) {
+    let Some(n) = st.fast.near.get(&p) else {
+        return;
+    };
+    let ends = [
+        (p.0, p.1, minelib_net::fast::TO_GUEST, n.send.0, n.turn.0),
+        (p.1, p.0, minelib_net::fast::TO_HOST, n.send.1, n.turn.1),
+    ];
+    for (me, peer, dir, send, turn) in ends {
+        if let Some(c) = st.conns.get(&me) {
+            transport::push(
+                &c.tx,
+                &Response::NearWay {
+                    peer,
+                    route: n.route,
+                    key: n.key,
+                    dir,
+                    send,
+                    turn: Some(turn),
+                },
+            );
+        }
+    }
+}
+
+/// (v333) Reprend la route de la paire `p` (à ses deux bouts encore là).
+fn near_close(st: &mut State, p: (u64, u64)) {
+    let Some(n) = st.fast.near.remove(&p) else {
+        return;
+    };
+    for (me, peer) in [(p.0, p.1), (p.1, p.0)] {
+        if let Some(c) = st.conns.get(&me) {
+            transport::push(
+                &c.tx,
+                &Response::NearWay {
+                    peer,
+                    route: n.route,
+                    key: [0; 32],
+                    dir: 0,
+                    send: false,
+                    turn: None,
+                },
+            );
+        }
+    }
 }
 
 /// (v331) Adresses relayées que dit cette connexion (celles des nœuds de son jeu), dans
@@ -1817,6 +2037,91 @@ mod tests {
     /// (v331) Les essais qui donnent des adresses relayées aux nœuds de ce programme : un
     /// à la fois (les jeux d'essai disent au relais celles de tous les nœuds du programme).
     static TURN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// (v333) Deux voisins proches d'un monde de construction dont les liens avec le relais
+    /// passent par TURN : le relais leur donne une route directe par TURN, et leurs positions
+    /// y passent sans lui. Un troisième, loin, n'en a pas. Le lien de l'un ne passe plus par
+    /// TURN : la route est reprise.
+    #[test]
+    fn close_neighbours_whose_links_go_through_turn_get_a_direct_way() {
+        let _turn = TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (server, _engine) = minelib_p2p::turn::essai::MiniTurn::start_alone();
+        let nodes: Vec<minelib_p2p::Node> = (0..2)
+            .map(|_| {
+                let n = minelib_p2p::Node::start_offline().unwrap();
+                n.passeurs().start_turn(vec![server.source()]);
+                n
+            })
+            .collect();
+        until(|| nodes.iter().all(|n| n.passeurs().turn_addr().is_some()));
+        let (h, login) = relay("voisins");
+        let (a, al) = login("VoisinA");
+        a.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [7; 32],
+            max_players: 0,
+            seed: 0,
+            terrain: 0,
+        });
+        let room = match wait(&a, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let (b, bl) = login("VoisinB");
+        b.send(Cmd::Join(room));
+        wait(&b, |e| matches!(e, Event::Joined { .. }));
+        let (c, cl) = login("VoisinLoin");
+        c.send(Cmd::Join(room));
+        wait(&c, |e| matches!(e, Event::Joined { .. }));
+        for (l, chunk) in [(&al, [0, 0]), (&bl, [0, 0]), (&cl, [300, 0])] {
+            transport::push(l, &Request::Position { chunk });
+            transport::push(l, &Request::LinkTurn { on: true });
+        }
+        let near = |cl: &Client| -> minelib_net::fast::Near {
+            match wait(cl, |e| matches!(e, Event::Near(Some(_)))) {
+                Event::Near(Some(n)) => n,
+                _ => unreachable!(),
+            }
+        };
+        let (na, nb) = (near(&a), near(&b));
+        let (b_id, a_id) = (na.wanted(), nb.wanted());
+        assert_eq!((b_id.len(), a_id.len()), (1, 1), "chacun envoie à l'autre");
+        let (a_id, b_id) = (a_id[0], b_id[0]);
+        until(|| na.open(b_id) && nb.open(a_id));
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(
+                st.fast.near_counts(),
+                (3, 1),
+                "une seule route : le loin n'en a pas"
+            );
+        }
+        while b.poll().is_some() {}
+        for i in 0..100u8 {
+            assert_eq!(na.send(&[0xAB, i]), vec![b_id]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut got = 0;
+        let t = Instant::now();
+        while got < 100 && t.elapsed() < Duration::from_secs(5) {
+            match b.poll() {
+                Some(Event::NearPos { peer, data }) => {
+                    assert_eq!((peer, data[0]), (a_id, 0xAB));
+                    got += 1;
+                }
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        assert_eq!(got, 100, "positions venues directement");
+        // Le lien de B ne passe plus par TURN : la route est reprise (après trois passages).
+        transport::push(&bl, &Request::LinkTurn { on: false });
+        wait(&a, |e| matches!(e, Event::Near(None)));
+        assert_eq!(h.state.lock().unwrap().fast.near_counts(), (2, 0));
+        drop(nodes);
+    }
 
     /// (v331) Sans passeur, une partie FPS a quand même sa voie rapide : par TURN, de l'hôte
     /// au joueur et retour, sans passer par le relais, et sans que l'un voie l'adresse de

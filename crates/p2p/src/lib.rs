@@ -426,6 +426,47 @@ fn remember_tunnel(remote: [u8; 32], conn: &iroh::endpoint::Connection) {
     t.push((remote, conn.clone()));
 }
 
+/// (v333) Tunnels de ce jeu, par l'adresse locale où l'on s'y connecte (celle que la
+/// connexion au relais a en main) : de quoi dire si le lien passe en ce moment par TURN.
+type LocalLinks = Vec<(
+    SocketAddr,
+    iroh::endpoint::Connection,
+    passeur::PasseurTransport,
+)>;
+static LOCAL_LINKS: std::sync::Mutex<LocalLinks> = std::sync::Mutex::new(Vec::new());
+
+fn remember_link(
+    local: SocketAddr,
+    conn: &iroh::endpoint::Connection,
+    passeurs: &passeur::PasseurTransport,
+) {
+    let mut l = LOCAL_LINKS.lock().unwrap();
+    l.retain(|(a, c, _)| *a != local && c.close_reason().is_none());
+    l.push((local, conn.clone(), passeurs.clone()));
+}
+
+/// (v333) Le tunnel joint à l'adresse locale `addr` passe-t-il en ce moment par TURN ? (Le
+/// chemin qu'iroh a choisi est-il une route de passeurs, et son saut en cours le saut
+/// TURN ?) Rien : ce n'est pas un tunnel de ce jeu.
+fn link_probe(addr: &str) -> Option<bool> {
+    let a: SocketAddr = addr.parse().ok()?;
+    let (conn, passeurs) = {
+        let l = LOCAL_LINKS.lock().unwrap();
+        let (_, c, p) = l
+            .iter()
+            .find(|(x, c, _)| *x == a && c.close_reason().is_none())?;
+        (c.clone(), p.clone())
+    };
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected())?;
+    Some(match selected.remote_addr() {
+        iroh::TransportAddr::Custom(c) => {
+            passeur::route_of(c).is_some_and(|r| passeurs.via_turn(r))
+        }
+        _ => false,
+    })
+}
+
 /// (v285) Ce jeu joint-il le nœud `remote` en direct ? `None` s'il n'y a pas de tunnel
 /// vers lui (réseau local, même machine) ; `Some(false)` tant que tout passe par un
 /// serveur relais d'iroh (hôte anonyme, ou box qui ne laisse pas faire) : ces serveurs
@@ -592,6 +633,7 @@ impl Node {
         })?;
         remember_tunnel(remote, &conn);
         let local = listener.local_addr()?;
+        remember_link(local, &conn, &self.passeurs);
         self.rt.spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let Ok((send, recv)) = conn.open_bi().await else {
@@ -723,6 +765,7 @@ impl Node {
         remember_tunnel(remote, &conn);
         log::info!("tunnel : lien vers le relais ouvert par des passeurs");
         let local = listener.local_addr()?;
+        remember_link(local, &conn, &self.passeurs);
         self.rt
             .spawn(passeur::keep(self.passeurs.clone(), remote, route, conn.clone()));
         self.rt.spawn(async move {
@@ -776,6 +819,7 @@ impl Node {
                     }
                 };
             remember_tunnel(remote, &conn);
+            remember_link(addr, &conn, &passeurs);
             // (Journal : ni adresse ni nœud, seulement par où passe le tunnel.)
             match route {
                 Some(r) => {

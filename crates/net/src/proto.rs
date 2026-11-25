@@ -86,6 +86,7 @@ use serde::{Deserialize, Serialize};
 /// joueurs qui ne sont pas OP ne la reçoivent plus : `Request::Host::seed` et `terrain`,
 /// `Response::Hosted::terrain`, `Response::Joined::terrain`, `Response::SeedLock::seed`.
 /// (v331, toujours 75) `FastGuest::turn` et `FastWay::turn` (`FastTurn`).
+/// (v333, toujours 75) `Request::LinkTurn` et `Response::NearWay`.
 pub const PROTOCOL: u32 = 75;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
@@ -1029,6 +1030,13 @@ pub enum Request {
         node: [u8; 32],
         turn: Option<([u8; 4], u16)>,
     },
+    /// (v333) Le lien de ce jeu avec ce relais passe (ou ne passe plus) par un serveur TURN.
+    /// Dit à chaque connexion et quand cela change. Le relais ne relie directement par TURN
+    /// des voisins d'un monde de construction (`Response::NearWay`) que si leurs liens avec
+    /// lui y passent déjà : sinon ce qu'il leur remet ne coûte rien au quota du serveur.
+    LinkTurn {
+        on: bool,
+    },
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -1140,6 +1148,7 @@ impl Request {
                 | Request::TunnelWant { .. }
                 | Request::TunnelBad { .. }
                 | Request::TurnAt { .. }
+                | Request::LinkTurn { .. }
                 | Request::NetLog { .. }
                 | Request::MapReport
                 | Request::BulkEdit { .. }
@@ -2015,6 +2024,18 @@ pub enum Response {
     NetLogWanted {
         on: bool,
     },
+    /// (v333) Voie directe d'un monde de construction (`crate::fast::Near`) : une route par
+    /// TURN vers le joueur `peer` (son numéro sur ce relais), l'un de nos voisins les plus
+    /// proches. `dir` : notre sens sur elle ; `send` : nos positions rapides lui vont par
+    /// elle (il est parmi nos plus proches voisins) ; `turn` vide : route reprise.
+    NearWay {
+        peer: u64,
+        route: u64,
+        key: [u8; 32],
+        dir: u8,
+        send: bool,
+        turn: Option<FastTurn>,
+    },
 }
 
 /// Passeur d'une route de la voie rapide : où lui écrire (IPv4, port UDP) et la clé du
@@ -2124,6 +2145,7 @@ impl Response {
                 | Response::NetLogWanted { .. }
                 | Response::FastGuest { .. }
                 | Response::FastHost { .. }
+                | Response::NearWay { .. }
                 | Response::PartyInvite { .. }
                 | Response::Invited { .. }
                 | Response::InviteDeclined { .. }
