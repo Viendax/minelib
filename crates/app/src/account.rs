@@ -460,6 +460,9 @@ pub struct Accounts {
     pub game_events: Vec<Event>,
     /// Classement reçu : (amis ?, lignes, sa propre ligne).
     pub leaderboard: Option<(bool, Vec<proto::RankEntry>, Option<proto::RankEntry>)>,
+    /// (v315) Nombre de lignes du classement mondial à partir duquel la suite a déjà été
+    /// demandée (0 : pas encore).
+    rank_asked: usize,
     /// Amis et s'ils sont en ligne.
     pub friends: Vec<(String, bool)>,
     /// (v231) Où ils sont (même ordre), invitations reçues dans le monde d'un ami (la plus
@@ -562,6 +565,7 @@ impl Accounts {
             login_secret: None,
             game_events: Vec::new(),
             leaderboard: None,
+            rank_asked: 0,
             friends: Vec::new(),
             friend_places: Vec::new(),
             world_invites: Vec::new(),
@@ -1138,6 +1142,17 @@ impl Accounts {
                 Event::Leaderboard { friends, list, me } => {
                     self.busy = None;
                     self.leaderboard = Some((friends, list, me));
+                    self.rank_asked = 0;
+                }
+                // (v315) La suite du classement mondial : ajoutée si elle fait bien suite
+                // à ce qu'on a (le classement a pu être redemandé entre-temps).
+                Event::LeaderboardMore { from, list } => {
+                    self.busy = None;
+                    if let Some((false, have, _)) = &mut self.leaderboard {
+                        if have.len() == from as usize {
+                            have.extend(list);
+                        }
+                    }
                 }
                 // (v231) Liste d'amis : passée au jeu avec ce qui la suit (où ils sont, demandes).
                 Event::Friends(list) => {
@@ -1283,6 +1298,20 @@ impl Accounts {
     }
 
     /// Commande de partie (héberger, rejoindre, quitter).
+    /// (v315) Le classement mondial n'est plus coupé : quand la liste affichée (défilée
+    /// jusqu'à `scroll`) approche de la fin de ce qu'on a, et que la dernière page reçue
+    /// était pleine, la suivante est demandée (une fois).
+    pub fn leaderboard_more(&mut self, scroll: usize) {
+        let Some((false, list, _)) = &self.leaderboard else {
+            return;
+        };
+        let n = list.len();
+        if rank_more(n, scroll, self.rank_asked) {
+            self.rank_asked = n;
+            self.room(Cmd::LeaderboardMore { from: n as u32 });
+        }
+    }
+
     pub fn room(&mut self, cmd: Cmd) {
         // (v146) En veille : quitter le monde n'a rien à dire au relais du monde ; le reste
         // attend qu'on y revienne.
@@ -2252,5 +2281,30 @@ mod relay_tests {
         assert_eq!((back.len(), back[0].node, back[0].noise), (1, [5; 32], [105; 32]));
         *CHOSEN.lock().unwrap() = None;
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// (v315) Faut-il demander la suite du classement ? `have` lignes reçues, liste défilée
+/// jusqu'à `scroll`, suite déjà demandée quand on en avait `asked`.
+fn rank_more(have: usize, scroll: usize, asked: usize) -> bool {
+    have > 0 && have % proto::RANK_PAGE == 0 && asked != have && scroll + 60 >= have
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+
+    /// (v315) La suite du classement est demandée quand on approche de la fin d'une page
+    /// pleine, une seule fois ; jamais quand la dernière page n'était pas pleine (c'est la
+    /// fin du classement).
+    #[test]
+    fn the_next_ranking_page_is_asked_once_near_the_end_of_a_full_page() {
+        let page = proto::RANK_PAGE;
+        assert!(!rank_more(page, 0, 0), "en haut de la liste : pas encore");
+        assert!(rank_more(page, page - 40, 0));
+        assert!(!rank_more(page, page - 40, page), "déjà demandée");
+        assert!(rank_more(2 * page, 2 * page - 10, page));
+        assert!(!rank_more(page + 37, page + 30, page), "fin du classement");
+        assert!(!rank_more(0, 0, 0));
     }
 }

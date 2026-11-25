@@ -69,7 +69,7 @@ Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 - **Les cartes de la communauté** : toute carte déjà lancée en partie FPS en ligne apparaît dans la liste de tout le monde et se télécharge toute seule. Elle reste disponible tant qu'un joueur qui y a joué l'a encore (son jeu la renvoie au relais si besoin). Tes autres mondes restent privés.
 - Pendant l'échauffement, **les autres joueurs restent anonymes** (« Joueur 3 ») : on ne quitte pas la recherche parce qu'on a vu un nom. Les pseudos s'affichent quand la partie commence au complet.
 - **Matchmaking équitable** : d'abord un niveau Elo proche de l'équipe déjà formée (moyenne du lobby), puis les nouveaux avec les nouveaux, puis un facteur de confiance proche (le plus bas du lobby). Jamais avec quelqu'un que tu as signalé.
-- **Classement** : tes amis d'abord, le **Top mondial** à côté. Elo calculé comme aux échecs sur les parties 5 contre 5 des 10 cartes les plus jouées, avec les statistiques habituelles (K/D, % de tirs à la tête, ADR, MVP).
+- **Classement** : tes amis d'abord, le **Top mondial** à côté. (v315) Le Top mondial n'est plus coupé aux 50 premiers : il se lit jusqu'au dernier joueur classé, la suite se charge quand tu défiles (200 lignes à la fois). Elo calculé comme aux échecs sur les parties 5 contre 5 des 10 cartes les plus jouées, avec les statistiques habituelles (K/D, % de tirs à la tête, ADR, MVP).
 
 ### Le facteur de confiance
 

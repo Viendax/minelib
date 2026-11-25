@@ -2343,6 +2343,10 @@ impl Game {
             time,
             lobby,
         );
+        // (v315) Classement mondial entier : la suite arrive quand on défile vers la fin.
+        if self.fps_home.world_tab {
+            self.accounts.leaderboard_more(self.fps_home.scroll);
+        }
         match action {
             multiplayer::FpsAction::Back => {
                 self.searching = None;

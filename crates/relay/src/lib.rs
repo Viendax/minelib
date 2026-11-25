@@ -7774,6 +7774,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             };
             Response::Leaderboard { list, me }
         }
+        // (v315) La suite du classement mondial.
+        Request::LeaderboardFrom { from } => {
+            let (list, me) = st.stats.top_from(pseudo, from as usize);
+            Response::Leaderboard { list, me }
+        }
         Request::Friend { pseudo: who, add } => {
             if !who.is_empty() {
                 let Some(found) = st.accounts.load(&who) else {
@@ -9252,6 +9257,7 @@ fn handle_locked(
             | Request::MatchResult { .. }
             | Request::CheatFound { .. }
             | Request::Leaderboard { .. }
+            | Request::LeaderboardFrom { .. }
             | Request::Friend { .. }
             | Request::Invite { .. }
             | Request::InviteReply { .. }

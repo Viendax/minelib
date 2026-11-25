@@ -65,6 +65,7 @@ use serde::{Deserialize, Serialize};
 /// endormis (`ServerEntry` : record, dernière activité, gardien) et `DeleteWorld` ; (v312)
 /// L'Évidé partagé en construction en ligne (`BuildMsg::Evide`, `EvideBite`, `EvideEat`,
 /// surveillés par le relais : `evide::Watch`).
+/// (v315, toujours 75) `LeaderboardFrom` : la suite du classement.
 pub const PROTOCOL: u32 = 75;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
@@ -80,6 +81,10 @@ pub fn client_version(client: &str) -> u32 {
         .find_map(|w| w.strip_prefix('v')?.parse().ok())
         .unwrap_or(0)
 }
+
+/// (v315) Lignes du classement par réponse (une ligne fait moins de 100 octets, une trame
+/// 65 535 au plus).
+pub const RANK_PAGE: usize = 200;
 
 /// Morceau d'une carte transférée (octets).
 pub const MAP_PART: usize = 48 * 1024;
@@ -382,7 +387,7 @@ pub enum Request {
         kind: u8,
         detail: String,
     },
-    /// Classement : les 50 meilleurs, ou ses amis.
+    /// Classement : les `RANK_PAGE` meilleurs (la suite : `LeaderboardFrom`), ou ses amis.
     Leaderboard {
         friends: bool,
     },
@@ -955,6 +960,12 @@ pub enum Request {
     /// ne sont pas touchées.
     DeleteWorld {
         code: Option<u32>,
+    },
+    /// (v315) La suite du classement mondial, à partir du rang `from` (compté de zéro) :
+    /// `RANK_PAGE` lignes au plus (réponse `Leaderboard`). Le classement n'est plus coupé
+    /// aux 50 premiers : le jeu demande la page suivante quand on approche de la fin.
+    LeaderboardFrom {
+        from: u32,
     },
 }
 

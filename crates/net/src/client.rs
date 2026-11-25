@@ -201,6 +201,10 @@ pub enum Cmd {
     Leaderboard {
         friends: bool,
     },
+    /// (v315) La suite du classement mondial, à partir du rang `from` (compté de zéro).
+    LeaderboardMore {
+        from: u32,
+    },
     Friend {
         pseudo: String,
         add: bool,
@@ -386,6 +390,11 @@ pub enum Event {
         friends: bool,
         list: Vec<crate::proto::RankEntry>,
         me: Option<crate::proto::RankEntry>,
+    },
+    /// (v315) La suite du classement mondial demandée par `Cmd::LeaderboardMore`.
+    LeaderboardMore {
+        from: u32,
+        list: Vec<crate::proto::RankEntry>,
     },
     /// Amis, et s'ils sont en ligne.
     Friends(Vec<(String, bool)>),
@@ -2176,6 +2185,15 @@ impl Worker {
                 match self.request(&Request::Leaderboard { friends })? {
                     Response::Leaderboard { list, me } => {
                         self.emit(Event::Leaderboard { friends, list, me });
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
+            }
+            Cmd::LeaderboardMore { from } => {
+                match self.request(&Request::LeaderboardFrom { from })? {
+                    Response::Leaderboard { list, .. } => {
+                        self.emit(Event::LeaderboardMore { from, list });
                         Ok(())
                     }
                     r => self.unexpected(r),

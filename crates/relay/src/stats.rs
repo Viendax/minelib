@@ -412,8 +412,15 @@ impl Store {
         v
     }
 
-    /// Les 50 meilleurs, et sa propre ligne.
+    /// Les premiers (une page), et sa propre ligne. (v315) La suite : `top_from`. Avant,
+    /// le classement s'arrêtait aux 50 premiers.
     pub fn top(&self, me: &str) -> (Vec<RankEntry>, Option<RankEntry>) {
+        self.top_from(me, 0)
+    }
+
+    /// (v315) Une page du classement à partir du rang `from` (compté de zéro), et sa
+    /// propre ligne.
+    pub fn top_from(&self, me: &str, from: usize) -> (Vec<RankEntry>, Option<RankEntry>) {
         let ranked = self.ranked();
         let mine = ranked
             .iter()
@@ -421,8 +428,9 @@ impl Store {
             .map(|i| ranked[i].entry(i as u32 + 1));
         let list = ranked
             .iter()
-            .take(50)
             .enumerate()
+            .skip(from)
+            .take(minelib_net::proto::RANK_PAGE)
             .map(|(i, s)| s.entry(i as u32 + 1))
             .collect();
         (list, mine)
@@ -598,6 +606,49 @@ mod tests {
         };
         let s = Stats::from(old);
         assert_eq!(s.trust, TRUST_START + 2 * trust::REPORT);
+    }
+
+    /// (v315) Le classement n'est plus coupé aux 50 premiers : 450 joueurs classés se
+    /// lisent en trois pages qui se suivent sans trou ni doublon, et sa propre ligne est
+    /// donnée avec chacune, même au fond du classement.
+    #[test]
+    fn the_whole_ranking_is_read_page_after_page() {
+        let dir = std::env::temp_dir().join(format!("minelib-pages-{}", rand::random::<u32>()));
+        let mut st = Store::open(dir.clone()).unwrap();
+        for i in 0..450u32 {
+            let s = st.get_mut(&format!("Joueur{i:03}"));
+            s.matches = 1;
+            s.elo = 2000.0 - i as f64;
+        }
+        let page = minelib_net::proto::RANK_PAGE;
+        let (first, me) = st.top("joueur449");
+        assert_eq!(first.len(), page);
+        assert_eq!((first[0].pseudo.as_str(), first[0].rank), ("Joueur000", 1));
+        assert_eq!(me.unwrap().rank, 450);
+        let mut all = first;
+        loop {
+            let (more, me) = st.top_from("joueur449", all.len());
+            assert_eq!(me.unwrap().rank, 450);
+            let last = more.len() < page;
+            all.extend(more);
+            if last {
+                break;
+            }
+        }
+        assert_eq!(all.len(), 450);
+        for (i, e) in all.iter().enumerate() {
+            assert_eq!(e.rank as usize, i + 1);
+            assert_eq!(e.pseudo, format!("Joueur{i:03}"));
+        }
+        // Une page pleine tient largement dans une trame (65 535 octets).
+        let bytes = minelib_net::transport::encode(&minelib_net::proto::Response::Leaderboard {
+            list: all[..page].to_vec(),
+            me: None,
+        })
+        .unwrap();
+        println!("CLASSEMENT : une page de {page} lignes fait {} octets", bytes.len());
+        assert!(bytes.len() < 40_000, "{} octets", bytes.len());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
