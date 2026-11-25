@@ -22,6 +22,35 @@ use crate::menu::{self, Ctx, GOLD, GREY, RED, WHITE};
 /// Le relais de secours n'a pas repris le monde après ce temps : abandon.
 const TAKEOVER_GIVE_UP: Duration = Duration::from_secs(60);
 
+/// (v320) Seconde connexion du compte, qui entre au relais du monde par des passeurs (voir
+/// `Accounts::tend_move`) : ce qu'elle a dit jusqu'ici (rejoué quand elle remplace la
+/// première), depuis quand, quand elle est entrée, et le nœud iroh à part qui porte son
+/// tunnel (avec l'adresse locale de celui-ci), déposé par son fil une fois le tunnel ouvert.
+struct Moving {
+    client: Client,
+    said: Vec<Event>,
+    since: std::time::Instant,
+    ready: Option<std::time::Instant>,
+    relay: [u8; 32],
+    slot: std::sync::Arc<std::sync::Mutex<Option<(minelib_p2p::Node, String)>>>,
+}
+
+/// (v320) Essais ratés de lien par des passeurs : nouvel essai au bout de 1, 2, 4… minutes,
+/// 30 au plus.
+fn move_wait(fails: u8) -> Duration {
+    Duration::from_secs(60u64 << fails.saturating_sub(1).min(5)).min(Duration::from_secs(1800))
+}
+
+/// (v320) Le lien avec le relais du monde passe-t-il par les serveurs relais d'iroh (débit
+/// limité par un tiers) ? Faux s'il passe par des passeurs ou en direct, ou si ce n'est pas
+/// un tunnel (relais de ce PC, du réseau local).
+pub(crate) fn world_link_slow() -> bool {
+    let Some(ad) = CHOSEN.lock().unwrap().clone() else {
+        return false;
+    };
+    minelib_p2p::node_direct(ad.node) == Some(false)
+}
+
 /// Nœud iroh du jeu (un seul, gardé pour la durée du jeu). Son identité est gardée à côté
 /// du dossier du relais (`noeud.key`) : la même à chaque lancement.
 fn node(dir: &std::path::Path) -> Option<&'static minelib_p2p::Node> {
@@ -379,6 +408,8 @@ fn auto_relay(
     std::thread::spawn(move || {
         let Some(node) = node(&dir) else { return };
         node.serve(mine);
+        // (v320) Ses joueurs y viennent ensuite par des passeurs.
+        h.set_own_node(node.id());
         // Pseudos uniques avec les autres relais du DHT.
         h.set_whois(minelib_relay::federated_whois(node, public));
         h.set_peer_servers(minelib_relay::federated_servers(node, public));
@@ -529,6 +560,23 @@ pub struct Accounts {
     waking: Option<std::time::Instant>,
     wake_next: Option<std::time::Instant>,
     wake_fails: u8,
+    /// (v320) Lien avec le relais du monde par des passeurs (voir `tend_move`) : le nœud iroh
+    /// à part qui le porte, son adresse locale et le nœud du relais ; la seconde connexion en
+    /// train d'entrer ; prochain essai et essais ratés. `link_auto` : la connexion est celle
+    /// du relais trouvé tout seul (seul cas où l'on sait quel nœud la sert). `idle` (dit
+    /// par le jeu à chaque image) : au menu, sans partie ni recherche, le seul moment où
+    /// changer de connexion ne coupe rien. `link_moved` : c'est fait (le jeu redit alors à
+    /// la nouvelle connexion ce qu'il avait dit à l'ancienne). `room_at` : dernière demande
+    /// d'entrer dans une partie.
+    link_node: Option<minelib_p2p::Node>,
+    passeur_link: Option<(String, [u8; 32])>,
+    moving: Option<Moving>,
+    move_next: Option<std::time::Instant>,
+    move_fails: u8,
+    link_auto: bool,
+    idle: bool,
+    link_moved: bool,
+    room_at: Option<std::time::Instant>,
 }
 
 /// (v146) Retour au relais du monde après la veille : nouvel essai au bout de… ; au-delà de
@@ -604,6 +652,15 @@ impl Accounts {
             waking: None,
             wake_next: None,
             wake_fails: 0,
+            link_node: None,
+            passeur_link: None,
+            moving: None,
+            move_next: None,
+            move_fails: 0,
+            link_auto: false,
+            idle: false,
+            link_moved: false,
+            room_at: None,
         }
     }
 
@@ -721,6 +778,7 @@ impl Accounts {
             self.client = Some(Client::spawn_resolved(Box::new(move || {
                 auto_relay(&dir, &mut failed)
             })));
+            self.link_auto = true;
         }
         if self.client.is_none() {
             let mut addr_str = self.relay_addr.clone();
@@ -756,6 +814,7 @@ impl Accounts {
                 }
             }
             self.client = Some(Client::spawn(addr_str, key));
+            self.link_auto = false;
         }
         self.client.as_ref().expect("client")
     }
@@ -850,6 +909,7 @@ impl Accounts {
             if got.iter().any(|e| matches!(e, Event::TakenOver { .. })) {
                 log::info!("relais de secours : il a repris le monde, la partie continue chez lui");
                 self.client = self.probe.take();
+                self.link_auto = false;
                 self.world_paused = false;
                 self.probe_next = None;
                 self.last_heard = now;
@@ -862,6 +922,14 @@ impl Accounts {
             }) {
                 // (Il n'a pas encore repris le monde, ou ne répond pas : nouvel essai.)
                 self.probe = None;
+            }
+        }
+        // (v320) Lien par des passeurs : la seconde connexion entre ; entrée, elle remplace la
+        // première, et ce qu'elle a dit est lu comme ce que dit la connexion.
+        if events.is_empty() {
+            if let Some(replay) = self.tend_move(now) {
+                events = replay;
+                self.last_heard = now;
             }
         }
         let Some(client) = &self.client else { return };
@@ -1327,8 +1395,171 @@ impl Accounts {
             return;
         }
         if self.logged_in() {
+            // (v320) Une partie s'ouvre peut-être : pas de changement de connexion pendant ce
+            // temps (elle s'ouvre sur celle-ci).
+            if matches!(
+                cmd,
+                Cmd::Join(_) | Cmd::Host { .. } | Cmd::Search { .. } | Cmd::Party { .. }
+            ) {
+                self.room_at = Some(std::time::Instant::now());
+            }
             self.client().send(cmd);
         }
+    }
+
+    /// (v320) Le jeu dit à chaque image s'il est au menu, sans partie ni recherche en cours.
+    pub fn set_idle(&mut self, idle: bool) {
+        self.idle = idle;
+    }
+
+    /// (v320) La connexion au relais vient de changer (elle passe par des passeurs) : vrai
+    /// une fois. Ce que le jeu a dit à l'ancienne une fois pour toutes (garant, passeur)
+    /// est à redire à la nouvelle.
+    pub fn take_link_moved(&mut self) -> bool {
+        std::mem::take(&mut self.link_moved)
+    }
+
+    /// (v320) Lien avec le relais du monde par des passeurs. Le joueur y entre d'abord par
+    /// les serveurs relais d'iroh (un tiers au débit limité : 45 Ko/s mesurés, de quoi se
+    /// connecter et discuter, pas de recevoir un monde ni de jouer en FPS à 256 tick).
+    /// Au menu, si ce relais a des passeurs, une seconde connexion du compte s'ouvre par
+    /// une route qu'il donne (`Node::tunnel_by_passeurs`, depuis un nœud iroh à part : iroh
+    /// ferait partir une connexion de plus par le chemin déjà choisi), et entre comme la
+    /// première (mot de passe de la session, appareil de confiance : rien à redemander).
+    /// Entrée, elle remplace la première, qui se ferme. Ratée, la première reste, et un
+    /// nouvel essai a lieu plus tard. Rien ne change pour le joueur, sinon le débit.
+    fn tend_move(&mut self, now: std::time::Instant) -> Option<Vec<Event>> {
+        if let Some(m) = &mut self.moving {
+            // (Le joueur ouvre une partie, ou fait autre chose : on laisse tomber.)
+            let mut failed: Option<String> = (!self.idle).then(|| "partie en cours".into());
+            while failed.is_none() {
+                let Some(e) = m.client.poll() else { break };
+                match &e {
+                    Event::LoggedIn { .. } => m.ready = Some(now),
+                    Event::NeedTotp => failed = Some("code 2FA demandé".into()),
+                    Event::Error(t) | Event::Offline(t) => failed = Some(t.clone()),
+                    Event::Lost | Event::LoggedOut => failed = Some("connexion perdue".into()),
+                    _ => {}
+                }
+                m.said.push(e);
+            }
+            if failed.is_none() && m.ready.is_none() && m.since.elapsed() > Duration::from_secs(30)
+            {
+                failed = Some("délai dépassé".into());
+            }
+            // (Entrée, mais la première attend toujours une réponse : la remplacer la
+            // perdrait. Elle reste.)
+            if failed.is_none() && m.ready.is_some_and(|t| t.elapsed() > Duration::from_secs(10)) {
+                failed = Some("une demande en cours sur la première connexion".into());
+            }
+            if let Some(why) = failed {
+                self.moving = None;
+                self.move_fails = self.move_fails.saturating_add(1);
+                let wait = move_wait(self.move_fails);
+                self.move_next = Some(now + wait);
+                log::info!(
+                    "lien vers le relais : pas par des passeurs ({why}) — nouvel essai dans {} min",
+                    wait.as_secs() / 60
+                );
+                return None;
+            }
+            // Entrée : elle remplace la première quand celle-ci n'attend plus de réponse.
+            if m.ready.is_none() || self.busy.is_some() {
+                return None;
+            }
+            let m = self.moving.take()?;
+            if let Some((node, addr)) = m.slot.lock().unwrap().take() {
+                self.link_node = Some(node);
+                self.passeur_link = Some((addr, m.relay));
+            }
+            self.client = Some(m.client);
+            self.link_moved = true;
+            self.move_fails = 0;
+            self.move_next = None;
+            log::info!("lien vers le relais : il passe maintenant par des passeurs");
+            return Some(m.said);
+        }
+        let (node, key) = self.move_wanted(now)?;
+        let (pseudo, password) = self.login_secret.clone().or_else(|| self.remembered())?;
+        let backup = std::fs::read(self.backup_path(&pseudo)).ok();
+        let device = self.device(&pseudo);
+        let slot: std::sync::Arc<std::sync::Mutex<Option<(minelib_p2p::Node, String)>>> =
+            std::sync::Arc::default();
+        let put = slot.clone();
+        let dir = self.relay_dir.clone();
+        let mut failed: Vec<[u8; 32]> = Vec::new();
+        // 0 : à ouvrir ; 1 : ouvert (une reconnexion plus tard fait comme le jeu d'habitude) ;
+        // 2 : raté (la seconde connexion ne cherche pas d'autre chemin : la première reste).
+        let mut state = 0u8;
+        let client = Client::spawn_by_passeurs(Box::new(move || match state {
+            0 => {
+                state = 2;
+                // (Essais : sans serveur d'iroh.)
+                let n = if cfg!(test) {
+                    minelib_p2p::Node::start_offline()?
+                } else {
+                    minelib_p2p::Node::start_private()?
+                };
+                let addr = n.tunnel_by_passeurs(node, Duration::from_secs(6))?.to_string();
+                *put.lock().unwrap() = Some((n, addr.clone()));
+                state = 1;
+                Ok((addr, Some(key)))
+            }
+            1 => auto_relay(&dir, &mut failed),
+            _ => Err(anyhow::anyhow!("pas de route par des passeurs")),
+        }));
+        client.send(Cmd::Login {
+            pseudo,
+            password,
+            totp: None,
+            backup,
+            device,
+        });
+        log::info!("lien vers le relais : essai par des passeurs");
+        self.moving = Some(Moving {
+            client,
+            said: Vec::new(),
+            since: now,
+            ready: None,
+            relay: node,
+            slot,
+        });
+        None
+    }
+
+    /// (v320) Faut-il essayer de passer par des passeurs, et vers quel relais (nœud, clé) ?
+    fn move_wanted(&self, now: std::time::Instant) -> Option<([u8; 32], [u8; 32])> {
+        if !self.idle || !self.link_auto || self.busy.is_some() || self.client.is_none() {
+            return None;
+        }
+        let a = self.account.as_ref()?;
+        if self.dozing.is_some()
+            || self.waking.is_some()
+            || self.taking_over.is_some()
+            || self.probe.is_some()
+            || self.world_at.is_some()
+            || self.standby.is_some()
+            || self.party.0 != 0
+            || self.join_after_login.is_some()
+            || self.room_at.is_some_and(|t| t.elapsed() < Duration::from_secs(20))
+            || self.move_next.is_some_and(|t| now < t)
+            || !minelib_net::fast::passeurs_known()
+        {
+            return None;
+        }
+        let ad = CHOSEN.lock().unwrap().clone()?;
+        // Déjà rapide : par des passeurs (et toujours : iroh ne l'a pas fait passer par ses
+        // serveurs), ou en direct (`hote_direct=true` des deux côtés).
+        if minelib_p2p::node_direct(ad.node) == Some(true) {
+            return None;
+        }
+        // Entrer de nouveau sans rien demander au joueur : le mot de passe de la session, et
+        // l'appareil de confiance si le compte a la double authentification.
+        let (pseudo, _) = self.login_secret.clone().or_else(|| self.remembered())?;
+        if !pseudo.eq_ignore_ascii_case(&a.pseudo) || (a.totp && self.device(&pseudo).is_none()) {
+            return None;
+        }
+        Some((ad.node, ad.noise))
     }
 
     /// (v146) Peut-on se mettre en veille (et revenir) : connecté au relais du monde, avec
@@ -1381,6 +1612,7 @@ impl Accounts {
         let client = Client::spawn(addr, Some(rkey));
         client.send(Cmd::Wake { room, cert, key });
         self.client = Some(client);
+        self.link_auto = false;
         self.waking = Some(now);
     }
 
@@ -1549,6 +1781,7 @@ impl Accounts {
     fn start_takeover(&mut self) {
         if let Some(c) = self.takeover_client() {
             self.client = Some(c);
+            self.link_auto = false;
         }
     }
 
@@ -1704,6 +1937,7 @@ impl Accounts {
             e.region
         );
         // Directement s'il donne une adresse joignable, sinon par un tunnel vers son nœud.
+        self.link_auto = false;
         self.client = Some(Client::spawn_resolved(Box::new(move || {
             if let Ok(a) = addr.parse::<SocketAddr>() {
                 if TcpStream::connect_timeout(&a, Duration::from_millis(800)).is_ok() {
@@ -2231,11 +2465,120 @@ fn draw_qr(ui: &mut Ui, data: &str, x: f32, y: f32, side: f32) {
 mod relay_tests {
     use super::*;
 
+    /// (v320) Les essais qui touchent au relais choisi (`CHOSEN`) passent l'un après l'autre.
+    static CHOSEN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn chosen_lock() -> std::sync::MutexGuard<'static, ()> {
+        CHOSEN_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// (v320) Au menu, connecté au relais du monde sans passeurs (ici en direct ; dans le
+    /// jeu, par les serveurs d'iroh), le jeu ouvre une seconde connexion du compte par une
+    /// route de passeurs ; entrée, elle remplace la première sans que rien ne change pour le
+    /// joueur (toujours connecté, mêmes demandes), et le jeu ne recommence pas.
+    #[test]
+    fn at_the_menu_the_link_to_the_relay_moves_to_passeurs() {
+        let _lock = chosen_lock();
+        let root = std::env::temp_dir().join(format!("minelib-menu-lien-{}", rand::random::<u32>()));
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: root.join("relais"),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let node = minelib_p2p::Node::start_offline().unwrap();
+        node.serve(h.addr);
+        h.set_own_node(node.id());
+        let wait = |c: &Client, pred: &dyn Fn(&Event) -> bool| {
+            let t = std::time::Instant::now();
+            loop {
+                if let Some(e) = c.poll() {
+                    if pred(&e) {
+                        return;
+                    }
+                }
+                assert!(t.elapsed() < Duration::from_secs(30), "délai dépassé");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let mut pas = Vec::new();
+        for i in 0..4 {
+            let c = Client::spawn(h.addr.to_string(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: format!("PasMenu{i}"),
+                password: "motdepasse".into(),
+            });
+            wait(&c, &|e| matches!(e, Event::LoggedIn { .. }));
+            c.send(Cmd::Passeur(true));
+            pas.push(c);
+        }
+        minelib_net::fast::tunnel_asker("MoiMenu");
+        let mut acc = Accounts::new(
+            h.addr.to_string(),
+            &crypto::hex(&h.public),
+            root.join("joueur").join("relais"),
+            String::new(),
+        );
+        acc.sent = Some(("MoiMenu".into(), "motdepasse".into()));
+        acc.send(Cmd::Register {
+            pseudo: "MoiMenu".into(),
+            password: "motdepasse".into(),
+        });
+        // (Le relais trouvé tout seul, joint par un tunnel vers ce nœud : ce que le jeu fait
+        // d'habitude.)
+        acc.link_auto = true;
+        *CHOSEN.lock().unwrap() = Some(minelib_p2p::Ad {
+            node: node.id(),
+            noise: h.public,
+            name: "essai".into(),
+            since: 0,
+            seen: 0,
+        });
+        acc.set_idle(true);
+        let t = std::time::Instant::now();
+        while !acc.take_link_moved() {
+            acc.poll();
+            assert!(t.elapsed() < Duration::from_secs(60), "le lien n'a pas changé");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        println!("MENU : lien passé par des passeurs en {:?}", t.elapsed());
+        let (addr, relay) = acc.passeur_link.clone().expect("lien par des passeurs");
+        assert_eq!(relay, node.id());
+        // Les derniers mots de la seconde connexion sont lus : c'est elle que le jeu emploie.
+        for _ in 0..50 {
+            acc.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(acc.logged_in());
+        assert_eq!(acc.relay_at.as_ref().map(|(a, _)| a.clone()), Some(addr));
+        assert_eq!(minelib_p2p::node_direct(node.id()), Some(true));
+        assert!(!world_link_slow());
+        // Toujours connecté : une demande, sa réponse.
+        acc.client().send(Cmd::Leaderboard { friends: false });
+        let t = std::time::Instant::now();
+        while acc.leaderboard.is_none() {
+            acc.poll();
+            assert!(t.elapsed() < Duration::from_secs(20), "pas de réponse");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Et pas de nouvel essai.
+        for _ in 0..100 {
+            acc.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(acc.moving.is_none() && !acc.take_link_moved());
+        *CHOSEN.lock().unwrap() = None;
+        drop(pas);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// (v279) Les relais où le compte s'est connecté sont retenus, le dernier d'abord, sans
     /// doublon et pas plus de `KNOWN_MAX` ; ni ce PC ni un relais déjà essayé sans succès ne
     /// sont rejoints.
     #[test]
     fn relays_used_before_are_kept_and_tried_first() {
+        let _lock = chosen_lock();
         let root = std::env::temp_dir().join(format!("minelib-connus-{}", std::process::id()));
         let dir = root.join("relais");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2287,7 +2630,7 @@ mod relay_tests {
 /// (v315) Faut-il demander la suite du classement ? `have` lignes reçues, liste défilée
 /// jusqu'à `scroll`, suite déjà demandée quand on en avait `asked`.
 fn rank_more(have: usize, scroll: usize, asked: usize) -> bool {
-    have > 0 && have % proto::RANK_PAGE == 0 && asked != have && scroll + 60 >= have
+    have > 0 && have.is_multiple_of(proto::RANK_PAGE) && asked != have && scroll + 60 >= have
 }
 
 #[cfg(test)]

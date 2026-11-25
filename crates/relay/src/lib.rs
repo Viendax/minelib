@@ -16,6 +16,7 @@ mod journaux;
 mod limits;
 mod maps;
 mod mondes;
+pub mod passeur_seul;
 mod passeurs;
 mod provinces;
 mod registry;
@@ -765,6 +766,13 @@ impl Handle {
     /// `f` leur demande si le pseudo est déjà pris.
     pub fn set_whois(&self, f: WhoisFn) {
         *self.whois.lock().unwrap() = Some(f);
+    }
+
+    /// (v320) Le nœud iroh `node` sert ce relais (`Node::serve`, dans ce programme) : ses
+    /// joueurs y viennent ensuite par des passeurs (voir `passeurs::own_assign`).
+    pub fn set_own_node(&self, node: [u8; 32]) {
+        let mut st = self.state.lock().unwrap();
+        passeurs::set_own_node(&mut st, node);
     }
 }
 

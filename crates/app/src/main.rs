@@ -2808,7 +2808,18 @@ impl Game {
         if relayed {
             self.accounts.relayed_beat();
         }
+        // (v320) Au menu, sans partie : le lien avec le relais peut changer de connexion
+        // (par des passeurs). Changé, ce qu'on avait dit à l'ancienne est redit.
+        self.accounts.set_idle(
+            self.session.is_none()
+                && self.searching.is_none()
+                && self.garant.is_none()
+                && self.garant_worker.is_none(),
+        );
         self.accounts.poll();
+        if self.accounts.take_link_moved() {
+            self.garant_announced = None;
+        }
         let mut changed = false;
         if let Some(k) = self.accounts.new_relay_key.take() {
             self.options.relay_key = k;

@@ -2295,7 +2295,8 @@ impl BuildNet {
         self.spot_timer -= dt;
         self.close_timer -= dt;
         // (v285) Le relais qui reçoit nos positions est-il joint par les serveurs relais
-        // d'iroh ? (Le relais du monde ne compte pas : rien ne change pour lui.)
+        // d'iroh ? (v320) Le relais du monde aussi : depuis que le jeu ne montre plus son
+        // adresse IP (v313), il est joint par eux tant qu'il n'a pas de passeurs.
         self.slow_link.0 -= dt;
         if self.slow_link.0 <= 0.0 {
             let node = match self.shards.conns.get(&proto::region_of(chunk)) {
@@ -2306,7 +2307,10 @@ impl BuildNet {
                     .filter(|c| c.joined && c.link.is_some())
                     .map(|c| c.info.node),
             };
-            let slow = node.is_some_and(|n| minelib_p2p::node_direct(n) == Some(false));
+            let slow = match node {
+                Some(n) => minelib_p2p::node_direct(n) == Some(false),
+                None => crate::account::world_link_slow(),
+            };
             self.slow_link = (1.0, slow);
         }
         // (v285) Jamais plus d'une position par 1/256 s, de l'une ou l'autre sorte

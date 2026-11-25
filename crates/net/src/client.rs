@@ -164,6 +164,16 @@ pub enum Cmd {
     /// Sert (ou non) de passeur aux parties des autres (`crate::fast`), sans s'annoncer
     /// garant. (`GarantAvailable` le fait aussi : qui peut être garant peut être passeur.)
     Passeur(bool),
+    /// (v320) Silence complet du relais au-delà duquel on le tient pour perdu (lien par
+    /// des passeurs : plus long).
+    Patience(Duration),
+    /// (v320) Passeur sans joueur (`minelib-relay --passeur`), à dire avant `Passeur(true)` :
+    /// son adresse publique (un serveur la connaît, il n'a pas de box à interroger) et son
+    /// port UDP (0 : n'importe lequel).
+    PasseurAt {
+        ip: Option<std::net::Ipv4Addr>,
+        port: u16,
+    },
     GarantReady,
     Conflict {
         player: u64,
@@ -676,6 +686,14 @@ impl Client {
         Self::spawn_inner(String::new(), None, Some(resolve), true)
     }
 
+    /// (v320) Comme `spawn_resolved`, pour un lien avec le relais par des passeurs : un
+    /// silence est attendu `SILENCE_PASSEURS` avant de tenir le relais pour perdu.
+    pub fn spawn_by_passeurs(resolve: Resolver) -> Self {
+        let c = Self::spawn_inner(String::new(), None, Some(resolve), false);
+        c.send(Cmd::Patience(SILENCE_PASSEURS));
+        c
+    }
+
     fn spawn_with(addr: String, pinned: Option<[u8; 32]>, resolve: Option<Resolver>) -> Self {
         Self::spawn_inner(addr, pinned, resolve, false)
     }
@@ -766,9 +784,21 @@ pub fn peer_servers(addr: &str, key: [u8; 32], kind: u8) -> Result<Vec<proto::Se
 
 /// (v314) Le relais est-il muet ? `quiet` : temps depuis son dernier message ; `pinged` : un
 /// ping est parti depuis ; `ping_age` : il y a combien de temps.
+#[cfg(test)]
 fn silent(quiet: Duration, pinged: bool, ping_age: Duration) -> bool {
-    quiet > SILENCE_MAX && pinged && ping_age > SILENCE_PING
+    silent_after(SILENCE_MAX, quiet, pinged, ping_age)
 }
+
+/// (v320) Même règle, au bout de `limit` (lien par des passeurs : `SILENCE_PASSEURS`).
+fn silent_after(limit: Duration, quiet: Duration, pinged: bool, ping_age: Duration) -> bool {
+    quiet > limit && pinged && ping_age > SILENCE_PING
+}
+
+/// (v320) Lien avec le relais par des passeurs : si ses deux chaînes se taisent à la fois
+/// (deux passeurs perdus d'un coup), iroh le fait passer par ses serveurs au bout de 15 s.
+/// Le jeu l'attend, plutôt que de tenir le relais pour perdu à 10 s (et de quitter le
+/// monde où l'on est).
+const SILENCE_PASSEURS: Duration = Duration::from_secs(20);
 
 /// (v314) Sonde un relais : sa clé, et s'il parle le même protocole que ce jeu (il répond
 /// à son bonjour). Le jeu s'en sert pour choisir son relais : après une mise à jour qui
@@ -835,6 +865,10 @@ struct Worker {
     relay_pub: [u8; 32],
     /// Connexion de garant (deuxième connexion du compte pendant qu'il joue).
     garant: bool,
+    /// (v320) Silence complet du relais au-delà duquel on le tient pour perdu.
+    patience: Duration,
+    /// (v320) Passeur sans joueur : adresse publique et port UDP (voir `Cmd::PasseurAt`).
+    passeur_at: Option<(Option<std::net::Ipv4Addr>, u16)>,
     /// Voie rapide de la partie FPS en cours : sens de ce qu'on envoie, et le bout.
     fast: Option<(u8, crate::fast::Endpoint)>,
     /// Ce jeu sert de passeur aux parties des autres (tant qu'il s'annonce garant) : le
@@ -897,6 +931,8 @@ impl Worker {
             pseudo: String::new(),
             relay_pub: [0; 32],
             garant: false,
+            patience: SILENCE_MAX,
+            passeur_at: None,
             fast: None,
             passeur: None,
             relay_passeurs: false,
@@ -972,21 +1008,34 @@ impl Worker {
         }
         if self.passeur.is_none() {
             let (tx, probes) = channel();
-            let p = match crate::fast::Passeur::start_any(tx) {
+            // (v320) Passeur sans joueur : le port voulu, et son adresse publique, connue
+            // (serveur) : pas de box à interroger.
+            let (ip, port) = self.passeur_at.unwrap_or((None, 0));
+            let started = if port != 0 {
+                crate::fast::Passeur::start(port, tx)
+            } else {
+                crate::fast::Passeur::start_any(tx)
+            };
+            let p = match started {
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!("passeur : {e}");
                     return Ok(());
                 }
             };
-            crate::fast::set_own_passeur(p.port(), None);
-            let mapped = ask_box(p.port());
+            let fixed = ip.map(|ip| std::net::SocketAddrV4::new(ip, p.port()));
+            crate::fast::set_own_passeur(p.port(), fixed);
+            let mapped = if fixed.is_some() {
+                None
+            } else {
+                Some(ask_box(p.port()))
+            };
             self.passeur = Some(Passeur {
                 p,
                 probes,
                 on: false,
-                mapped: Some(mapped),
-                external: None,
+                mapped,
+                external: fixed,
                 heard: Instant::now(),
                 logged: (Instant::now(), 0, 0),
             });
@@ -1180,7 +1229,14 @@ impl Worker {
                 }
                 Ok(Some(Incoming::Push(b))) => chan.send_raw(&b).map(|_| None),
                 // (v314) Relais muet : perdu (voir `SILENCE_MAX`).
-                Ok(None) if silent(heard.elapsed(), last_ping > heard, last_ping.elapsed()) => {
+                Ok(None)
+                    if silent_after(
+                        self.patience,
+                        heard.elapsed(),
+                        last_ping > heard,
+                        last_ping.elapsed(),
+                    ) =>
+                {
                     Err(anyhow!("le relais ne répond plus"))
                 }
                 Ok(None) => Ok(None),
@@ -2123,6 +2179,14 @@ impl Worker {
                 Ok(())
             }
             Cmd::Passeur(on) => self.set_passeur(on),
+            Cmd::Patience(d) => {
+                self.patience = d;
+                Ok(())
+            }
+            Cmd::PasseurAt { ip, port } => {
+                self.passeur_at = Some((ip, port));
+                Ok(())
+            }
             Cmd::GarantReady => {
                 self.oneway(&Request::GarantReady)?;
                 Ok(())

@@ -444,6 +444,12 @@ const WAKE_WAIT: Duration = Duration::from_millis(2500);
 const ASK_WAIT: Duration = Duration::from_millis(1500);
 const CHECK_WAIT: Duration = Duration::from_millis(1500);
 
+/// (v317) Faut-il attendre que le jeu revienne au relais du monde avant d'ouvrir le
+/// tunnel ? Seulement en veille, et si ce relais avait des passeurs.
+pub(crate) fn wait_for_relay(dozing: bool, passeurs_lately: bool) -> bool {
+    dozing && passeurs_lately
+}
+
 /// Demande au relais du monde une route par des passeurs vers le nœud `remote`, l'ouvre
 /// dans `t`, et s'assure qu'elle passe de bout en bout. Rien : aucun relais de ce jeu n'a
 /// de passeur, la route n'est pas venue à temps, ou elle ne passe pas.
@@ -452,12 +458,6 @@ const CHECK_WAIT: Duration = Duration::from_millis(1500);
 /// chemin comme celui-ci à une connexion déjà ouverte (il n'ouvre de lui-même que des
 /// chemins directs ou par ses serveurs). Le tunnel doit donc partir par le passeur ; les
 /// serveurs d'iroh lui sont ajoutés ensuite, en secours.
-/// (v317) Faut-il attendre que le jeu revienne au relais du monde avant d'ouvrir le
-/// tunnel ? Seulement en veille, et si ce relais avait des passeurs.
-pub(crate) fn wait_for_relay(dozing: bool, passeurs_lately: bool) -> bool {
-    dozing && passeurs_lately
-}
-
 pub(crate) async fn ask(t: &PasseurTransport, remote: [u8; 32]) -> Option<u64> {
     if !fast::passeurs_known() {
         // (v317) En veille au fond d'un pays, ce jeu n'a plus de lien avec le relais du

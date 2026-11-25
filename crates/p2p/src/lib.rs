@@ -245,6 +245,19 @@ pub fn host_direct(_open_box: bool) -> bool {
     HOSTS_DIRECT.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 
+/// (v320) Une adresse joignable de partout : ni réseau local, ni boucle locale, ni la plage
+/// que les opérateurs partagent entre leurs abonnés (100.64.0.0/10).
+fn is_public_v4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || (o[0] == 100 && (64..128).contains(&o[1])))
+}
+
 /// (v285) Connexions iroh ouvertes par les tunnels de ce jeu, par nœud distant.
 static TUNNELS: std::sync::Mutex<Vec<([u8; 32], iroh::endpoint::Connection)>> =
     std::sync::Mutex::new(Vec::new());
@@ -420,6 +433,25 @@ impl Node {
         *self.ep.id().as_bytes()
     }
 
+    /// (v320) Adresse IPv4 publique de ce nœud, telle que la voient les serveurs d'iroh
+    /// (nœud avec transport IP seulement), attendue `wait` au plus : de quoi annoncer un
+    /// passeur sans joueur depuis un serveur, qui n'a pas de box à interroger.
+    pub fn public_ipv4(&self, wait: Duration) -> Option<std::net::Ipv4Addr> {
+        let start = std::time::Instant::now();
+        loop {
+            let found = self.ep.addr().addrs.iter().find_map(|a| match a {
+                iroh::TransportAddr::Ip(SocketAddr::V4(s)) if is_public_v4(*s.ip()) => {
+                    Some(*s.ip())
+                }
+                _ => None,
+            });
+            if found.is_some() || start.elapsed() >= wait {
+                return found;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     /// Rend le relais local `local` joignable par ce nœud. Chaque connexion commence
     /// par un préambule ([`preamble`]) qui donne au relais la vraie adresse du joueur
     /// distant : sans lui, tout le monde arriverait de 127.0.0.1.
@@ -450,6 +482,84 @@ impl Node {
                 });
             }
         });
+    }
+
+    /// (v320) Tunnel vers le nœud `remote` qui ne s'ouvre que par une route de passeurs, et
+    /// seulement si c'est elle qu'iroh choisit : le lien d'un joueur avec le relais du monde,
+    /// une fois entré par les serveurs d'iroh (c'est par ce premier lien que la route est
+    /// demandée). Rien d'ouvert sinon.
+    ///
+    /// À ouvrir depuis un nœud qui n'a encore aucune connexion vers `remote` : iroh fait
+    /// partir une nouvelle connexion par le chemin déjà choisi vers ce nœud, et n'ajoute
+    /// jamais celui des passeurs à une connexion ouverte.
+    pub fn tunnel_by_passeurs(&self, remote: [u8; 32], wait: Duration) -> Result<SocketAddr> {
+        let id = iroh::EndpointId::from_bytes(&remote).map_err(|e| anyhow!("{e}"))?;
+        let ep = self.ep.clone();
+        let passeurs = self.passeurs.clone();
+        // (Une route d'un tunnel fermé, gardée d'avant, n'est plus bonne.)
+        minelib_net::fast::forget_route(remote);
+        let (conn, listener, route) = self.rt.block_on(async move {
+            let route = passeur::ask(&passeurs, remote)
+                .await
+                .ok_or_else(|| anyhow!("pas de route par des passeurs"))?;
+            let addr = iroh::EndpointAddr::from_parts(
+                id,
+                [iroh::TransportAddr::Custom(passeur::addr(route))],
+            );
+            let conn = match tokio::time::timeout(wait, ep.connect(addr, ALPN)).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    passeurs.drop_route(route);
+                    return Err(anyhow!("par les passeurs : {e}"));
+                }
+                Err(_) => {
+                    passeurs.drop_route(route);
+                    return Err(anyhow!("par les passeurs : délai dépassé"));
+                }
+            };
+            // Le chemin en service doit être celui des passeurs (ni un serveur d'iroh, ni un
+            // lien direct).
+            let start = std::time::Instant::now();
+            loop {
+                let on = {
+                    let paths = conn.paths();
+                    let selected = paths.iter().find(|p| p.is_selected()).map(|p| {
+                        !p.is_relay() && !p.is_ip()
+                    });
+                    selected
+                };
+                match on {
+                    Some(true) => break,
+                    Some(false) => {
+                        conn.close(0u32.into(), b"pas par les passeurs");
+                        passeurs.drop_route(route);
+                        return Err(anyhow!("iroh a choisi un autre chemin que les passeurs"));
+                    }
+                    None if start.elapsed() > Duration::from_secs(2) => {
+                        conn.close(0u32.into(), b"pas par les passeurs");
+                        passeurs.drop_route(route);
+                        return Err(anyhow!("aucun chemin choisi"));
+                    }
+                    None => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            anyhow::Ok((conn, listener, route))
+        })?;
+        remember_tunnel(remote, &conn);
+        log::info!("tunnel : lien vers le relais ouvert par des passeurs");
+        let local = listener.local_addr()?;
+        self.rt
+            .spawn(passeur::keep(self.passeurs.clone(), remote, route, conn.clone()));
+        self.rt.spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let Ok((send, recv)) = conn.open_bi().await else {
+                    break;
+                };
+                tokio::spawn(pipe(tcp, send, recv));
+            }
+        });
+        Ok(local)
     }
 
     /// Tunnel vers le relais du nœud `remote` : renvoie une adresse locale où se
@@ -540,6 +650,23 @@ mod tests {
         set_hosts_direct(Some(false));
         assert!(!host_direct(false) && !host_direct(true));
         set_hosts_direct(None);
+    }
+
+    /// (v320) Seule une adresse joignable de partout sert à annoncer un passeur.
+    #[test]
+    fn only_a_public_ipv4_is_announced() {
+        for (ip, public) in [
+            ("203.0.113.7", false),
+            ("192.168.1.10", false),
+            ("10.0.0.1", false),
+            ("100.72.1.1", false),
+            ("127.0.0.1", false),
+            ("169.254.0.1", false),
+            ("82.65.10.3", true),
+            ("141.147.20.9", true),
+        ] {
+            assert_eq!(is_public_v4(ip.parse().unwrap()), public, "{ip}");
+        }
     }
 
     #[test]

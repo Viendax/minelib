@@ -58,7 +58,7 @@ pub fn clear_match_lock(root: &std::path::Path) {
 }
 
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 319;
+pub const VERSION: u32 = 320;
 const REPO: &str = "https://api.github.com/repos/Viendax/minelib/releases";
 const EVERY: Duration = Duration::from_secs(120);
 

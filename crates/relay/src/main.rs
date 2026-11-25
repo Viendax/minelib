@@ -6,6 +6,12 @@
 //!
 //! Par défaut, le relais est joignable sans port ouvert (iroh) et s'inscrit dans le DHT de
 //! BitTorrent : les jeux réglés sur `relay=auto` le trouvent tout seuls.
+//!
+//! (v320) `--passeur` : pas de relais, un passeur sans joueur (`passeur_seul`) pour une
+//! machine toujours allumée. Options : `--dir <dossier>` (`passeur_data`), `--ip <adresse
+//! publique>` (sinon celle que voient les serveurs d'iroh), `--port <premier port UDP>` (un
+//! par relais servi ; par défaut n'importe lesquels), `--relais "<nœud> <clé> <nom>"` (en
+//! plus des relais officiels et de ceux du DHT ; plusieurs fois possible).
 
 use anyhow::Result;
 
@@ -15,6 +21,10 @@ fn main() -> Result<()> {
          quinn=warn,quinn_proto=warn,tracing=warn,portmapper=warn,netwatch=warn,pkarr=warn",
     ))
     .init();
+    // (v320) Passeur sans joueur.
+    if std::env::args().any(|a| a == "--passeur") {
+        return passeur_main();
+    }
     // (v307) `--journaux` : recevoir les journaux réseau des joueurs qui les partagent, le
     // relevé de santé et les alertes du relais, dans `journaux_reseau.txt`.
     if std::env::args().any(|a| a == "--journaux") {
@@ -74,6 +84,8 @@ fn main() -> Result<()> {
                 h.set_peer_servers(minelib_relay::federated_servers(node, h.public));
                 let local = std::net::SocketAddr::from(([127, 0, 0, 1], h.addr.port()));
                 node.serve(local);
+                // (v320) Ses joueurs y viennent ensuite par des passeurs.
+                h.set_own_node(node.id());
                 minelib_p2p::publish(minelib_p2p::Ad {
                     node: node.id(),
                     noise: h.public,
@@ -130,4 +142,116 @@ fn main() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
     Ok(())
+}
+
+/// (v320) `minelib-relay --passeur` : voir `minelib_relay::passeur_seul`.
+fn passeur_main() -> Result<()> {
+    use minelib_relay::passeur_seul::{Headless, Options};
+    use std::time::{Duration, Instant};
+    let args: Vec<String> = std::env::args().collect();
+    let mut dir = std::path::PathBuf::from("passeur_data");
+    let mut ip: Option<std::net::Ipv4Addr> = None;
+    let mut port: u16 = 0;
+    let mut extra: Vec<minelib_p2p::Ad> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        let v = args.get(i + 1).cloned().unwrap_or_default();
+        match args[i].as_str() {
+            "--passeur" => {
+                i += 1;
+                continue;
+            }
+            "--dir" => dir = v.into(),
+            "--ip" => match v.parse() {
+                Ok(a) => ip = Some(a),
+                Err(_) => {
+                    eprintln!("--ip : adresse IPv4 attendue ({v})");
+                    std::process::exit(2);
+                }
+            },
+            "--port" => port = v.parse().unwrap_or(0),
+            "--relais" => extra.extend(minelib_p2p::parse_relays(&v)),
+            other => {
+                eprintln!("option inconnue : {other}");
+                std::process::exit(2);
+            }
+        }
+        i += 2;
+    }
+    std::fs::create_dir_all(&dir)?;
+    let key_path = dir.join("noeud.key");
+    let secret: [u8; 32] = std::fs::read(&key_path)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or_else(|| {
+            let k: [u8; 32] = minelib_net::transport::generate_static().0;
+            let _ = std::fs::write(&key_path, k);
+            k
+        });
+    // (Nœud avec transport IP : l'adresse d'un passeur est faite pour être connue.)
+    let node: &'static minelib_p2p::Node =
+        Box::leak(Box::new(minelib_p2p::Node::start_with(Some(secret))?));
+    let ip = match ip.or_else(|| node.public_ipv4(Duration::from_secs(20))) {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "Adresse publique introuvable : donne-la avec --ip (celle de la machine, vue \
+                 d'internet ; ses ports UDP doivent être ouverts)."
+            );
+            std::process::exit(2);
+        }
+    };
+    println!(
+        "Passeur sans joueur : {ip}, ports UDP {} — dossier {}",
+        if port == 0 {
+            "au hasard".to_string()
+        } else {
+            format!("à partir de {port}")
+        },
+        dir.display()
+    );
+    let mut p = Headless::new(Options {
+        dir: dir.clone(),
+        ip,
+        port,
+    });
+    let mut next_find = Instant::now();
+    let mut next_say = Instant::now() + Duration::from_secs(60);
+    loop {
+        if Instant::now() >= next_find {
+            next_find = Instant::now() + Duration::from_secs(600);
+            let mut ads = minelib_p2p::official();
+            ads.extend(extra.iter().cloned());
+            match minelib_p2p::find_relays() {
+                Ok(list) => ads.extend(list),
+                Err(e) => log::warn!("DHT : {e:#}"),
+            }
+            for ad in ads {
+                let (n, wait) = (ad.node, Duration::from_secs(10));
+                p.add(
+                    &ad.name,
+                    ad.noise,
+                    std::sync::Arc::new(move || {
+                        let addr = node.tunnel_checked(n, wait)?.to_string();
+                        // (Un relais d'une autre version du jeu n'en voudrait pas.)
+                        match minelib_net::client::probe(&addr, wait) {
+                            Ok((_, true)) => Ok(addr),
+                            Ok((_, false)) => Err(anyhow::anyhow!("autre version du jeu")),
+                            Err(e) => Err(e),
+                        }
+                    }),
+                );
+            }
+        }
+        p.tend();
+        if Instant::now() >= next_say {
+            next_say = Instant::now() + Duration::from_secs(60);
+            println!(
+                "Passeur : annoncé à {} relais sur {} connus.",
+                p.joined(),
+                p.relays()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }

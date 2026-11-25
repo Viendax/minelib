@@ -268,6 +268,26 @@ pub fn tunnel_wants(after: u64, pseudo: &str) -> (Vec<TunnelAsk>, u64) {
     (nodes, t.next - 1)
 }
 
+/// (v320) Toutes les demandes faites après la numéro `after` (sans le tri des essais par
+/// compte), et le numéro de la dernière : le relais y lit ce que dit le bout hôte des
+/// routes vers son propre nœud, qu'il tient lui-même (une route qui ne passe plus).
+pub fn tunnel_log(after: u64) -> (Vec<TunnelAsk>, u64) {
+    let t = TUNNELS.lock().unwrap();
+    let mut asks: Vec<TunnelAsk> = Vec::new();
+    for (n, ask) in &t.wants {
+        if *n > after && !asks.contains(ask) {
+            asks.push(*ask);
+        }
+    }
+    (asks, t.next - 1)
+}
+
+/// (v320) Oublie la route connue vers le nœud `node` (une route d'un tunnel fermé, qu'un
+/// nouveau tunnel prendrait pour bonne avant que le relais ait répondu).
+pub fn forget_route(node: [u8; 32]) {
+    TUNNELS.lock().unwrap().routes.retain(|r| r.node != node);
+}
+
 /// Essais, où plusieurs jeux vivent dans un même programme : seules les connexions de
 /// ces comptes envoient les demandes de tunnel (dans le jeu, un programme n'a qu'un
 /// compte, et toutes ses connexions les envoient).

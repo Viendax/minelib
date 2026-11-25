@@ -96,6 +96,14 @@ const TUNNEL_BAD_EVERY: std::time::Duration = std::time::Duration::from_secs(4);
 const TUNNEL_BAD_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 /// Tunnels d'un même compte, au plus (le plus ancien est repris au-delà).
 const TUNNELS_PER_PLAYER: usize = 12;
+/// (v320) Hôte des tunnels vers le nœud de ce relais lui-même : le lien d'un joueur avec
+/// lui, par des passeurs. Ce n'est pas une connexion : le relais tient ce bout de la route.
+pub(crate) const OWN: u64 = u64::MAX;
+/// (v320) Chaînes d'un lien vers ce relais, au plus : deux, sans passeur commun (quatre en
+/// tout). Les paquets en prennent une ; si un passeur tombe, chaque bout passe sur l'autre
+/// en deux secondes, sans qu'iroh s'en aperçoive, et la chaîne perdue est remplacée en
+/// gardant l'autre telle quelle (même sceau) : c'est par elle qu'arrive la réparation.
+const OWN_CHAINS: usize = 2;
 /// Demandes de tunnel acceptées d'une connexion par minute.
 const WANTS_PER_MIN: u16 = 240;
 
@@ -103,11 +111,16 @@ const WANTS_PER_MIN: u16 = 240;
 struct Tunnel {
     node: [u8; 32],
     pseudo: String,
-    /// Connexion du joueur (la dernière qui l'a demandé) et de l'hôte du nœud.
+    /// Connexion du joueur (la dernière qui l'a demandé) et de l'hôte du nœud (`OWN` : ce
+    /// relais lui-même). (v320) Et la machine du joueur : quand sa connexion se ferme, une
+    /// autre du même compte sur la même machine reprend le tunnel.
     guest: u64,
     host: u64,
+    guest_hw: Vec<[u8; 32]>,
     /// Passeurs retenus (connexion, clé du sceau de la route chez lui). (v308) Toujours
-    /// deux, en chaîne : le premier du côté du joueur, le second du côté de l'hôte.
+    /// deux, en chaîne : le premier du côté du joueur, le second du côté de l'hôte. (v320)
+    /// Lien vers ce relais : une ou deux chaînes ainsi, l'une après l'autre (chacune son
+    /// sceau).
     passeurs: Vec<(u64, [u8; 32])>,
     /// (v304) Passeurs par lesquels ce tunnel ne passait plus (signalés par ses bouts) :
     /// plus jamais pour lui. Et quand ses passeurs lui ont été donnés.
@@ -169,6 +182,12 @@ pub(crate) struct Fast {
     pub(crate) log_rate: HashMap<u64, (Instant, u16)>,
     pub(crate) refused: [u32; 3],
     pub(crate) conns_before: usize,
+    /// (v320) Nœuds iroh qui servent ce relais (`set_own_node`), empreintes de sa machine
+    /// (les passeurs de cette machine ne portent pas les liens vers lui), et dernière
+    /// demande lue de ce que disent les bouts hôtes qu'il tient (`fast::tunnel_log`).
+    own_nodes: Vec<[u8; 32]>,
+    own_hw: Vec<[u8; 32]>,
+    log_seen: u64,
 }
 
 impl Fast {
@@ -210,6 +229,12 @@ impl Fast {
     /// Passeurs vérifiés (essais et journal).
     pub(crate) fn verified(&self) -> usize {
         self.offers.values().filter(|o| o.verified).count()
+    }
+
+    /// (v320) Un passeur vérifié s'est-il annoncé sur ce port (essais) ?
+    #[cfg(test)]
+    pub(crate) fn offered_at(&self, port: u16) -> bool {
+        self.offers.values().any(|o| o.verified && o.addr.port() == port)
     }
 }
 
@@ -326,6 +351,30 @@ pub(crate) fn gone(st: &mut State, id: u64) {
     st.fast.asks.remove(&id);
     st.fast.told.remove(&id);
     st.fast.log_rate.remove(&id);
+    // (v320) Les tunnels qu'elle avait demandés passent à une autre connexion du même
+    // compte sur la même machine, s'il y en a une : c'est ainsi que le jeu change de lien
+    // avec ce relais (la nouvelle connexion, venue par les passeurs, entre ; puis l'ancienne,
+    // venue par les serveurs d'iroh, se ferme). Sinon le tunnel attend d'être redemandé ou
+    // repris, comme avant.
+    let moved: Vec<(u64, u64)> = st
+        .fast
+        .tunnels
+        .iter()
+        .filter(|(_, t)| t.guest == id)
+        .filter_map(|(r, t)| {
+            let other = st.conns.iter().find(|(c, x)| {
+                **c != id
+                    && x.pseudo.as_deref() == Some(t.pseudo.as_str())
+                    && minelib_net::hw::same_machine(&x.hw, &t.guest_hw)
+            })?;
+            Some((*r, *other.0))
+        })
+        .collect();
+    for (route, other) in moved {
+        if let Some(t) = st.fast.tunnels.get_mut(&route) {
+            t.guest = other;
+        }
+    }
     off(st, id);
     // (v301) Les relais qu'elle hébergeait ne sont plus là : leurs tunnels sont repris.
     st.fast.nodes.retain(|_, c| *c != id);
@@ -355,6 +404,7 @@ pub(crate) fn off(st: &mut State, id: u64) {
 /// refaites, les passeurs vérifiés sont resondés de temps en temps, et celui qui a manqué
 /// `MISSES_MAX` sondes de suite n'est plus retenu (jusqu'à sa prochaine annonce).
 pub(crate) fn upkeep(st: &mut State) {
+    own_reports(st);
     let Some(sock) = &st.fast.sock else {
         return;
     };
@@ -439,6 +489,35 @@ fn reassign(st: &mut State, id: u64) {
     }
 }
 
+/// (v320) Le nœud iroh `node` sert ce relais (`Node::serve`) : ses joueurs, entrés par les
+/// serveurs d'iroh, peuvent lui demander une route par des passeurs vers lui-même (leur
+/// lien avec lui : comptes, mondes, cartes, parties FPS), et il en tient le bout hôte.
+pub(crate) fn set_own_node(st: &mut State, node: [u8; 32]) {
+    if !st.fast.own_nodes.contains(&node) {
+        st.fast.own_nodes.push(node);
+    }
+    st.fast.own_hw = minelib_net::hw::fingerprints_for(&st.id.noise_public);
+    // (Ce qui a été dit avant ne le concerne pas.)
+    st.fast.log_seen = minelib_net::fast::tunnel_log(u64::MAX).1;
+}
+
+/// (v320) Ce que dit le bout hôte des liens vers ce relais, tenu ici même : une route où
+/// plus rien ne passe par aucune de ses chaînes reçoit d'autres passeurs.
+fn own_reports(st: &mut State) {
+    if st.fast.own_nodes.is_empty() {
+        return;
+    }
+    let (asks, last) = minelib_net::fast::tunnel_log(st.fast.log_seen);
+    st.fast.log_seen = last;
+    for ask in asks {
+        if let minelib_net::fast::TunnelAsk::Bad(route) = ask {
+            if st.fast.tunnels.get(&route).is_some_and(|t| t.host == OWN) {
+                tunnel_bad(st, OWN, route);
+            }
+        }
+    }
+}
+
 /// (v304) Cette connexion vient d'entrer : on lui dit s'il y a des passeurs (une fois).
 pub(crate) fn greet(st: &mut State, id: u64) {
     if st.fast.told.insert(id) {
@@ -511,18 +590,36 @@ pub(crate) fn node_ready(st: &mut State, id: u64, node: [u8; 32]) {
 /// des serveurs relais d'iroh. Le passeur ne sait ni qui ils sont ni ce qu'il porte (le
 /// tunnel est chiffré de bout en bout).
 pub(crate) fn tunnel_want(st: &mut State, id: u64, node: [u8; 32]) {
-    let Some(&host) = st.fast.nodes.get(&node) else {
-        return;
+    // (v320) Vers ce relais lui-même : il tient le bout hôte (`OWN`).
+    let own = st.fast.own_nodes.contains(&node);
+    let host = if own {
+        OWN
+    } else {
+        match st.fast.nodes.get(&node) {
+            Some(&h) => h,
+            None => return,
+        }
     };
     let Some(pseudo) = st.conns.get(&id).and_then(|c| c.pseudo.clone()) else {
         return;
     };
-    let (Some(g), Some(h)) = (st.conns.get(&id), st.conns.get(&host)) else {
+    let Some(g) = st.conns.get(&id) else {
         return;
     };
-    // Vers son propre relais : pas besoin de tunnel.
-    if host == id || (super::machines_apart(st) && super::same_machine(g, h)) {
-        return;
+    let guest_hw = g.hw.clone();
+    if own {
+        // (Le jeu de la machine du relais le joint sans tunnel.)
+        if super::machines_apart(st) && minelib_net::hw::same_machine(&g.hw, &st.fast.own_hw) {
+            return;
+        }
+    } else {
+        let Some(h) = st.conns.get(&host) else {
+            return;
+        };
+        // Vers son propre relais : pas besoin de tunnel.
+        if host == id || (super::machines_apart(st) && super::same_machine(g, h)) {
+            return;
+        }
     }
     let a = st.fast.asks.entry(id).or_insert((Instant::now(), 0));
     if a.0.elapsed() >= std::time::Duration::from_secs(60) {
@@ -545,6 +642,12 @@ pub(crate) fn tunnel_want(st: &mut State, id: u64, node: [u8; 32]) {
             if let Some(t) = st.fast.tunnels.get_mut(&route) {
                 t.renewed = Instant::now();
                 t.guest = id;
+            }
+            // (v320) Un lien vers ce relais : sa route est redite à chaque demande (celle-ci
+            // peut venir d'une connexion neuve, entrée par ce lien même), et complétée d'une
+            // seconde chaîne si des passeurs sont arrivés depuis.
+            if own {
+                own_assign(st, route);
             }
             return;
         }
@@ -572,6 +675,7 @@ pub(crate) fn tunnel_want(st: &mut State, id: u64, node: [u8; 32]) {
             pseudo,
             guest: id,
             host,
+            guest_hw,
             passeurs: Vec::new(),
             bad: Vec::new(),
             at: Instant::now(),
@@ -607,6 +711,10 @@ fn tunnel_assign(st: &mut State, route: u64) {
     let Some(t) = st.fast.tunnels.get(&route) else {
         return;
     };
+    if t.host == OWN {
+        own_assign(st, route);
+        return;
+    }
     let (guest, host, node) = (t.guest, t.host, t.node);
     let bad = t.bad.clone();
     let before: Vec<u64> = t.passeurs.iter().map(|(p, _)| *p).collect();
@@ -720,6 +828,162 @@ fn tunnel_assign(st: &mut State, route: u64) {
     tunnel_tell(st, guest, host, node, route, &[hop(first.1)], &[hop(second.1)]);
 }
 
+/// (v320) Passeurs d'un lien vers ce relais (`OWN`) : les chaînes qui peuvent encore servir
+/// sont gardées telles quelles (mêmes passeurs, même sceau), et complétées jusqu'à
+/// `OWN_CHAINS` par des paires neuves, chacune son sceau. Garder la chaîne vivante compte
+/// ici plus qu'ailleurs : la route est redite au joueur par son lien avec ce relais, qui
+/// passe justement par elle.
+fn own_assign(st: &mut State, route: u64) {
+    let Some(t) = st.fast.tunnels.get(&route) else {
+        return;
+    };
+    let (guest, node) = (t.guest, t.node);
+    let bad = t.bad.clone();
+    let before = t.passeurs.clone();
+    let guest_hw = t.guest_hw.clone();
+    let apart = super::machines_apart(st);
+    // Un passeur sert : vérifié, toujours là, pas signalé pour ce lien, ni le joueur, ni
+    // sur sa machine ou sur celle de ce relais (il verrait les deux bouts).
+    let ok = |p: &u64| -> Option<SocketAddrV4> {
+        let o = st.fast.offers.get(p)?;
+        let c = st.conns.get(p)?;
+        if !o.verified || c.kicked || c.garant_banned || super::link_bad(c) {
+            return None;
+        }
+        if *p == guest || bad.contains(p) {
+            return None;
+        }
+        if apart
+            && (minelib_net::hw::same_machine(&c.hw, &guest_hw)
+                || minelib_net::hw::same_machine(&c.hw, &st.fast.own_hw))
+        {
+            return None;
+        }
+        Some(o.addr)
+    };
+    // Les chaînes gardées.
+    let mut chains: Vec<[(u64, SocketAddrV4, [u8; 32]); 2]> = Vec::new();
+    for c in before.chunks(2) {
+        if let [a, b] = c {
+            if let (Some(x), Some(y)) = (ok(&a.0), ok(&b.0)) {
+                if chains.len() < OWN_CHAINS {
+                    chains.push([(a.0, x, a.1), (b.0, y, b.1)]);
+                }
+            }
+        }
+    }
+    let kept = chains.len();
+    // Des paires neuves : passeurs libres, chacun sur sa propre adresse (deux passeurs d'une
+    // même maison pourraient s'entendre), les moins chargés et les plus proches d'abord.
+    let giver = st.fast.offers.get(&guest).is_some_and(|o| o.verified);
+    let room = if giver {
+        TUNNEL_ROOM
+    } else {
+        TUNNEL_ROOM + TUNNEL_GIVERS
+    };
+    let used: Vec<u64> = chains.iter().flat_map(|c| c.iter().map(|x| x.0)).collect();
+    let mut cands: Vec<(usize, f32, u64, SocketAddrV4)> = st
+        .fast
+        .offers
+        .keys()
+        .filter(|p| !used.contains(p))
+        .filter_map(|p| {
+            let addr = ok(p)?;
+            let load = st.fast.load(*p);
+            if load + room >= LOAD_MAX {
+                return None;
+            }
+            let ms = super::link_ms(&st.conns[p]).unwrap_or(999.0);
+            Some(((ms / 20.0) as usize * 1000 + load, ms, *p, addr))
+        })
+        .collect();
+    cands.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.cmp(&b.2))
+    });
+    let mut ips: Vec<Ipv4Addr> = chains
+        .iter()
+        .flat_map(|c| c.iter().map(|x| *x.1.ip()))
+        .collect();
+    let mut fresh: Vec<(u64, SocketAddrV4)> = Vec::new();
+    for (_, _, p, addr) in cands {
+        if !apart || !ips.contains(addr.ip()) {
+            ips.push(*addr.ip());
+            fresh.push((p, addr));
+        }
+    }
+    let mut fresh = fresh.into_iter();
+    while chains.len() < OWN_CHAINS {
+        let (Some(a), Some(b)) = (fresh.next(), fresh.next()) else {
+            break;
+        };
+        let seal: [u8; 32] = rand::random();
+        chains.push([(a.0, a.1, seal), (b.0, b.1, seal)]);
+    }
+    // Ceux qui ne le portent plus n'ont plus sa route.
+    let now: Vec<u64> = chains.iter().flat_map(|c| c.iter().map(|x| x.0)).collect();
+    for (p, _) in before.iter().filter(|(p, _)| !now.contains(p)) {
+        if let Some(c) = st.conns.get(p) {
+            transport::push(
+                &c.tx,
+                &Response::PasseurTask {
+                    lot: route,
+                    routes: Vec::new(),
+                },
+            );
+        }
+    }
+    if chains.is_empty() {
+        st.fast.tunnels.remove(&route);
+        if !before.is_empty() {
+            tunnel_tell(st, guest, OWN, node, route, &[], &[]);
+        }
+        return;
+    }
+    // Les passeurs des chaînes neuves apprennent leur lien (les gardés l'ont déjà) : le
+    // premier parle au joueur, le second à ce relais.
+    for c in &chains[kept..] {
+        let (first, second) = (c[0], c[1]);
+        for (me, other, dir) in [
+            (first, second, minelib_net::fast::TO_GUEST),
+            (second, first, minelib_net::fast::TO_HOST),
+        ] {
+            if let Some(conn) = st.conns.get(&me.0) {
+                transport::push(
+                    &conn.tx,
+                    &Response::PasseurLink {
+                        lot: route,
+                        route,
+                        seal: me.2,
+                        dir,
+                        addr: other.1.ip().octets(),
+                        port: other.1.port(),
+                    },
+                );
+            }
+        }
+    }
+    let hop = |a: SocketAddrV4, seal: [u8; 32]| FastHop {
+        addr: a.ip().octets(),
+        port: a.port(),
+        seal,
+    };
+    let to_guest: Vec<FastHop> = chains.iter().map(|c| hop(c[0].1, c[0].2)).collect();
+    let to_host: Vec<FastHop> = chains.iter().map(|c| hop(c[1].1, c[1].2)).collect();
+    let passeurs: Vec<(u64, [u8; 32])> = chains
+        .iter()
+        .flat_map(|c| [(c[0].0, c[0].2), (c[1].0, c[1].2)])
+        .collect();
+    if let Some(t) = st.fast.tunnels.get_mut(&route) {
+        if t.passeurs != passeurs {
+            t.passeurs = passeurs;
+            t.at = Instant::now();
+        }
+    }
+    tunnel_tell(st, guest, OWN, node, route, &to_guest, &to_host);
+}
+
 /// La route du tunnel (ou sa reprise : aucun passeur) est dite à ses deux bouts, l'hôte
 /// d'abord (il doit s'être montré au passeur avant le premier paquet du joueur). Chaque
 /// bout ne reçoit que les passeurs auxquels il écrit lui-même (`to_guest`, `to_host`).
@@ -733,6 +997,27 @@ fn tunnel_tell(
     to_host: &[FastHop],
 ) {
     for (c, is_host, hops) in [(host, true, to_host), (guest, false, to_guest)] {
+        // (v320) Le bout hôte d'un lien vers ce relais : tenu ici même, par le nœud iroh
+        // qui le sert (dans ce programme).
+        if c == OWN {
+            let vias = hops
+                .iter()
+                .map(|h| minelib_net::fast::Via {
+                    addr: std::net::SocketAddr::from((h.addr, h.port)),
+                    seal: h.seal,
+                })
+                .collect();
+            minelib_net::fast::tunnel_given(
+                minelib_net::fast::TunnelRoute {
+                    node,
+                    route,
+                    host: true,
+                    vias,
+                },
+                false,
+            );
+            continue;
+        }
         if let Some(c) = st.conns.get(&c) {
             transport::push(
                 &c.tx,
@@ -1236,6 +1521,250 @@ mod tests {
         let id = node.id();
         until(|| h.state.lock().unwrap().fast.nodes.contains_key(&id));
         node
+    }
+
+    /// Lignes du classement reçues (une demande, sa réponse) : le lien avec le relais sert.
+    fn answered(c: &Client, within: Duration) -> bool {
+        c.send(Cmd::Leaderboard { friends: false });
+        let t = Instant::now();
+        while t.elapsed() < within {
+            match c.poll() {
+                Some(Event::Leaderboard { .. }) => return true,
+                Some(Event::Lost) | Some(Event::LoggedOut) => panic!("lien perdu"),
+                _ => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        false
+    }
+
+    /// (v320) Le lien d'un joueur avec ce relais lui-même, par des passeurs. Le relais est
+    /// servi par un nœud iroh, comme dans le jeu ; le joueur y entre d'abord sans eux (dans
+    /// le jeu : par les serveurs d'iroh), demande une route vers ce nœud, et ouvre par elle,
+    /// depuis un nœud à part, une seconde connexion qui entre avec le même compte ; la
+    /// première se ferme, le tunnel passe à la seconde. Avec quatre passeurs, la route a
+    /// deux chaînes sans passeur commun, un sceau chacune. Le premier passeur de la chaîne
+    /// en service tombe : le lien continue par l'autre sans se refermer, la chaîne perdue
+    /// est retirée et l'autre gardée telle quelle ; un passeur de plus arrive : la route
+    /// retrouve une seconde chaîne, la première toujours la même.
+    #[test]
+    fn a_player_reaches_this_relay_itself_through_two_chains_of_passeurs() {
+        let (h, login) = relay("lien");
+        let relay_node = minelib_p2p::Node::start_offline().unwrap();
+        relay_node.serve(h.addr);
+        h.set_own_node(relay_node.id());
+        let mut pas: Vec<Option<Client>> = Vec::new();
+        for i in 0..4 {
+            let (c, _) = login(&format!("PasLien{i}"));
+            c.send(Cmd::Passeur(true));
+            pas.push(Some(c));
+        }
+        until(|| h.state.lock().unwrap().fast.verified() == 4);
+        minelib_net::fast::tunnel_asker("MoiLien");
+        let (first, _) = login("MoiLien");
+        let mine = minelib_p2p::Node::start_offline().unwrap();
+        let t = mine
+            .tunnel_by_passeurs(relay_node.id(), Duration::from_secs(10))
+            .expect("tunnel par les passeurs");
+        let second = Client::spawn(t.to_string(), Some(h.public));
+        second.send(Cmd::Login {
+            pseudo: "MoiLien".into(),
+            password: "motdepasse".into(),
+            totp: None,
+            backup: None,
+            device: None,
+        });
+        wait(&second, |e| matches!(e, Event::LoggedIn { .. }));
+        let (route, chains) = {
+            let st = h.state.lock().unwrap();
+            let (r, t) = st
+                .fast
+                .tunnels
+                .iter()
+                .find(|(_, t)| t.host == OWN)
+                .expect("un lien vers ce relais");
+            (*r, t.passeurs.clone())
+        };
+        assert_eq!(chains.len(), 4, "deux chaînes de deux");
+        let ids: std::collections::HashSet<u64> = chains.iter().map(|x| x.0).collect();
+        assert_eq!(ids.len(), 4, "aucun passeur commun");
+        assert!(chains[0].1 == chains[1].1 && chains[2].1 == chains[3].1);
+        assert_ne!(chains[0].1, chains[2].1, "un sceau par chaîne");
+        assert_eq!(minelib_p2p::node_direct(relay_node.id()), Some(true));
+        assert_eq!(relay_node.passeurs().routes(), 1, "le relais tient le bout hôte");
+        // La première connexion se ferme : le tunnel passe à la seconde.
+        drop(first);
+        until(|| {
+            let st = h.state.lock().unwrap();
+            let mine = st
+                .conns
+                .values()
+                .filter(|c| c.pseudo.as_deref() == Some("MoiLien"))
+                .count();
+            mine == 1 && st.conns.contains_key(&st.fast.tunnels[&route].guest)
+        });
+        assert!(answered(&second, Duration::from_secs(10)), "le lien sert");
+        // Le premier passeur de la chaîne en service tombe.
+        let fallen = {
+            let st = h.state.lock().unwrap();
+            st.conns[&chains[0].0].pseudo.clone().unwrap()
+        };
+        let i: usize = fallen.trim_start_matches("PasLien").parse().unwrap();
+        let before = mine.passeurs().via(route);
+        let t0 = Instant::now();
+        drop(pas[i].take());
+        // La route du joueur change de passeur : dite par le relais, par l'autre chaîne.
+        until(|| mine.passeurs().via(route) != before);
+        println!("LIEN : le joueur change de passeur après {:?}", t0.elapsed());
+        assert!(answered(&second, Duration::from_secs(10)), "le lien continue");
+        let took = t0.elapsed();
+        println!("LIEN : un passeur tombe, le lien répond de nouveau après {took:?}");
+        until(|| {
+            let st = h.state.lock().unwrap();
+            st.fast.tunnels.get(&route).is_some_and(|t| t.passeurs == chains[2..4])
+        });
+        for _ in 0..20 {
+            assert!(answered(&second, Duration::from_secs(5)));
+        }
+        // Un passeur de plus : la route retrouve une seconde chaîne à la demande suivante
+        // (le jeu redemande sa route toutes les 30 s ; ici, tout de suite).
+        let (c5, _) = login("PasLien4");
+        c5.send(Cmd::Passeur(true));
+        until(|| h.state.lock().unwrap().fast.verified() == 4);
+        minelib_net::fast::tunnel_want(relay_node.id());
+        until(|| {
+            let st = h.state.lock().unwrap();
+            st.fast
+                .tunnels
+                .get(&route)
+                .is_some_and(|t| t.passeurs.len() == 4 && t.passeurs[..2] == chains[2..4])
+        });
+        assert!(answered(&second, Duration::from_secs(10)));
+    }
+
+    /// (v320) Lien vers ce relais : deux ou trois passeurs donnent une chaîne, un seul n'en
+    /// donne aucune (il verrait les deux bouts) ; le jeu de la machine du relais ne demande
+    /// jamais de route vers lui.
+    #[test]
+    fn a_link_to_this_relay_takes_one_chain_with_two_or_three_passeurs() {
+        let (h, login) = relay("lien-une");
+        h.set_own_node([0x5a; 32]);
+        let (_g, gl) = login("MoiUne");
+        let (a, _) = login("PasUne0");
+        a.send(Cmd::Passeur(true));
+        until(|| h.state.lock().unwrap().fast.verified() == 1);
+        transport::push(&gl, &Request::TunnelWant { node: [0x5a; 32] });
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(h.state.lock().unwrap().fast.tunnels(), 0, "un passeur seul : rien");
+        let (b, _) = login("PasUne1");
+        let (c, _) = login("PasUne2");
+        b.send(Cmd::Passeur(true));
+        c.send(Cmd::Passeur(true));
+        until(|| h.state.lock().unwrap().fast.verified() == 3);
+        transport::push(&gl, &Request::TunnelWant { node: [0x5a; 32] });
+        until(|| h.state.lock().unwrap().fast.tunnels() == 1);
+        let st = h.state.lock().unwrap();
+        let t = st.fast.tunnels.values().next().unwrap();
+        assert_eq!((t.host, t.passeurs.len()), (OWN, 2));
+        assert_eq!(t.passeurs[0].1, t.passeurs[1].1);
+    }
+
+    /// (v320) Débit d'un lien vers ce relais par une chaîne de passeurs (ici sur cette
+    /// machine : ce qui est mesuré, c'est ce que le chemin laisse passer, pas un réseau) :
+    /// un monde de 2 Mo, puis un flux de partie FPS (256 messages de 300 octets par seconde,
+    /// ce que l'hôte envoie à un joueur). Par les serveurs d'iroh, 2 Mo prennent 43 s
+    /// (mesuré depuis un PC, v317).
+    #[test]
+    fn a_link_through_passeurs_carries_a_world_and_a_256_tick_stream() {
+        use std::io::{Read, Write};
+        let (h, login) = relay("debit");
+        // Un nœud que ce relais tient pour le sien, servant un puits qui répond à chaque
+        // envoi : ici, ce n'est pas le relais (on mesure le chemin seul).
+        let sink = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in sink.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut c = c;
+                    let mut head = [0u8; 5];
+                    if c.read_exact(&mut head).is_err() {
+                        return;
+                    }
+                    let mut who = vec![0u8; head[4] as usize];
+                    let _ = c.read_exact(&mut who);
+                    // Chaque bloc : 4 octets de longueur, puis le bloc ; réponse : 1 octet.
+                    loop {
+                        let mut n = [0u8; 4];
+                        if c.read_exact(&mut n).is_err() {
+                            return;
+                        }
+                        let mut buf = vec![0u8; u32::from_le_bytes(n) as usize];
+                        if c.read_exact(&mut buf).is_err() || c.write_all(&[1]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let node = minelib_p2p::Node::start_offline().unwrap();
+        node.serve(sink_addr);
+        h.set_own_node(node.id());
+        let mut pas = Vec::new();
+        for i in 0..2 {
+            let (c, _) = login(&format!("PasDebit{i}"));
+            c.send(Cmd::Passeur(true));
+            pas.push(c);
+        }
+        until(|| h.state.lock().unwrap().fast.verified() == 2);
+        minelib_net::fast::tunnel_asker("MoiDebit");
+        let (_me, _) = login("MoiDebit");
+        let mine = minelib_p2p::Node::start_offline().unwrap();
+        let t = mine
+            .tunnel_by_passeurs(node.id(), Duration::from_secs(10))
+            .expect("tunnel par les passeurs");
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_nodelay(true).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let send = |c: &mut std::net::TcpStream, block: &[u8]| {
+            c.write_all(&(block.len() as u32).to_le_bytes()).unwrap();
+            c.write_all(block).unwrap();
+        };
+        // Un monde : 2 Mo en blocs de 64 Kio, puis l'accusé du dernier.
+        let block = vec![7u8; 64 * 1024];
+        let t0 = Instant::now();
+        let n = 2_000_000 / block.len() + 1;
+        for _ in 0..n {
+            send(&mut c, &block);
+        }
+        let mut ack = vec![0u8; n];
+        c.read_exact(&mut ack).unwrap();
+        let took = t0.elapsed();
+        let kbs = (n * block.len()) as f64 / 1024.0 / took.as_secs_f64();
+        println!("DEBIT : {} octets en {:.2} s, {:.0} Ko/s", n * block.len(), took.as_secs_f64(), kbs);
+        assert!(kbs > 400.0, "{kbs:.0} Ko/s");
+        // Une partie FPS : 256 messages de 300 octets par seconde pendant 3 s.
+        let msg = vec![3u8; 300];
+        let mut late = Vec::new();
+        let start = Instant::now();
+        for i in 0..768u32 {
+            let due = start + Duration::from_micros(i as u64 * 3906);
+            if let Some(d) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+            let sent = Instant::now();
+            send(&mut c, &msg);
+            let mut a = [0u8; 1];
+            c.read_exact(&mut a).unwrap();
+            late.push(sent.elapsed());
+        }
+        late.sort();
+        let (p50, p99) = (late[late.len() / 2], late[late.len() * 99 / 100]);
+        println!(
+            "DEBIT : 256 par seconde, aller-retour médian {:?}, 99 % sous {:?}, en {:.2} s",
+            p50,
+            p99,
+            start.elapsed().as_secs_f64()
+        );
+        assert!(start.elapsed() < Duration::from_secs(5), "le flux a pris du retard");
     }
 
     /// (v301, v308) Un joueur ouvre un tunnel vers le relais qu'un autre héberge : le
