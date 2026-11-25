@@ -526,11 +526,22 @@ fn mix(style: u8, col: i32, row: i32, lay: i32, o: f32) -> Jaw {
         let side = px.abs();
         if smile {
             // Une bande courbe, plus haute vers les joues ; elle s'ouvre surtout au milieu.
-            let line = 3.0 + 0.24 * px * px;
-            let bulge = 1.0 - (px / 4.2).powi(2);
-            let bottom = (line - 0.55 - 2.8 * wide * bulge).max(1.0);
-            let top = line + 0.5 + 1.2 * wide * bulge;
-            return Some(((bottom - 0.5).ceil() as i32, (top - 0.5).floor() as i32, side > 3.0));
+            let rows = |px: f32| {
+                let line = 3.0 + 0.24 * px * px;
+                let bulge = 1.0 - (px / 4.2).powi(2);
+                let bottom = (line - 0.55 - 2.8 * wide * bulge).max(1.0);
+                let top = line + 0.5 + 1.2 * wide * bulge;
+                ((bottom - 0.5).ceil() as i32, (top - 0.5).floor() as i32)
+            };
+            let (lo, mut hi) = rows(px);
+            // (v310) « Plus de blanc là, à la place ça le fait sourire ; agrandis la bouche là et
+            // là, sur ces deux pixels » : grande ouverte, de chaque côté des deux dents du
+            // milieu, le haut de la bouche monte d'un cube, à la hauteur de la colonne d'à
+            // côté (vers la joue) : son bord du haut fait le sourire.
+            if side == 1.5 && wide > 0.6 {
+                hi = hi.max(rows(2.5).1);
+            }
+            return Some((lo, hi, side > 3.0));
         }
         // L'ovale, et ses coins qui remontent d'un cube par colonne.
         let half = 2.0 + wide;
@@ -595,9 +606,10 @@ fn mix(style: u8, col: i32, row: i32, lay: i32, o: f32) -> Jaw {
         return Jaw::Flesh;
     }
     // (v306) « Bouche juste cette face et celle-là quand il a la bouche ouverte, sinon on dirait
-    // que ce sont ses yeux » : le sourire ouvert, à chaque coin, le cube sombre au-dessus de
-    // la dent du coin est refermé sur son visage (il restait seul, comme un œil).
-    if smile && corner && lay == 0 && row > lo {
+    // que ce sont ses yeux » ; (v310) « en rouge, ça doit être de la même couleur qu'en bleu » :
+    // le sourire ouvert (plus d'une rangée au coin), chaque coin est refermé sur son visage,
+    // du blanc de sa peau : ni le cube sombre resté seul en haut, ni la dent du coin.
+    if smile && corner && lay == 0 && hi > lo {
         return Jaw::Flesh;
     }
     if lay == 0 && (smile || !corner) {
@@ -731,6 +743,12 @@ pub fn skin(part: usize, c: [usize; 3], d: [usize; 3], k: usize) -> u32 {
                 return if edge { OUTLINE } else { SOCKET };
             }
         }
+    }
+    // (v310) « Les 2 pixels en rouge doivent être de la même couleur qu'en bleu » : sur son
+    // visage, la plaque jaunâtre du milieu, au-dessus de sa bouche, déborde de deux cubes
+    // d'un côté, sur ses deux rangées du bas (ils prennent la couleur du cube d'à côté).
+    if part == HEAD && k == 0 && x * 8 / d[0] == 4 && matches!(y * 16 / d[1], 6 | 7) {
+        return skin(part, [3 * d[0] / 8, y, c[2]], d, k);
     }
     let middle = x == (d[0] - 1) / 2 || x == d[0] / 2;
     if part == CHEST && k <= 1 && y % 3 == 1 && !middle {
@@ -2615,12 +2633,25 @@ mod tests {
                         }
                     }
                 }
+                // (v310) Grande ouverte : de chaque côté des dents du milieu, la bouche monte
+                // jusqu'à la rangée des dents des coins (ces deux cubes étaient blancs) ; au
+                // milieu, au-dessus des deux dents, son visage reste.
+                if style == MOUTH_STYLE && open == 1.0 {
+                    let at = |col: usize, row: usize| {
+                        jaw_of(style, [col * d[0] / 8, row * d[1] / 16, 0], d, open)
+                    };
+                    assert_eq!((at(2, 5), at(5, 5)), (Jaw::Hollow, Jaw::Hollow));
+                    assert_eq!((at(3, 5), at(4, 5)), (Jaw::Flesh, Jaw::Flesh));
+                    assert_eq!((at(3, 4), at(4, 4)), (Jaw::Tooth, Jaw::Tooth));
+                    assert_eq!((at(1, 5), at(6, 5)), (Jaw::Tooth, Jaw::Tooth));
+                }
                 // (v306) Le sourire ouvert : sur son visage, rien de sombre aux deux colonnes
                 // du bord (on aurait dit ses yeux), seulement la dent du coin.
+                // (v310) Ni dent : ses coins ont le blanc de sa peau.
                 if matches!(style, 6 | 8) && open >= 0.35 {
                     for y in 0..d[1] {
                         for x in [0, d[0] - 1] {
-                            assert_ne!(jaw_of(style, [x, y, 0], d, open), Jaw::Hollow, "{style} {open}");
+                            assert_eq!(jaw_of(style, [x, y, 0], d, open), Jaw::Flesh, "{style} {open}");
                         }
                     }
                 }
