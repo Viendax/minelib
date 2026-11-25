@@ -2020,8 +2020,9 @@ impl Worker {
             },
             Cmd::GarantAvailable(on) => {
                 self.oneway(&Request::GarantAvailable { on })?;
-                // Qui peut être garant peut être passeur (`crate::fast`).
-                self.set_passeur(on)
+                // Qui peut être garant peut être passeur (`crate::fast`), (v308) s'il l'a
+                // accepté.
+                self.set_passeur(on && crate::fast::passeur_allowed())
             }
             Cmd::FastWant(groups) => {
                 self.oneway(&Request::FastWant { groups })?;

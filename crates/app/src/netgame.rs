@@ -5495,7 +5495,7 @@ mod tests {
     fn fast_match_at(passeurs_lag: bool, div: u32) -> FastRun {
         const LAG: usize = 40;
         let dir = std::env::temp_dir().join(format!("minelib-net-rapide-{}", rand_u32()));
-        for p in ["Pas1", "Pas2"] {
+        for p in ["Pas1", "Pas2", "Pas3", "Pas4"] {
             minelib_relay::test_seed_games(&dir, p, 5);
         }
         minelib_relay::ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -5519,8 +5519,9 @@ mod tests {
             wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
             (c, link)
         };
-        // Deux joueurs sans lien avec la partie prêtent leur port.
-        let passeurs: Vec<Client> = ["Pas1", "Pas2"]
+        // Quatre joueurs sans lien avec la partie prêtent leur port : deux voies, chacune une
+        // chaîne de deux passeurs (v308).
+        let passeurs: Vec<Client> = ["Pas1", "Pas2", "Pas3", "Pas4"]
             .iter()
             .map(|p| {
                 let (c, _) = login(p);
@@ -5787,7 +5788,7 @@ mod tests {
         // Ni trou ni doublon : la prédiction de l'invité est l'état de l'hôte.
         assert!(r.end_gap < 0.05, "prédiction de l'invité = hôte (écart {})", r.end_gap);
         // Les positions sont parties par les passeurs, chacun sa part.
-        assert_eq!(r.stats.heard, 3, "les deux passeurs répondent");
+        assert_eq!(r.stats.heard, 3, "les deux voies répondent");
         assert!(r.stats.sent > 500, "paquets partis par la voie rapide : {}", r.stats.sent);
         assert!(
             r.stalled * 10 < r.frames.max(1),

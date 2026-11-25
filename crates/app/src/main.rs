@@ -441,6 +441,8 @@ impl Game {
         // il est le relais, l'a demandé (paramètres avancés).
         minelib_net::netlog::set_share(options.share_netlog == Some(true));
         minelib_relay::set_receive_logs(options.receive_netlogs);
+        // (v308) Passeur : seulement si le joueur l'a accepté.
+        minelib_net::fast::set_passeur_allowed(options.passeur == Some(true));
         jobs::set_uniform_sharing(options.cpu_uniform);
         crate::audio::set_output(&options.audio_out);
         crate::voice::set_input(&options.audio_in);
@@ -1115,6 +1117,31 @@ impl Game {
                 share_answer = Some(false);
             }
         }
+        // (v308) Puis, une seule fois aussi : servir de passeur ? C'est un échange : ton
+        // jeu porte les paquets chiffrés d'autres joueurs, les leurs portent les tiens, et
+        // personne ne voit l'adresse de celui à qui il parle. Mais celui à qui un passeur
+        // remet un paquet voit l'adresse du passeur : on ne le devient pas sans l'accepter.
+        let mut passeur_answer = None;
+        if self.options.share_netlog.is_some() && self.options.passeur.is_none() {
+            let y0 = c.h - 116.0 * s;
+            c.ui.text(4.0 * s, y0, s, WHITE, "Relayer pour les autres joueurs ?");
+            for (i, line) in [
+                "Ton jeu porte des paquets chiffrés d'autres joueurs, les leurs portent les",
+                "tiens : c'est ce qui cache les adresses IP entre joueurs. Ceux à qui ton jeu",
+                "remet un paquet voient ton adresse (pas ton pseudo). Paramètres avancés.",
+            ]
+            .iter()
+            .enumerate()
+            {
+                c.ui.text(4.0 * s, y0 + 11.0 * s + i as f32 * 7.0 * ds, ds, GREY, *line);
+            }
+            if c.button("Oui", 4.0 * s + 33.0 * s, y0 + 32.0 * s, 66.0, true) {
+                passeur_answer = Some(true);
+            }
+            if c.button("Non", 4.0 * s + 105.0 * s, y0 + 32.0 * s, 66.0, true) {
+                passeur_answer = Some(false);
+            }
+        }
         let credit = "Textures : VoxelArt Libre (CC BY 4.0 / CC0) - voir CREDITS.txt";
         let tw = Ui::text_width(credit, ds);
         c.ui.text(
@@ -1127,6 +1154,13 @@ impl Game {
         if let Some(yes) = share_answer {
             self.options.share_netlog = Some(yes);
             minelib_net::netlog::set_share(yes);
+            if let Err(e) = self.options.save(&self.paths.options) {
+                log::error!("options : {e:#}");
+            }
+        }
+        if let Some(yes) = passeur_answer {
+            self.options.passeur = Some(yes);
+            minelib_net::fast::set_passeur_allowed(yes);
             if let Err(e) = self.options.save(&self.paths.options) {
                 log::error!("options : {e:#}");
             }
@@ -3280,7 +3314,7 @@ impl Game {
         let ds = (s / 2.0).floor().max(1.0);
         c.text_center("Paramètres avancés", c.h * 0.18, s * 2.0, WHITE);
         let cx = c.w / 2.0;
-        let mut y = c.h * 0.34;
+        let mut y = c.h * 0.28;
         let share = self.options.share_netlog == Some(true);
         let label = if share {
             "Partager mon journal réseau : oui"
@@ -3312,8 +3346,29 @@ impl Game {
             c.text_center(line, y, ds, GREY);
             y += 7.0 * ds;
         }
+        y += 12.0 * s;
+        // (v308) Passeur.
+        let pass = self.options.passeur == Some(true);
+        let label = if pass {
+            "Relayer pour les autres joueurs : oui"
+        } else {
+            "Relayer pour les autres joueurs : non"
+        };
+        let flip_pass = c.button(label, cx, y, 300.0, true);
+        y += 23.0 * s;
+        for line in [
+            "Ton jeu porte des paquets chiffrés d'autres joueurs, les leurs portent les tiens : c'est ce qui",
+            "cache les adresses IP entre joueurs. Ceux à qui ton jeu remet un paquet voient ton adresse.",
+        ] {
+            c.text_center(line, y, ds, GREY);
+            y += 7.0 * ds;
+        }
         y += 14.0 * s;
-        let done = c.button("Terminé", cx, (c.h * 0.72).max(y), 200.0, true);
+        let done = c.button("Terminé", cx, (c.h * 0.78).max(y), 200.0, true);
+        if flip_pass {
+            self.options.passeur = Some(!pass);
+            minelib_net::fast::set_passeur_allowed(!pass);
+        }
         if flip_share {
             self.options.share_netlog = Some(!share);
             minelib_net::netlog::set_share(!share);
@@ -3322,7 +3377,7 @@ impl Game {
             self.options.receive_netlogs = !recv;
             minelib_relay::set_receive_logs(!recv);
         }
-        if flip_share || flip_recv || done || input.pressed(KeyCode::Escape) {
+        if flip_share || flip_recv || flip_pass || done || input.pressed(KeyCode::Escape) {
             if let Err(e) = self.options.save(&self.paths.options) {
                 log::error!("options : {e:#}");
             }

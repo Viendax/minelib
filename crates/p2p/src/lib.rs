@@ -238,10 +238,9 @@ pub fn set_hosts_direct(choice: Option<bool>) {
 /// En direct, les joueurs servis voient l'adresse IP de l'hôte, et savent que c'est lui
 /// qui héberge. (v301) Ce n'est plus fait que sur demande (`hote_direct=true`) : un hôte
 /// anonyme est maintenant joint par des passeurs (`passeur`), sans le débit limité des
-/// serveurs relais d'iroh, et celui dont la box est ouverte porte lui-même ses tunnels
-/// quand il n'y a pas d'autre passeur : aussi vite qu'en direct, et les joueurs n'y
-/// voient qu'une adresse de passeur comme une autre. La v297 le mettait en direct de
-/// lui-même dans ce cas.
+/// serveurs relais d'iroh. (v308) Toujours deux, en chaîne ; son propre jeu ne porte plus
+/// jamais ses tunnels (il verrait l'adresse de ses joueurs). La v297 le mettait en direct
+/// de lui-même quand sa box était ouverte.
 pub fn host_direct(_open_box: bool) -> bool {
     HOSTS_DIRECT.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
@@ -794,6 +793,93 @@ mod tests {
         let (relay, paths) = paths_of(host.id(), 1);
         eprintln!("RESEAU 3 : chemins {paths:?}");
         assert_eq!(relay, Some(true));
+    }
+
+    /// (v308) Sur le vrai réseau : 256 messages par seconde et par joueur pendant 20 s
+    /// vers un hôte anonyme, par les serveurs relais d'iroh (le cas sans passeur). Combien
+    /// reviennent, en combien de temps : c'est ce que ces serveurs laissent passer d'un
+    /// jeu. `MINELIB_ESSAI_JOUEURS` : nombre de joueurs en même temps (1 sans la variable,
+    /// 4 au plus : ces serveurs sont partagés par tout le monde, on ne les charge pas pour
+    /// voir quand ils cèdent), chacun avec son propre nœud ; l'hôte, lui, n'a qu'une
+    /// connexion à son serveur.
+    #[test]
+    #[ignore = "réseau"]
+    fn on_the_real_network_256_messages_a_second_through_iroh_servers() {
+        use std::io::{Read, Write};
+        let players: usize = std::env::var("MINELIB_ESSAI_JOUEURS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 4);
+        let host = Node::start_private().unwrap();
+        host.serve(echo());
+        std::thread::sleep(Duration::from_secs(4));
+        const N: u32 = 256 * 20;
+        let remote = host.id();
+        let runs: Vec<_> = (0..players)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let guest = Node::start().unwrap();
+                    let t = guest.tunnel(remote).unwrap();
+                    let mut c = std::net::TcpStream::connect(t).unwrap();
+                    c.set_nodelay(true).unwrap();
+                    c.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+                    assert!(said_back(&mut c, b"debut"));
+                    let mut back = c.try_clone().unwrap();
+                    let started = std::time::Instant::now();
+                    let reader = std::thread::spawn(move || {
+                        // Chaque message porte son numéro : son temps d'aller-retour.
+                        let mut times = Vec::with_capacity(N as usize);
+                        let mut b = [0u8; 5];
+                        for _ in 0..N {
+                            if back.read_exact(&mut b).is_err() {
+                                break;
+                            }
+                            let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                            let sent = Duration::from_secs_f64(f64::from(n) / 256.0);
+                            times.push(started.elapsed().saturating_sub(sent));
+                        }
+                        times
+                    });
+                    for n in 0..N {
+                        let due = Duration::from_secs_f64(f64::from(n) / 256.0);
+                        if let Some(wait) = due.checked_sub(started.elapsed()) {
+                            std::thread::sleep(wait);
+                        }
+                        let mut m = [0u8; 5];
+                        m[..4].copy_from_slice(&n.to_le_bytes());
+                        if c.write_all(&m).is_err() {
+                            break;
+                        }
+                    }
+                    let times = reader.join().unwrap();
+                    drop(guest);
+                    (times, started.elapsed())
+                })
+            })
+            .collect();
+        let mut times = Vec::new();
+        let mut longest = Duration::ZERO;
+        for r in runs {
+            let (t, took) = r.join().unwrap();
+            times.extend(t);
+            longest = longest.max(took);
+        }
+        let got = times.len();
+        times.sort();
+        let at = |q: f64| times.get(((got as f64 - 1.0) * q) as usize).copied().unwrap_or_default();
+        eprintln!(
+            "RESEAU 256 : {players} joueur(s), {} messages envoyés, {got} revenus, en {longest:?} \
+             au plus ; aller-retour médian {:?}, 95 % sous {:?}, pire {:?}",
+            N as usize * players,
+            at(0.5),
+            at(0.95),
+            at(1.0)
+        );
+        let (relay, paths) = paths_of(remote, 0);
+        eprintln!("RESEAU 256 : chemins {paths:?}");
+        assert_eq!(relay, Some(true));
+        assert_eq!(got, N as usize * players, "des messages ne sont pas revenus");
     }
 
     /// Deux nœuds iroh sur cette machine : un relais TCP local joint par le tunnel.

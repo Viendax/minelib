@@ -323,6 +323,20 @@ pub fn tunnel_route(node: [u8; 32]) -> Option<TunnelRoute> {
 }
 
 
+/// (v308) Le joueur a-t-il accepté que son jeu serve de passeur ? Un passeur montre son
+/// adresse IP à ceux à qui il remet des paquets (un bout de route et un autre passeur) :
+/// ce n'est plus fait d'office pour tout jeu qui peut être garant, seulement pour qui l'a
+/// accepté (question posée une fois au menu d'accueil, paramètres avancés).
+static PASSEUR_OK: AtomicBool = AtomicBool::new(false);
+
+pub fn set_passeur_allowed(on: bool) {
+    PASSEUR_OK.store(on, Ordering::Relaxed);
+}
+
+pub fn passeur_allowed() -> bool {
+    PASSEUR_OK.load(Ordering::Relaxed)
+}
+
 /// (v304) Un relais auquel ce jeu est connecté a des passeurs en ce moment (redit par ses
 /// connexions tant que c'est vrai) : sans cela, inutile de demander une route et de
 /// l'attendre avant d'ouvrir un tunnel.
@@ -643,14 +657,14 @@ impl Passeur {
         }
     }
 
-    /// (v304) Route d'une chaîne de deux passeurs (elle remplace ce que ce passeur
-    /// portait pour l'attribution `lot`) : les paquets du sens `dir` lui viennent de
+    /// (v304) Route d'une chaîne de deux passeurs, dans l'attribution `lot` : les paquets du sens `dir` lui viennent de
     /// l'autre passeur, à l'adresse `from`, et c'est là qu'il envoie ceux de l'autre
     /// sens. Il ne voit ainsi qu'un des deux bouts de la route.
     pub fn set_link(&self, lot: u64, route: u64, seal: [u8; 32], dir: u8, from: SocketAddr) {
         let mut hops = self.inner.hops.lock().unwrap();
-        hops.retain(|_, h| h.lot != lot);
-        if hops.len() >= ROUTES_MAX || dir > 1 {
+        // (v308) Elle s'ajoute aux autres routes de l'attribution (une partie FPS en a une
+        // par joueur) ; une attribution se retire d'un bloc par `set_lot` vide.
+        if (hops.len() >= ROUTES_MAX && !hops.contains_key(&route)) || dir > 1 {
             return;
         }
         let mut ends = [None; 2];

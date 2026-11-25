@@ -157,6 +157,10 @@ pub struct Options {
     /// (v307) Quand ce PC est le relais : recevoir les journaux réseau des joueurs qui les
     /// partagent, dans `journaux_reseau.txt` (paramètres avancés). `recevoir_journaux=true`.
     pub receive_netlogs: bool,
+    /// (v308) Ce jeu sert-il de passeur (il porte des paquets chiffrés d'autres joueurs, et
+    /// montre son adresse IP à ceux à qui il les remet) ? Rien : pas encore demandé (la
+    /// question est posée une fois, au menu d'accueil). `passeur=true` ou `false`.
+    pub passeur: Option<bool>,
     /// Clé du relais retenue au premier contact (hexadécimal, vide = pas encore).
     pub relay_key: String,
     /// Dernier pseudo utilisé (prérempli à la connexion).
@@ -204,6 +208,7 @@ impl Default for Options {
             invitation: String::new(),
             share_netlog: None,
             receive_netlogs: false,
+            passeur: None,
             relay_key: String::new(),
             pseudo: String::new(),
         }
@@ -277,6 +282,13 @@ impl Options {
             if let Some(v) = kv.get("recevoir_journaux") {
                 o.receive_netlogs = v == "true";
             }
+            if let Some(v) = kv.get("passeur") {
+                o.passeur = match v.as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                };
+            }
             if let Some(v) = kv.get("relay_key") {
                 o.relay_key = v.trim().to_string();
             }
@@ -338,7 +350,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\njournal_reseau={}\nrecevoir_journaux={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\njournal_reseau={}\nrecevoir_journaux={}\npasseur={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -370,7 +382,12 @@ impl Options {
                     Some(false) => "false",
                     None => "demander",
                 },
-                self.receive_netlogs
+                self.receive_netlogs,
+                match self.passeur {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "demander",
+                }
             ),
         )?;
         Ok(())
@@ -1013,6 +1030,7 @@ mod tests {
             // (v307) Le partage du journal réseau : pas encore demandé, puis oui ou non ;
             // la réception, non sans la ligne.
             assert_eq!((again.share_netlog, again.receive_netlogs), (None, false));
+            assert_eq!(again.passeur, None);
             let mut o = again;
             o.share_netlog = Some(voulu != Some(false));
             o.receive_netlogs = true;
@@ -1020,6 +1038,10 @@ mod tests {
             let back = Options::load(&f);
             assert_eq!(back.share_netlog, Some(voulu != Some(false)));
             assert!(back.receive_netlogs);
+            let mut o = back;
+            o.passeur = Some(true);
+            o.save(&f).unwrap();
+            assert_eq!(Options::load(&f).passeur, Some(true));
         }
         let _ = fs::remove_dir_all(dir);
     }
