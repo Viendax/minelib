@@ -40,6 +40,15 @@ pub struct GpuTimes {
     /// compté seulement quand la carte sait horodater hors d'une passe (`whole_n`).
     pub whole: f32,
     pub whole_n: u32,
+    /// (v321) Entre deux images, sur la carte : de l'horodatage écrit après la présentation
+    /// au début des commandes de l'image (les données envoyées pour elle, copiées avant).
+    pub upload: f32,
+    pub upload_n: u32,
+    /// (v321) Entre deux images, sur la carte : de la fin de l'image d'avant à l'horodatage
+    /// écrit après sa présentation (la présentation, et ce que Windows ou d'autres
+    /// programmes font tourner sur la carte pendant ce temps).
+    pub presenting: f32,
+    pub presenting_n: u32,
 }
 
 impl GpuTimes {
@@ -258,6 +267,10 @@ pub fn gpu(t: GpuTimes) {
         p.window_gpu.0.gap_n += t.gap_n;
         p.window_gpu.0.whole += t.whole;
         p.window_gpu.0.whole_n += t.whole_n;
+        p.window_gpu.0.upload += t.upload;
+        p.window_gpu.0.upload_n += t.upload_n;
+        p.window_gpu.0.presenting += t.presenting;
+        p.window_gpu.0.presenting_n += t.presenting_n;
         p.window_gpu.1 += 1;
     });
 }
@@ -384,7 +397,16 @@ pub fn frame_end() {
                 } else {
                     String::new()
                 };
-                format!(" | GPU moyen : scène {:.2}{}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2}{whole}{gap})", g.scene / k, g.extra(k), g.taa / k, g.present / k, g.span / k)
+                let split = if g.upload_n > 0 && g.presenting_n > 0 {
+                    format!(
+                        " [dont présentation et autres programmes {:.2}, données envoyées {:.2}]",
+                        g.presenting / g.presenting_n as f32,
+                        g.upload / g.upload_n as f32
+                    )
+                } else {
+                    String::new()
+                };
+                format!(" | GPU moyen : scène {:.2}{}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2}{whole}{gap}{split})", g.scene / k, g.extra(k), g.taa / k, g.present / k, g.span / k)
             } else {
                 " | GPU : mesure indisponible".to_string()
             };

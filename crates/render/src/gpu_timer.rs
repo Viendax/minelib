@@ -29,7 +29,10 @@ const PASSES: u32 = 11;
 const WHOLE_BEGIN: u32 = PASSES * 2;
 const WHOLE_END: u32 = PASSES * 2 + 1;
 /// Chaque passe × (début, fin), puis les deux horodatages de l'image entière.
-const QUERIES: u32 = PASSES * 2 + 2;
+/// (v321) Horodatage écrit par un petit envoi à part juste après la présentation de l'image
+/// d'avant (`open`) : il coupe « entre deux images » en deux, voir `after_submit`.
+const OPENED: u32 = PASSES * 2 + 2;
+const QUERIES: u32 = PASSES * 2 + 3;
 /// Tampons de relecture en rotation (le GPU a quelques images d'avance).
 const RING: usize = 4;
 
@@ -54,6 +57,11 @@ pub struct GpuTimer {
     frame: u64,
     slot_frame: Vec<u64>,
     prev_end: Option<(u64, u64)>,
+    /// (v321) Fin de toutes les commandes de l'image d'avant (`WHOLE_END`) : son numéro et
+    /// son horodatage.
+    prev_whole_end: Option<(u64, u64)>,
+    /// (v321) `begin` déjà fait par `open` pour l'image qui vient.
+    opened: bool,
     /// (v316) La carte sait horodater entre deux passes (`WHOLE_BEGIN`, `WHOLE_END`).
     inside: bool,
 }
@@ -98,6 +106,8 @@ impl GpuTimer {
             frame: 0,
             slot_frame: vec![0; RING],
             prev_end: None,
+            prev_whole_end: None,
+            opened: false,
             inside: device
                 .features()
                 .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
@@ -105,7 +115,31 @@ impl GpuTimer {
     }
 
     /// Début d'image : choisit un tampon libre pour cette image.
+    /// Avant les commandes de l'image, si `open` ne l'a pas déjà fait.
     pub fn begin(&mut self) {
+        if std::mem::take(&mut self.opened) {
+            return;
+        }
+        self.start();
+    }
+
+    /// (v321) Juste après la présentation d'une image : réserve déjà la place de la suivante
+    /// et y écrit l'horodatage `OPENED` dans un petit envoi à part. Sur la carte, entre la
+    /// fin de l'image d'avant et le début de la suivante, on sait alors ce qui revient à la
+    /// présentation (et à ce que Windows ou d'autres programmes font tourner sur la carte à
+    /// ce moment), et ce qui revient aux données envoyées pour l'image (maillages, lumières,
+    /// joueurs…), copiées avant ses commandes.
+    pub fn open(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.start();
+        self.opened = true;
+        if self.inside && self.slot.is_some() {
+            let mut e = device.create_command_encoder(&Default::default());
+            e.write_timestamp(&self.set, OPENED);
+            queue.submit([e.finish()]);
+        }
+    }
+
+    fn start(&mut self) {
         self.marks.store(0, Ordering::Relaxed);
         self.frame += 1;
         let i = self.next;
@@ -213,6 +247,24 @@ impl GpuTimer {
                 let (wb, we) = (t[WHOLE_BEGIN as usize], t[WHOLE_END as usize]);
                 let whole = (self.inside && wb != 0 && we > wb)
                     .then(|| (we - wb) as f32 * self.period_ns / 1e6);
+                // (v321) « Entre deux images » coupé en deux par `OPENED` : de la fin de
+                // l'image d'avant à l'horodatage écrit après sa présentation, puis de là au
+                // début des commandes de celle-ci. Écarté au-delà de 50 ms (menu, fenêtre
+                // réduite : l'horodatage date alors d'avant la pause).
+                let ms_between = |a: u64, b: u64| {
+                    (a != 0 && b > a)
+                        .then(|| (b - a) as f32 * self.period_ns / 1e6)
+                        .filter(|m| *m < 50.0)
+                };
+                let op = t[OPENED as usize];
+                let upload = if self.inside { ms_between(op, wb) } else { None };
+                let presenting = match self.prev_whole_end {
+                    Some((f, end)) if self.inside && f + 1 == frame => ms_between(end, op),
+                    _ => None,
+                };
+                if self.inside && we > wb && wb != 0 {
+                    self.prev_whole_end = Some((frame, we));
+                }
                 out[n] = Some(GpuTimes {
                     scene: ms(SCENE),
                     taa: ms(TAA),
@@ -235,6 +287,10 @@ impl GpuTimer {
                     gap_n: gap.filter(|g| *g < 500.0).map_or(0, |_| 1),
                     whole: whole.unwrap_or(0.0),
                     whole_n: whole.map_or(0, |_| 1),
+                    upload: upload.unwrap_or(0.0),
+                    upload_n: upload.map_or(0, |_| 1),
+                    presenting: presenting.unwrap_or(0.0),
+                    presenting_n: presenting.map_or(0, |_| 1),
                 });
                 n += 1;
             }

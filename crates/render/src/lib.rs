@@ -4265,6 +4265,9 @@ impl Renderer {
                 }
                 perf::gpu(g);
             }
+            // (v321) Place de l'image suivante réservée dès maintenant, avec un horodatage
+            // juste après cette présentation (`GpuTimer::open`).
+            t.open(&self.device, &self.queue);
         }
 
         taa.prev_view_proj = Some(view_proj);
