@@ -948,6 +948,9 @@ struct Conn {
     /// même compte, client « minelib-garant ») : elle ne sert que de garant, on ne la
     /// prend jamais pour le joueur lui-même.
     garant_only: bool,
+    /// (v313) Bits de preuve de travail en plus annoncés à cette connexion pour une
+    /// inscription (`limits::extra_bits`) : c'est ce prix-là qui lui est demandé.
+    pow_extra: u8,
     /// Garant écarté (désaccords rejetés par les joueurs) : plus choisi cette session.
     garant_banned: bool,
     /// Aller-retour jusqu'au relais mesuré par son jeu (ms, moyenne glissante).
@@ -1025,6 +1028,7 @@ impl Conn {
             kicked: false,
             garant: false,
             garant_only: false,
+            pow_extra: 0,
             garant_banned: false,
             rtt: None,
             rtt_dev: 0.0,
@@ -9422,7 +9426,9 @@ fn handle_account(
                     format!("Réessaie dans {wait} s."),
                 );
             }
-            if !crypto::pow_ok(&pseudo, &pubkey, pow, st.cfg.pow_bits) {
+            // (v313) Au prix annoncé à cette connexion dans son bonjour.
+            let bits = st.cfg.pow_bits + st.conns.get(&id).map_or(0, |c| c.pow_extra);
+            if !crypto::pow_ok(&pseudo, &pubkey, pow, bits) {
                 return err(ErrorCode::BadProofOfWork, "");
             }
             if st.registry.lookup(&pseudo).is_some() {

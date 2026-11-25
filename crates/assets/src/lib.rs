@@ -145,7 +145,9 @@ pub struct Options {
     /// `hote_direct=true` dans `options.txt`. (v301) Sans la ligne, `auto` ou `false` :
     /// non, l'hôte reste anonyme, joint par des passeurs (`minelib_p2p::passeur`) et, s'il
     /// n'y en a pas, par les serveurs relais publics d'iroh. (La v297 le mettait en direct
-    /// d'elle-même quand sa box était ouverte.)
+    /// d'elle-même quand sa box était ouverte.) (v313) Le réglage vaut aussi pour le nœud du
+    /// jeu lui-même (`minelib_p2p::Node::start_game`) : sans `true`, il n'ouvre aucun lien
+    /// direct, ni comme joueur ni comme relais, et ne montre donc son adresse IP à personne.
     pub host_direct: Option<bool>,
     /// (v298) Invitation reçue d'un ami : la ligne de son fichier `invitation.txt` (nœud et
     /// clé de son relais). Ce relais est joint directement, sans la liste du DHT.

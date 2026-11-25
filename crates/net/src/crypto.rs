@@ -141,13 +141,45 @@ pub fn pow_ok(pseudo: &str, pubkey: &[u8; 32], nonce: u64, bits: u8) -> bool {
     leading_zeros(&pow_hash(pseudo, pubkey, nonce)) >= bits as u32
 }
 
-/// Cherche une preuve de travail (quelques dixièmes de seconde pour 20 bits).
+/// Cherche une preuve de travail (quelques dixièmes de seconde pour 20 bits). (v313) Un
+/// relais très demandé en veut plus (`Hello::pow_bits`) : au-delà de 20 bits, tous les
+/// cœurs du PC cherchent ensemble, le premier qui trouve arrête les autres.
 pub fn pow_solve(pseudo: &str, pubkey: &[u8; 32], bits: u8) -> u64 {
-    let mut nonce = rand::random::<u64>() >> 8;
-    while !pow_ok(pseudo, pubkey, nonce, bits) {
-        nonce = nonce.wrapping_add(1);
+    let threads = if bits > 20 {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    } else {
+        1
+    };
+    if threads == 1 {
+        let mut nonce = rand::random::<u64>() >> 8;
+        while !pow_ok(pseudo, pubkey, nonce, bits) {
+            nonce = nonce.wrapping_add(1);
+        }
+        return nonce;
     }
-    nonce
+    let found = std::sync::atomic::AtomicU64::new(u64::MAX);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut nonce = rand::random::<u64>() >> 8;
+                let mut n = 0u32;
+                loop {
+                    if pow_ok(pseudo, pubkey, nonce, bits) {
+                        found.store(nonce, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    nonce = nonce.wrapping_add(1);
+                    n = n.wrapping_add(1);
+                    if n & 4095 == 0
+                        && found.load(std::sync::atomic::Ordering::Relaxed) != u64::MAX
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    found.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Empreinte courte d'une clé publique (affichage, ex. « 7Q3K-M2XD »).
@@ -200,6 +232,9 @@ mod tests {
         let pk = [7u8; 32];
         let n = pow_solve("abc", &pk, 10);
         assert!(pow_ok("abc", &pk, n, 10));
+        // (v313) À plusieurs cœurs (au-delà de 20 bits), la preuve trouvée est valable.
+        let n21 = pow_solve("abc", &pk, 21);
+        assert!(pow_ok("abc", &pk, n21, 21));
         assert!(pow_ok("ABC", &pk, n, 10));
         assert!(!pow_ok("abd", &pk, n, 30));
         assert_eq!(unhex(&hex(&[1, 255, 16])).unwrap(), vec![1, 255, 16]);

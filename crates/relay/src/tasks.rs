@@ -376,14 +376,18 @@ async fn serve_loop(link: &mut Link, state: &Arc<Mutex<State>>, peer: &str, id: 
                 Request::Hello { protocol, client } if protocol == proto::PROTOCOL => {
                     hello = true;
                     let mut st = state.lock().unwrap();
+                    // (v313) Joueur sans adresse connue : sa preuve de travail d'inscription
+                    // monte avec les inscriptions de l'heure (`limits::extra_bits`).
+                    let extra = st.limits.extra_bits(peer);
                     if let Some(c) = st.conns.get_mut(&id) {
                         c.garant_only = client.starts_with("minelib-garant");
                         c.version = proto::client_version(&client);
+                        c.pow_extra = extra;
                     }
                     Some(Response::Hello {
                         protocol: proto::PROTOCOL,
                         relay: st.cfg.name.clone(),
-                        pow_bits: st.cfg.pow_bits,
+                        pow_bits: st.cfg.pow_bits + extra,
                     })
                 }
                 Request::Hello { .. } => Some(err(ErrorCode::Protocol, "")),

@@ -1180,22 +1180,23 @@ impl Game {
         // remet un paquet voit l'adresse du passeur : on ne le devient pas sans l'accepter.
         let mut passeur_answer = None;
         if self.options.share_netlog.is_some() && self.options.passeur.is_none() {
-            let y0 = c.h - 116.0 * s;
+            let y0 = c.h - 116.0 * s - 7.0 * ds;
             c.ui.text(4.0 * s, y0, s, WHITE, "Relayer pour les autres joueurs ?");
             for (i, line) in [
                 "Ton jeu porte des paquets chiffrés d'autres joueurs, les leurs portent les",
                 "tiens : c'est ce qui cache les adresses IP entre joueurs. Ceux à qui ton jeu",
-                "remet un paquet voient ton adresse (pas ton pseudo). Paramètres avancés.",
+                "remet un paquet voient ton adresse (pas ton pseudo). Qui relaie est servi",
+                "en premier quand les passeurs manquent. Paramètres avancés.",
             ]
             .iter()
             .enumerate()
             {
                 c.ui.text(4.0 * s, y0 + 11.0 * s + i as f32 * 7.0 * ds, ds, GREY, *line);
             }
-            if c.button("Oui", 4.0 * s + 33.0 * s, y0 + 32.0 * s, 66.0, true) {
+            if c.button("Oui", 4.0 * s + 33.0 * s, y0 + 32.0 * s + 7.0 * ds, 66.0, true) {
                 passeur_answer = Some(true);
             }
-            if c.button("Non", 4.0 * s + 105.0 * s, y0 + 32.0 * s, 66.0, true) {
+            if c.button("Non", 4.0 * s + 105.0 * s, y0 + 32.0 * s + 7.0 * ds, 66.0, true) {
                 passeur_answer = Some(false);
             }
         }
@@ -3487,6 +3488,7 @@ impl Game {
         for line in [
             "Ton jeu porte des paquets chiffrés d'autres joueurs, les leurs portent les tiens : c'est ce qui",
             "cache les adresses IP entre joueurs. Ceux à qui ton jeu remet un paquet voient ton adresse.",
+            "Quand les passeurs manquent, ceux qui relaient sont servis en premier.",
         ] {
             c.text_center(line, y, ds, GREY);
             y += 7.0 * ds;

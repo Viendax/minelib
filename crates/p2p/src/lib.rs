@@ -325,6 +325,18 @@ impl Node {
         Self::build(None, !host_direct(open_box))
     }
 
+    /// (v313) Nœud du jeu lui-même (identité fixe `secret`) : anonyme lui aussi. Il n'a pas
+    /// de transport IP : il ne joint les relais, et n'est joint quand il en devient un, que
+    /// par des passeurs ou par les serveurs relais d'iroh. Avant, il ouvrait des liens
+    /// directs dès que les box le permettaient : l'hôte d'un relais voyait l'adresse IP de
+    /// chaque joueur (elle servait même de clé à ses limites), et chaque joueur la sienne.
+    /// Sauf si le joueur a demandé les liens directs (`hote_direct=true`) : son adresse est
+    /// alors visible de ceux qui l'ont demandé aussi, et d'eux seulement (un lien direct
+    /// demande un transport IP aux deux bouts).
+    pub fn start_game(secret: [u8; 32]) -> Result<Self> {
+        Self::build(Some(secret), !host_direct(false))
+    }
+
     /// (v301) Nœud sans serveur d'iroh ni adresse directe : il n'est joignable, et ne
     /// joint les autres, que par des passeurs (essais sans réseau).
     #[doc(hidden)]
@@ -819,7 +831,13 @@ mod tests {
         let runs: Vec<_> = (0..players)
             .map(|_| {
                 std::thread::spawn(move || {
-                    let guest = Node::start().unwrap();
+                    // (v313) `MINELIB_ESSAI_ANONYME` : le joueur aussi est sans transport
+                    // IP (le cas de tous les jeux depuis la v313).
+                    let guest = if std::env::var("MINELIB_ESSAI_ANONYME").is_ok() {
+                        Node::start_private().unwrap()
+                    } else {
+                        Node::start().unwrap()
+                    };
                     let t = guest.tunnel(remote).unwrap();
                     let mut c = std::net::TcpStream::connect(t).unwrap();
                     c.set_nodelay(true).unwrap();

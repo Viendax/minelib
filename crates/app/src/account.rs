@@ -41,7 +41,9 @@ pub(crate) fn p2p_node(dir: &std::path::Path) -> Option<&'static minelib_p2p::No
                 let _ = std::fs::write(&path, k);
                 k
             });
-        match minelib_p2p::Node::start_with(Some(secret)) {
+        // (v313) Anonyme : plus de lien direct, donc plus d'adresse IP montrée à l'hôte d'un
+        // relais ni aux joueurs qu'on sert (sauf `hote_direct=true`).
+        match minelib_p2p::Node::start_game(secret) {
             Ok(n) => Some(n),
             Err(e) => {
                 log::warn!("iroh : {e:#}");

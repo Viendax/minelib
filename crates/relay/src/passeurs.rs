@@ -76,6 +76,11 @@ const TUNNEL_VIAS: usize = 2;
 /// Routes que chaque passeur garde libres pour les parties FPS : les tunnels ne prennent
 /// pas ses dernières places.
 const TUNNEL_ROOM: usize = 8;
+/// (v313) Échange direct : des 16 places de tunnel d'un passeur, 8 sont gardées aux joueurs
+/// dont le jeu est lui-même un passeur vérifié. Tant que les passeurs ont de la place, tout
+/// le monde est servi ; quand ils se remplissent, ceux qui portent les paquets des autres
+/// continuent de recevoir des routes, les autres gardent les serveurs relais d'iroh.
+const TUNNEL_GIVERS: usize = 8;
 /// Un tunnel que son joueur ne redemande plus (il le fait toutes les 30 s tant qu'il s'en
 /// sert) est repris après ce temps ; bien plus tard si le joueur n'a plus aucune connexion
 /// à ce relais (endormi au fond d'un pays, il s'en sert encore sans pouvoir le redire).
@@ -619,6 +624,13 @@ fn tunnel_assign(st: &mut State, route: u64) {
         let ms = super::link_ms(c).unwrap_or(999.0);
         Some(((ms / 20.0) as usize * 1000 + load, ms, *p, o.addr))
     };
+    // (v313) Celui qui demande est-il passeur lui-même ? (Voir `TUNNEL_GIVERS`.)
+    let giver = st.fast.offers.get(&guest).is_some_and(|o| o.verified);
+    let kept = if giver {
+        TUNNEL_ROOM
+    } else {
+        TUNNEL_ROOM + TUNNEL_GIVERS
+    };
     // Des passeurs sans rapport avec les deux bouts.
     let mut cands: Vec<(usize, f32, u64, SocketAddrV4)> = st
         .fast
@@ -631,7 +643,7 @@ fn tunnel_assign(st: &mut State, route: u64) {
             !(apart && ends.iter().any(|e| super::same_machine(c, e)))
         })
         .filter(|(_, _, p, _)| {
-            before.contains(p) || st.fast.load(*p) + TUNNEL_ROOM < LOAD_MAX
+            before.contains(p) || st.fast.load(*p) + kept < LOAD_MAX
         })
         .collect();
     cands.sort_by(|a, b| {
@@ -1288,6 +1300,66 @@ mod tests {
             assert_eq!(h.state.lock().unwrap().fast.tunnels(), 0);
         }
         assert_eq!(host_node.passeurs().routes(), 0);
+    }
+
+    /// (v313) Échange direct. Trois passeurs, chacun déjà chargé de huit tunnels : un
+    /// joueur qui ne relaie pas n'obtient plus de route (il garde les serveurs d'iroh),
+    /// celui dont le jeu est passeur en obtient encore une, par les deux autres.
+    #[test]
+    fn those_who_relay_still_get_routes_when_passeurs_fill_up() {
+        let (h, login) = relay("echange");
+        let (_host, hl) = login("HoteEch");
+        let (_g1, g1) = login("PrendEch");
+        let (_g2, g2) = login("PrendEch2");
+        let (a, _) = login("PasEch");
+        let (b, _) = login("PasEch2");
+        let (c, cl) = login("DonneEch");
+        for p in [&a, &b, &c] {
+            p.send(Cmd::Passeur(true));
+        }
+        until(|| h.state.lock().unwrap().fast.verified() == 3);
+        // Treize relais hébergés (des nœuds de façade : seules les routes comptent ici).
+        let node = |i: u8| [100 + i; 32];
+        for i in 0..13u8 {
+            transport::push(
+                &hl,
+                &Request::ShardReady {
+                    region: [i as i32, 0],
+                    node: node(i),
+                    addr: String::new(),
+                    key: [0; 32],
+                },
+            );
+        }
+        until(|| h.state.lock().unwrap().fast.nodes.len() >= 13);
+        // Douze tunnels d'un joueur qui ne relaie pas : deux passeurs chacun, les moins
+        // chargés d'abord ; à la fin, chacun des trois en porte huit.
+        for i in 0..12u8 {
+            transport::push(&g1, &Request::TunnelWant { node: node(i) });
+        }
+        until(|| h.state.lock().unwrap().fast.tunnels() == 12);
+        {
+            let st = h.state.lock().unwrap();
+            let mut loads: Vec<usize> = st.fast.offers.keys().map(|p| st.fast.load(*p)).collect();
+            loads.sort();
+            assert_eq!(loads, vec![8, 8, 8]);
+        }
+        // Un autre joueur qui ne relaie pas : plus de place pour lui.
+        transport::push(&g2, &Request::TunnelWant { node: node(12) });
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(h.state.lock().unwrap().fast.tunnels(), 12);
+        // Celui qui relaie : servi, par les deux autres passeurs.
+        transport::push(&cl, &Request::TunnelWant { node: node(12) });
+        until(|| h.state.lock().unwrap().fast.tunnels() == 13);
+        let st = h.state.lock().unwrap();
+        let t = st
+            .fast
+            .tunnels
+            .values()
+            .find(|t| t.pseudo == "DonneEch")
+            .unwrap();
+        assert_eq!(t.passeurs.len(), 2);
+        assert!(t.passeurs.iter().all(|(p, _)| *p != t.guest));
     }
 
     /// (v307) Un joueur qui partage son journal réseau : ses lignes arrivent dans le
