@@ -109,6 +109,7 @@ mod keycomp;
 mod keylag;
 mod keytest;
 mod keys;
+mod laps;
 mod light_editor;
 mod lightnet;
 mod lightning;
@@ -425,6 +426,9 @@ struct Game {
     /// Essais (`MINELIB_EN_LIGNE=1`) : monde à ouvrir en ligne dès que le compte est connecté.
     auto_online: Option<PathBuf>,
     pending_open: Option<(PathBuf, u32)>,
+    /// (v309) La partie doit repartir d'une origine plus proche du joueur (`Session::
+    /// wants_rebase`) : faite en fin d'image (`rebase_world`).
+    rebase: bool,
     /// Vider tous les maillages GPU (changement de monde) en fin d'image.
     clear_meshes: bool,
     quit: bool,
@@ -545,7 +549,10 @@ impl Game {
             keys_scroll: 0,
             keys_drag: false,
             session: None,
-            config: SessionConfig { view_distance },
+            config: SessionConfig {
+                view_distance,
+                far_origin: true,
+            },
             ui: Ui::default(),
             sysmon: SysMonitor::start(),
             time: 0.0,
@@ -575,6 +582,7 @@ impl Game {
                 .filter(|s| !s.trim().is_empty()),
             auto_online: None,
             pending_open: None,
+            rebase: false,
             clear_meshes: false,
             quit: false,
             optimus: None,
@@ -747,6 +755,12 @@ impl Game {
     }
 
     fn play(&mut self, dir: PathBuf) {
+        self.play_with(dir, true);
+    }
+
+    /// (v309) Ouvre le monde `dir` ; `far_origin` faux : en ligne ou en partie FPS, tout est
+    /// compté depuis le centre du monde (voir `SessionConfig::far_origin`).
+    fn play_with(&mut self, dir: PathBuf, far_origin: bool) {
         // Nouveau monde : rien de l'ancien ne doit rester à l'écran.
         self.session = None;
         self.played = true;
@@ -757,7 +771,11 @@ impl Game {
         self.announce_garant(false);
         // Le rendu est emprunté pendant l'image : on vide ses maillages en fin d'image.
         self.clear_meshes = true;
-        match Session::open(dir, self.config) {
+        let config = SessionConfig {
+            far_origin,
+            ..self.config
+        };
+        match Session::open(dir, config) {
             Ok(mut s) => {
                 s.voice_volumes = load_volumes(&self.paths.root.join("voice.txt"));
                 s.sensitivity = self.options.sensitivity;
@@ -926,6 +944,37 @@ impl Game {
                 self.accounts.room(Cmd::Join(room));
                 self.friends_note = Some(("Connexion au monde…".into(), self.time));
             }
+        }
+    }
+
+    /// (v309) « Aucun problème jusqu'à 16,7 millions » : le joueur s'est éloigné de l'origine
+    /// de sa partie (`Session::wants_rebase`) ; le monde est enregistré et rouvert, compté
+    /// depuis une origine proche de lui (`session::origin_near`). L'écran de chargement le temps
+    /// de recharger autour de lui ; le tchat et sa vitesse suivent.
+    fn rebase_world(&mut self) {
+        let Some(mut s) = self.session.take() else {
+            return;
+        };
+        if let Err(e) = s.save() {
+            log::error!("sauvegarde impossible avant de changer d'origine : {e:#}");
+            self.session = Some(s);
+            return;
+        }
+        let dir = s.dir.clone();
+        let place = s.abs_of(s.player.pos);
+        let chat = std::mem::take(&mut s.chat);
+        let vel = s.player.vel;
+        drop(s);
+        log::info!(
+            "loin de l'origine de la partie : rouverte depuis une origine plus proche (joueur en {:.1} / {:.1} / {:.1})",
+            place[0],
+            place[1],
+            place[2]
+        );
+        self.play_with(dir, true);
+        if let Some(n) = &mut self.session {
+            n.chat = chat;
+            n.player.vel = vel;
         }
     }
 
@@ -2165,7 +2214,7 @@ impl Game {
     /// en mode FPS garde le sien dans son fichier.
     fn play_vs_bots(&mut self, dir: PathBuf) {
         self.fps_status = None;
-        self.play(dir);
+        self.play_with(dir, false);
         if let Some(s) = &mut self.session {
             if s.game.mode != save::GameMode::Fps {
                 s.saved_mode = Some(s.game.mode);
@@ -2541,7 +2590,7 @@ impl Game {
             return;
         };
         let map = fpsmap::load(&dir);
-        self.play(dir);
+        self.play_with(dir, false);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Fps;
@@ -2566,7 +2615,7 @@ impl Game {
         let Some(link) = self.accounts.link.clone() else {
             return;
         };
-        self.play(dir);
+        self.play_with(dir, false);
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Fps;
             // Pas de vol en partie en ligne.
@@ -2602,7 +2651,7 @@ impl Game {
             .into_iter()
             .find(|w| w.dir == dir)
             .map_or_else(|| "Monde".into(), |w| w.meta.name);
-        self.play(dir);
+        self.play_with(dir, false);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             if s.game.mode == save::GameMode::Fps {
@@ -2660,7 +2709,7 @@ impl Game {
                 }
             }
         };
-        self.play(dir);
+        self.play_with(dir, false);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Creative;
@@ -4648,6 +4697,7 @@ impl GameLoop for Game {
                     s.chat.known = self.accounts.friends.iter().map(|f| f.0.clone()).collect();
                 }
                 s.update(input, dt, &mut renderer, active);
+                self.rebase |= s.wants_rebase();
                 let _ui = minelib_render::perf::scope("interface");
                 loading = s.loading_progress();
                 // (v220) Interface masquée (F1, construction) : pas d'écran F3 non plus.
@@ -4742,6 +4792,9 @@ impl GameLoop for Game {
             } else {
                 self.screen = Screen::Solo;
             }
+        }
+        if std::mem::take(&mut self.rebase) {
+            self.rebase_world();
         }
         if std::mem::take(&mut self.clear_meshes) {
             renderer.clear_meshes();

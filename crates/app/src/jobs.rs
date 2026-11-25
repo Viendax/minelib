@@ -154,7 +154,9 @@ pub struct Workers {
 }
 
 impl Workers {
-    pub fn new(seed: u32, gen: Generator) -> Self {
+    /// (v309) `origin` : origine des coordonnées locales de la partie (`World::origin`) ; les
+    /// chunks demandés le sont à leur place locale, générés à leur place absolue.
+    pub fn new(seed: u32, gen: Generator, origin: ChunkPos) -> Self {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2);
@@ -179,7 +181,7 @@ impl Workers {
                         } else {
                             minelib_platform::lower_thread_priority();
                         }
-                        worker_loop(i, &queue, &cancel, &done_tx, gen, seed)
+                        worker_loop(i, &queue, &cancel, &done_tx, gen, seed, origin)
                     })
                     .ok()
             })
@@ -238,6 +240,19 @@ impl Workers {
     }
 }
 
+/// (v309) Chunk local `pos` d'une partie dont l'origine est `origin` : généré à sa place
+/// absolue (le relief ne dépend que d'elle), rendu à sa place locale.
+fn generate_at(gen: Generator, seed: u32, pos: ChunkPos, origin: ChunkPos) -> Chunk {
+    // (v309) Sur la carte bouclée : de l'autre côté de la limite, le chunk de l'autre bord.
+    let at = ChunkPos {
+        x: minelib_world::lap::wrap_chunk(pos.x as i64 + origin.x as i64),
+        z: minelib_world::lap::wrap_chunk(pos.z as i64 + origin.z as i64),
+    };
+    let mut c = generate(gen, seed, at);
+    c.pos = pos;
+    c
+}
+
 fn worker_loop(
     index: usize,
     queue: &Queue,
@@ -245,6 +260,7 @@ fn worker_loop(
     done_tx: &std::sync::mpsc::Sender<Done>,
     gen: Generator,
     seed: u32,
+    origin: ChunkPos,
 ) {
     loop {
         // Thread mis en pause par la régulation : il attend sans prendre de tâche.
@@ -259,7 +275,7 @@ fn worker_loop(
         // ne se calcule et le monde reste invisible) : le chunk fautif est noté dans le
         // journal et rendu vide, le reste continue.
         let done = match job {
-            Job::Generate(pos) => match std::panic::catch_unwind(|| generate(gen, seed, pos)) {
+            Job::Generate(pos) => match std::panic::catch_unwind(|| generate_at(gen, seed, pos, origin)) {
                 Ok(c) => Done::Generated(c),
                 Err(_) => {
                     // (v283) Rendu vide (il en arrive un) : l'écran de chargement, qui attend

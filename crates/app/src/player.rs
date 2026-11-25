@@ -635,7 +635,18 @@ impl Player {
         }
         self.note_released(m, fwd, right);
 
-        let crouching = m.sneak && !self.flying;
+        // (v309) « Collé contre le sol, le sneak doit rester en sneak en fly » : en vol, posé sur
+        // le sol avec *Accroupi* tenu, on est accroupi comme à pied (posture, vitesse, bord qui
+        // retient) ; en l'air, *Accroupi* reste la descente. (Pas de vol en mode FPS : rien
+        // n'y change.)
+        // Posé : touché au pas d'avant, ou le sol à moins d'un centième de bloc (en vol, la
+        // vitesse vers le bas repart de zéro à chaque contact : le pas suivant peut être trop
+        // court pour toucher).
+        let landed = self.flying
+            && m.sneak
+            && !self.noclip
+            && (self.on_ground || self.support_within(world, 0.01));
+        let crouching = m.sneak && (!self.flying || landed);
         let fps = m.fps && !self.flying && !self.noclip;
         let duck_rate = if fps { self.duck_speed * 1.5 } else { 12.0 };
         let target = if crouching { 1.0 } else { 0.0 };
@@ -676,7 +687,14 @@ impl Player {
         }
 
         if self.flying {
-            let speed = if m.sprint { FLY_SPRINT } else { FLY };
+            // (v309) Accroupi au sol (ci-dessus) : à la vitesse accroupie.
+            let speed = if crouching {
+                SNEAK
+            } else if m.sprint {
+                FLY_SPRINT
+            } else {
+                FLY
+            };
             let target = wish * speed + Vec3::Y * m.up * speed;
             if target == Vec3::ZERO {
                 // Plus aucune touche de déplacement : arrêt sur place, sans distance de
@@ -2755,6 +2773,63 @@ mod tests {
                 p.crouch
             );
         }
+    }
+
+    /// (v309) « Collé contre le sol, le sneak doit rester en sneak en fly » : en vol, *Accroupi*
+    /// tenu fait descendre ; posé sur le sol, on y est accroupi et on le reste tant que la
+    /// touche est tenue (posture, vitesse accroupie, le bord retient), sans repartir en l'air ni
+    /// se relever. Lâchée, on se relève et l'on vole de nouveau.
+    #[test]
+    fn flying_against_the_ground_sneaking_stays_sneaking() {
+        let w = flat_world();
+        let mut p = Player::new(Vec3::new(8.5, 14.0, 8.5));
+        p.flying = true;
+        p.yaw = 0.0;
+        let sneak = MoveInput {
+            sneak: true,
+            up: -1.0,
+            ..Default::default()
+        };
+        // En l'air : la descente, pas accroupi.
+        for _ in 0..ticks(16) {
+            p.update(&w, &sneak, TICK);
+        }
+        assert!(p.pos.y < 14.0 && !p.on_ground);
+        assert!(p.crouch < 0.01, "accroupi en l'air : {}", p.crouch);
+        // Jusqu'au sol (11), puis deux secondes collé contre lui : accroupi, et il le reste.
+        for _ in 0..ticks(512) {
+            p.update(&w, &sneak, TICK);
+        }
+        assert!(p.on_ground && (p.pos.y - 11.0).abs() < 1e-3, "{} {}", p.pos.y, p.on_ground);
+        let mut lowest = 1.0f32;
+        for _ in 0..ticks(256) {
+            p.update(&w, &sneak, TICK);
+            lowest = lowest.min(p.crouch);
+        }
+        assert!(lowest > 0.99, "relevé au sol : {lowest}");
+        assert!(p.flying, "le vol reste choisi");
+        // En avançant : à la vitesse accroupie, et le bord du sol retient.
+        let walk = MoveInput {
+            forward: 1.0,
+            ..sneak
+        };
+        let z0 = p.pos.z;
+        for _ in 0..ticks(128) {
+            p.update(&w, &walk, TICK);
+        }
+        let moved = z0 - p.pos.z;
+        assert!(moved > SNEAK * 0.5 && moved < SNEAK * 1.2, "{moved} blocs en une seconde");
+        assert!(p.crouch > 0.99);
+        // Lâchée : on se relève, et l'on vole (Saut fait monter).
+        let up = MoveInput {
+            up: 1.0,
+            jump: true,
+            ..Default::default()
+        };
+        for _ in 0..ticks(128) {
+            p.update(&w, &up, TICK);
+        }
+        assert!(p.crouch < 0.01 && p.pos.y > 11.5, "{} {}", p.crouch, p.pos.y);
     }
 
     /// (v247) « La toute fin de l'animation pour se mettre accroupi est trop longue » : en

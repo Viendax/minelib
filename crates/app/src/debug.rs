@@ -47,6 +47,11 @@ pub fn frame_summary(times: &VecDeque<f32>) -> FrameSummary {
 pub struct DebugInfo<'a> {
     pub frames: FrameSummary,
     pub player: &'a Player,
+    /// (v309) Origine de la partie (`World::origin_blocks`) : tout est montré à sa place
+    /// absolue dans le monde.
+    pub origin: [i32; 3],
+    /// (v309) Tours de la carte bouclée du joueur (`laps`) : une ligne de plus s'il en a fait.
+    pub laps: crate::laps::Laps,
     pub hit: Option<Hit>,
     pub seed: u32,
     pub chunks_loaded: usize,
@@ -95,11 +100,19 @@ fn facing(yaw: f32) -> &'static str {
 pub fn build(d: &DebugInfo) -> Overlay {
     let f = d.frames;
     let p = d.player;
-    let pos = p.pos;
+    // (v309) Place absolue (double précision : au millième jusqu'à 16,7 millions et au-delà).
+    let o = d.origin;
+    // (v309) Sur la carte bouclée (ses tours : `laps`).
+    let wrap = minelib_world::lap::wrap_f64;
+    let pos = [
+        wrap(p.pos.x as f64 + o[0] as f64),
+        p.pos.y as f64,
+        wrap(p.pos.z as f64 + o[2] as f64),
+    ];
     let (bx, by, bz) = (
-        pos.x.floor() as i32,
-        pos.y.floor() as i32,
-        pos.z.floor() as i32,
+        pos[0].floor() as i32,
+        pos[1].floor() as i32,
+        pos[2].floor() as i32,
     );
     let chunk = ChunkPos::containing(bx, bz);
     let cs = CHUNK_SIZE as i32;
@@ -132,7 +145,7 @@ pub fn build(d: &DebugInfo) -> Overlay {
             fps_color,
         ),
         Line::white(""),
-        Line::white(format!("XYZ : {:.3} / {:.3} / {:.3}", pos.x, pos.y, pos.z)),
+        Line::white(format!("XYZ : {:.3} / {:.3} / {:.3}", pos[0], pos[1], pos[2])),
         Line::white(format!("Bloc : {bx} {by} {bz}")),
         Line::white(format!(
             "Chunk : {} {}   (dans le chunk : {} {})",
@@ -154,6 +167,14 @@ pub fn build(d: &DebugInfo) -> Overlay {
         Line::white(d.keys.clone()),
         Line::white(""),
     ];
+    // (v309) Ses tours de la carte bouclée, s'il en a fait : sous sa place.
+    if let Some(t) = crate::laps::text(d.laps) {
+        let at = left
+            .iter()
+            .position(|l| l.text.starts_with("XYZ"))
+            .map_or(left.len(), |i| i + 1);
+        left.insert(at, Line::white(t));
+    }
     if d.fps {
         let p = d.player;
         left.insert(
@@ -189,9 +210,9 @@ pub fn build(d: &DebugInfo) -> Overlay {
                 "Bloc visé : {} (#{}) en {} {} {}, face {face}, {:.1} m",
                 h.id.name(),
                 h.id.0,
-                h.block[0],
+                minelib_world::lap::wrap_block(h.block[0] as i64 + o[0] as i64),
                 h.block[1],
-                h.block[2],
+                minelib_world::lap::wrap_block(h.block[2] as i64 + o[2] as i64),
                 h.distance
             );
             let color = match &d.torch_info {

@@ -153,8 +153,10 @@ fn center_of(b: [i32; 3]) -> Vec3 {
 }
 
 /// Écrans enregistrés dans le dossier du monde (aucun si le fichier manque). Une ligne
-/// par écran : bloc, face, direction, taille (absente avant la v160 : normale).
-pub fn load(dir: &Path) -> Vec<Placed> {
+/// par écran : bloc, face, direction, taille (absente avant la v160 : normale). (v309) Le
+/// bloc est enregistré à sa place absolue ; rendu compté depuis l'origine de la partie
+/// `origin` (`World::origin_blocks`).
+pub fn load(dir: &Path, origin: [i32; 3]) -> Vec<Placed> {
     let Ok(text) = std::fs::read_to_string(dir.join(FILE)) else {
         return Vec::new();
     };
@@ -166,7 +168,12 @@ pub fn load(dir: &Path) -> Vec<Placed> {
                 .collect::<Result<_, _>>()
                 .ok()?;
             (n.len() == 9 || n.len() == 10).then(|| Placed {
-                block: [n[0], n[1], n[2]],
+                // (v309) La place la plus proche de l'origine, sur la carte bouclée.
+                block: [
+                    minelib_world::lap::wrap_block(n[0] as i64 - origin[0] as i64),
+                    n[1],
+                    minelib_world::lap::wrap_block(n[2] as i64 - origin[2] as i64),
+                ],
                 normal: [n[3], n[4], n[5]],
                 facing: [n[6], n[7], n[8]],
                 size: n.get(9).map_or(NORMAL, |&k| k.clamp(0, 3) as u8),
@@ -176,12 +183,19 @@ pub fn load(dir: &Path) -> Vec<Placed> {
         .collect()
 }
 
-/// Enregistre les écrans dans le dossier du monde.
-pub fn save(dir: &Path, screens: &[Placed]) {
+/// Enregistre les écrans dans le dossier du monde. (v309) `origin` : celle de la partie, les
+/// blocs sont écrits à leur place absolue.
+pub fn save(dir: &Path, screens: &[Placed], origin: [i32; 3]) {
     let mut text =
         String::from("# Écrans vidéo : bloc (x y z), face (normale), direction, taille\n");
     for s in screens {
-        let [b, n, f] = [s.block, s.normal, s.facing];
+        // (v309) Sur la carte bouclée.
+        let b = [
+            minelib_world::lap::wrap_block(s.block[0] as i64 + origin[0] as i64),
+            s.block[1],
+            minelib_world::lap::wrap_block(s.block[2] as i64 + origin[2] as i64),
+        ];
+        let [n, f] = [s.normal, s.facing];
         text += &format!(
             "{} {} {} {} {} {} {} {} {} {}\n",
             b[0], b[1], b[2], n[0], n[1], n[2], f[0], f[1], f[2], s.size
@@ -2923,11 +2937,20 @@ mod tests {
             Placed::new([3, 0, 2], [0, 1, 0], Vec3::new(3.5, 2.0, 9.0), 3),
             Placed::new([5, 0, 2], [1, 0, 0], Vec3::new(9.0, 2.0, 2.0), 0),
         ];
-        save(&dir, &list);
-        assert_eq!(load(&dir), list);
+        save(&dir, &list, [0; 3]);
+        assert_eq!(load(&dir, [0; 3]), list);
+        // (v309) Loin du centre du monde : écrits à leur place absolue, relus depuis l'origine
+        // de la partie (une autre ici).
+        let far = [16_777_216, 0, -4_096];
+        save(&dir, &list, far);
+        let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        assert!(text.contains("16777216 1 -4096"), "{text}");
+        let back = load(&dir, [16_773_120, 0, 0]);
+        assert_eq!(back[0].block, [4_096, list[0].block[1], -4_096]);
+        assert_eq!(load(&dir, far), list);
         // Fichier d'avant les tailles (9 nombres) : écrans normaux.
         std::fs::write(dir.join(FILE), "0 1 0 0 0 1 0 0 1\n").unwrap();
-        assert_eq!(load(&dir), vec![wall()]);
+        assert_eq!(load(&dir, [0; 3]), vec![wall()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -3,6 +3,7 @@
 //! - [`block`]   : types de blocs et leurs propriétés.
 //! - [`Chunk`]   : colonne de 16 × 256 × 16 blocs.
 //! - [`gen`]     : génération procédurale du terrain.
+//! - [`lap`]     : (v309) la carte bouclée (on en fait le tour).
 //! - [`mesh`]    : construction du maillage d'un chunk (faces cachées supprimées, AO).
 //! - [`World`]   : ensemble des chunks chargés, accès en coordonnées monde.
 //! - [`raycast`] : lancer de rayon voxel (visée, casse/pose de blocs).
@@ -10,6 +11,7 @@
 pub mod block;
 pub mod flame;
 pub mod gen;
+pub mod lap;
 pub mod mesh;
 pub mod noise;
 pub mod raycast;

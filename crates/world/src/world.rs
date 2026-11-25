@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::flame::{CHEMICALS, WOOD_FLAME};
 use crate::gen::{generate, Generator};
+use crate::lap::{wrap_block, wrap_chunk};
 use crate::{BlockId, Chunk, ChunkPos, CHUNK_HEIGHT, CHUNK_SIZE};
 
 /// Portée de la lumière d'une torche (blocs). Doit rester < 16 : le maillage d'un
@@ -28,15 +29,28 @@ pub struct Light {
 }
 
 /// Ensemble des chunks chargés. Les coordonnées passées ici sont en blocs monde.
+///
+/// (v309) **Coordonnées locales.** Loin du centre du monde, un f32 ne vaut plus qu'au bloc
+/// près (16 777 216 = 2²⁴) : la partie compte tout depuis une **origine** proche du joueur
+/// (`origin`, en chunks, multiple de 256 chunks ; (0, 0) près du centre, en mode FPS et en
+/// ligne). Les coordonnées que le jeu passe ici, celles des chunks chargés, de leurs
+/// maillages, du joueur et de tout le reste de la partie sont **locales** (monde − origine).
+/// Ce qui est enregistré (modifications, torches, chunks importés : `edits`, `load_edit`,
+/// `torches_abs`, `load_torch`, `bases`, `set_bases`) et la génération restent en
+/// coordonnées **absolues**. Origine (0, 0) : local = absolu, rien ne change.
 pub struct World {
     pub seed: u32,
+    /// (v309) Origine des coordonnées locales, en chunks (voir plus haut).
+    origin: ChunkPos,
+    /// Chunks chargés, à leur place locale.
     chunks: HashMap<ChunkPos, Arc<Chunk>>,
+    /// Torches posées, à leur place absolue.
     torches: HashMap<[i32; 3], Torch>,
-    /// Blocs modifiés par le joueur, par chunk (index local → bloc). Réappliqués à chaque
-    /// (re)génération du chunk et enregistrés dans la sauvegarde.
+    /// Blocs modifiés par le joueur, par chunk absolu (index local → bloc). Réappliqués à
+    /// chaque (re)génération du chunk et enregistrés dans la sauvegarde.
     edits: HashMap<ChunkPos, HashMap<u32, BlockId>>,
-    /// Chunks importés (ex. monde Minecraft converti), compressés : ils remplacent la
-    /// génération procédurale à leur emplacement.
+    /// Chunks importés (ex. monde Minecraft converti), compressés, à leur place absolue : ils
+    /// remplacent la génération procédurale à leur emplacement.
     bases: HashMap<ChunkPos, Arc<Vec<u8>>>,
     /// (v209) Numéro de l'ensemble `bases` actuel (un nouveau à chaque `set_bases`, unique
     /// dans le programme) : la sauvegarde ne réécrit `chunks.bin` que s'il a changé.
@@ -69,6 +83,7 @@ impl World {
     pub fn new(seed: u32) -> Self {
         Self {
             seed,
+            origin: ChunkPos { x: 0, z: 0 },
             chunks: HashMap::new(),
             torches: HashMap::new(),
             edits: HashMap::new(),
@@ -84,7 +99,105 @@ impl World {
         }
     }
 
-    /// Installe des chunks importés (compressés en RLE). Les chunks invalides sont ignorés.
+    /// (v309) Origine des coordonnées locales, en chunks (voir `World`).
+    pub fn origin(&self) -> ChunkPos {
+        self.origin
+    }
+
+    /// (v309) Origine des coordonnées locales, en blocs (y = 0).
+    pub fn origin_blocks(&self) -> [i32; 3] {
+        let (x, z) = self.origin.origin();
+        [x, 0, z]
+    }
+
+    /// (v309) Chunk absolu du chunk local `p`. (v309) Sur la carte bouclée (`lap`).
+    pub fn abs_chunk(&self, p: ChunkPos) -> ChunkPos {
+        ChunkPos {
+            x: wrap_chunk(p.x as i64 + self.origin.x as i64),
+            z: wrap_chunk(p.z as i64 + self.origin.z as i64),
+        }
+    }
+
+    /// (v309) Chunk local du chunk absolu `p`. (v309) Le plus proche de l'origine, sur la
+    /// carte bouclée : de l'autre côté de la limite, un chunk voisin reste voisin.
+    pub fn local_chunk(&self, p: ChunkPos) -> ChunkPos {
+        ChunkPos {
+            x: wrap_chunk(p.x as i64 - self.origin.x as i64),
+            z: wrap_chunk(p.z as i64 - self.origin.z as i64),
+        }
+    }
+
+    /// (v309) Place absolue du bloc local `p`. (v309) Sur la carte bouclée.
+    pub fn abs_block(&self, p: [i32; 3]) -> [i32; 3] {
+        let o = self.origin_blocks();
+        [
+            wrap_block(p[0] as i64 + o[0] as i64),
+            p[1],
+            wrap_block(p[2] as i64 + o[2] as i64),
+        ]
+    }
+
+    /// (v309) Place locale du bloc absolu `p`. (v309) La plus proche de l'origine, sur la
+    /// carte bouclée.
+    pub fn local_block(&self, p: [i32; 3]) -> [i32; 3] {
+        let o = self.origin_blocks();
+        [
+            wrap_block(p[0] as i64 - o[0] as i64),
+            p[1],
+            wrap_block(p[2] as i64 - o[2] as i64),
+        ]
+    }
+
+    /// (v309) Change l'origine des coordonnées locales (voir `World`). Les chunks chargés
+    /// (et ce qui est relevé en coordonnées locales) passent à leur nouvelle place locale ;
+    /// ce qui est enregistré est absolu, rien n'y change. Le reste de la partie compte depuis
+    /// l'origine : à faire avant d'y charger quoi que ce soit.
+    pub fn set_origin(&mut self, origin: ChunkPos) {
+        // (v309) Le décalage le plus court sur la carte bouclée.
+        let (dx, dz) = (
+            wrap_chunk(self.origin.x as i64 - origin.x as i64),
+            wrap_chunk(self.origin.z as i64 - origin.z as i64),
+        );
+        self.origin = origin;
+        if dx == 0 && dz == 0 {
+            return;
+        }
+        let chunk = |p: ChunkPos| ChunkPos {
+            x: p.x + dx,
+            z: p.z + dz,
+        };
+        let block = |p: [i32; 3]| [p[0] + dx * CHUNK_SIZE as i32, p[1], p[2] + dz * CHUNK_SIZE as i32];
+        self.chunks = std::mem::take(&mut self.chunks)
+            .into_iter()
+            .map(|(p, mut c)| {
+                let q = chunk(p);
+                Arc::make_mut(&mut c).pos = q;
+                (q, c)
+            })
+            .collect();
+        self.probes = std::mem::take(&mut self.probes)
+            .into_iter()
+            .map(|(p, v)| (chunk(p), Arc::new(v.iter().map(|&b| block(b)).collect())))
+            .collect();
+        if let Some(j) = &mut self.journal {
+            for e in j.iter_mut() {
+                e.0 = block(e.0);
+            }
+        }
+        if let Some(t) = &mut self.touched {
+            for b in t.iter_mut() {
+                *b = block(*b);
+            }
+        }
+        if let Some(f) = &mut self.fresh {
+            for c in f.iter_mut() {
+                *c = chunk(*c);
+            }
+        }
+    }
+
+    /// Installe des chunks importés (compressés en RLE), à leur place absolue. Les chunks
+    /// invalides sont ignorés.
     pub fn set_bases(&mut self, bases: HashMap<ChunkPos, Vec<u8>>) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.bases_version = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -99,7 +212,7 @@ impl World {
             .chunks
             .keys()
             .copied()
-            .filter(|p| self.bases.contains_key(p))
+            .filter(|p| self.bases.contains_key(&self.abs_chunk(*p)))
             .collect();
         for p in loaded {
             self.chunks.remove(&p);
@@ -107,6 +220,7 @@ impl World {
         }
     }
 
+    /// Chunks importés, à leur place absolue.
     pub fn bases(&self) -> impl Iterator<Item = (ChunkPos, &[u8])> + '_ {
         self.bases.iter().map(|(p, d)| (*p, d.as_slice()))
     }
@@ -120,18 +234,23 @@ impl World {
         self.bases.len()
     }
 
-    /// Chunk importé à cet emplacement, sinon génération procédurale.
+    /// Chunk importé à cet emplacement (local), sinon génération procédurale (faite à sa
+    /// place absolue).
     fn base_or_generate(&self, pos: ChunkPos) -> Chunk {
-        self.bases
-            .get(&pos)
+        let at = self.abs_chunk(pos);
+        let mut c = self
+            .bases
+            .get(&at)
             .and_then(|d| Chunk::from_rle(pos, d))
-            .unwrap_or_else(|| generate(self.generator, self.seed, pos))
+            .unwrap_or_else(|| generate(self.generator, self.seed, at));
+        c.pos = pos;
+        c
     }
 
     // ------------------------------------------------------------ torches
 
     pub fn torch(&self, pos: [i32; 3]) -> Option<Torch> {
-        self.torches.get(&pos).copied()
+        self.torches.get(&self.abs_block(pos)).copied()
     }
 
     /// Secondes de couleur chimique restantes (`None` : torche ordinaire ou sel épuisé).
@@ -175,7 +294,7 @@ impl World {
         let mut dirty = self.set(x, y, z, block);
         if self.get(x, y, z).is_torch() {
             self.torches.insert(
-                [x, y, z],
+                self.abs_block([x, y, z]),
                 Torch {
                     chemical,
                     lit_at: self.clock,
@@ -187,7 +306,7 @@ impl World {
         dirty
     }
 
-    /// Torches dont la couleur chimique s'est éteinte entre `t0` et `t1`.
+    /// Torches dont la couleur chimique s'est éteinte entre `t0` et `t1` (places locales).
     pub fn torches_expiring(&self, t0: f64, t1: f64) -> Vec<[i32; 3]> {
         self.torches
             .iter()
@@ -195,7 +314,7 @@ impl World {
             .filter_map(|(p, t)| {
                 let c = CHEMICALS.get(t.chemical?)?;
                 let end = t.lit_at + c.burn_time_s() as f64;
-                (end > t0 && end <= t1).then_some(*p)
+                (end > t0 && end <= t1).then_some(self.local_block(*p))
             })
             .collect()
     }
@@ -206,22 +325,23 @@ impl World {
 
     /// Sources de lumière pouvant éclairer le chunk `pos` (chunk et voisins).
     pub fn lights_near(&self, pos: ChunkPos) -> Vec<Light> {
-        let (ox, oz) = pos.origin();
+        // (Les torches sont à leur place absolue.) (v309) Écart compté sur la carte bouclée : une
+        // torche juste de l'autre côté de la limite éclaire aussi.
+        let (ox, oz) = self.abs_chunk(pos).origin();
         let s = CHUNK_SIZE as i32;
+        let near = |p: i32, o: i32| {
+            let d = wrap_block(p as i64 - o as i64);
+            d >= -LIGHT_RADIUS && d < s + LIGHT_RADIUS
+        };
         self.torches
             .iter()
-            .filter(|(p, _)| {
-                p[0] >= ox - LIGHT_RADIUS
-                    && p[0] < ox + s + LIGHT_RADIUS
-                    && p[2] >= oz - LIGHT_RADIUS
-                    && p[2] < oz + s + LIGHT_RADIUS
-            })
+            .filter(|(p, _)| near(p[0], ox) && near(p[2], oz))
             .map(|(p, t)| {
                 let c = self.torch_color(t);
                 // Intensité : le canal le plus fort à 255, la teinte conservée.
                 let m = c.iter().copied().max().unwrap_or(1).max(1) as u32;
                 Light {
-                    pos: *p,
+                    pos: self.local_block(*p),
                     rgb: c.map(|v| (v as u32 * 255 / m) as u8),
                 }
             })
@@ -282,6 +402,7 @@ impl World {
 
     fn torch_nearby(&self, x: i32, y: i32, z: i32) -> bool {
         let r = LIGHT_RADIUS + 1;
+        let [x, y, z] = self.abs_block([x, y, z]);
         self.torches
             .keys()
             .any(|p| (p[0] - x).abs() <= r && (p[1] - y).abs() <= r && (p[2] - z).abs() <= r)
@@ -317,14 +438,17 @@ impl World {
         if self.chunks.contains_key(&chunk.pos) {
             return;
         }
+        let at = self.abs_chunk(chunk.pos);
         if let Some(c) = self
             .bases
-            .get(&chunk.pos)
+            .get(&at)
             .and_then(|d| Chunk::from_rle(chunk.pos, d))
         {
             chunk = c;
         } else if self.generator != Generator::Procedural {
-            chunk = generate(self.generator, self.seed, chunk.pos);
+            let pos = chunk.pos;
+            chunk = generate(self.generator, self.seed, at);
+            chunk.pos = pos;
         }
         self.apply_edits(&mut chunk);
         if let Some(f) = &mut self.fresh {
@@ -334,7 +458,7 @@ impl World {
     }
 
     fn apply_edits(&self, chunk: &mut Chunk) {
-        if let Some(e) = self.edits.get(&chunk.pos) {
+        if let Some(e) = self.edits.get(&self.abs_chunk(chunk.pos)) {
             for (&i, &id) in e {
                 let (x, z, y) = (i % 16, (i / 16) % 16, i / 256);
                 chunk.set(x as usize, y as usize, z as usize, id);
@@ -342,17 +466,18 @@ impl World {
         }
     }
 
-    /// Modifications du joueur : (chunk, index local = x + 16 z + 256 y, bloc).
+    /// Modifications du joueur : (chunk absolu, index dans le chunk = x + 16 z + 256 y,
+    /// bloc). Pour la sauvegarde.
     pub fn edits(&self) -> impl Iterator<Item = (ChunkPos, u32, BlockId)> + '_ {
         self.edits
             .iter()
             .flat_map(|(c, m)| m.iter().map(move |(i, b)| (*c, *i, *b)))
     }
 
-    /// (v185) Modifications du joueur dans le chunk `pos` : (position monde, bloc).
+    /// (v185) Modifications du joueur dans le chunk (local) `pos` : (position locale, bloc).
     pub fn edits_in(&self, pos: ChunkPos) -> Vec<([i32; 3], BlockId)> {
         let (ox, oz) = pos.origin();
-        self.edits.get(&pos).map_or_else(Vec::new, |m| {
+        self.edits.get(&self.abs_chunk(pos)).map_or_else(Vec::new, |m| {
             m.iter()
                 .map(|(&i, &b)| {
                     let (x, z, y) = (i % 16, (i / 16) % 16, i / 256);
@@ -375,7 +500,7 @@ impl World {
         else {
             return None;
         };
-        let (c, i) = Self::cell(pos);
+        let (c, i) = Self::cell(self.abs_block(pos));
         match self.carpets.get(&c).and_then(|m| m.get(&i)) {
             Some(v) if v.len() == n as usize && v.last() == Some(&kind) => Some(v.clone()),
             _ => Some(vec![kind; n as usize]),
@@ -385,7 +510,7 @@ impl World {
     /// (v283) Garde les sortes des couches de la pile de tapis en `pos` (rien à garder si
     /// elles sont toutes de la même : le bloc suffit). À appeler après avoir posé son bloc.
     pub fn set_carpet_layers(&mut self, pos: [i32; 3], layers: &[u8]) {
-        let (c, i) = Self::cell(pos);
+        let (c, i) = Self::cell(self.abs_block(pos));
         let mixed = layers.len() >= 2 && layers.iter().any(|&k| Some(&k) != layers.last());
         if mixed {
             Arc::make_mut(self.carpets.entry(c).or_default()).insert(i, layers.to_vec());
@@ -395,7 +520,7 @@ impl World {
     }
 
     fn forget_carpet(&mut self, pos: [i32; 3]) {
-        let (c, i) = Self::cell(pos);
+        let (c, i) = Self::cell(self.abs_block(pos));
         if let Some(m) = self.carpets.get_mut(&c) {
             if m.contains_key(&i) {
                 Arc::make_mut(m).remove(&i);
@@ -406,7 +531,8 @@ impl World {
         }
     }
 
-    /// (v283) Chunk et index dans le chunk de la case `pos`.
+    /// (v283) Chunk et index dans le chunk de la case `pos` (ici, toujours absolue : les piles
+    /// sont gardées à leur place absolue, comme les modifications).
     fn cell(pos: [i32; 3]) -> (ChunkPos, u32) {
         let c = ChunkPos::containing(pos[0], pos[2]);
         let i = pos[0].rem_euclid(CHUNK_SIZE as i32) as u32
@@ -415,14 +541,14 @@ impl World {
         (c, i)
     }
 
-    /// (v283) Piles de tapis de plusieurs couleurs du chunk `pos` (index dans le chunk →
-    /// couches), pour son maillage.
+    /// (v283) Piles de tapis de plusieurs couleurs du chunk (local) `pos` (index dans le chunk
+    /// → couches), pour son maillage.
     pub fn carpets_in(&self, pos: ChunkPos) -> Option<Arc<HashMap<u32, Vec<u8>>>> {
-        self.carpets.get(&pos).cloned()
+        self.carpets.get(&self.abs_chunk(pos)).cloned()
     }
 
-    /// (v283) Toutes les piles de tapis de plusieurs couleurs : (case, couches). Pour la
-    /// sauvegarde.
+    /// (v283) Toutes les piles de tapis de plusieurs couleurs : (case absolue, couches). Pour
+    /// la sauvegarde.
     pub fn carpets(&self) -> impl Iterator<Item = ([i32; 3], &[u8])> + '_ {
         self.carpets.iter().flat_map(|(c, m)| {
             let (ox, oz) = c.origin();
@@ -433,7 +559,8 @@ impl World {
         })
     }
 
-    /// (v283) Recharge une pile de tapis enregistrée (avant ou après que son chunk arrive).
+    /// (v283) Recharge une pile de tapis enregistrée, à sa place absolue (avant ou après que
+    /// son chunk arrive).
     pub fn load_carpet(&mut self, pos: [i32; 3], layers: Vec<u8>) {
         if layers.len() >= 2 && layers.len() <= 16 {
             let (c, i) = Self::cell(pos);
@@ -453,7 +580,7 @@ impl World {
             let index = x.rem_euclid(CHUNK_SIZE as i32) as u32
                 + 16 * z.rem_euclid(CHUNK_SIZE as i32) as u32
                 + 256 * y as u32;
-            self.load_edit(pos, index, id);
+            self.load_edit(self.abs_chunk(pos), index, id);
             return Vec::new();
         }
         let journal = self.journal.take();
@@ -464,21 +591,29 @@ impl World {
         dirty
     }
 
+    /// Recharge une modification enregistrée (chunk absolu).
     pub fn load_edit(&mut self, chunk: ChunkPos, index: u32, id: BlockId) {
         self.edits.entry(chunk).or_default().insert(index, id);
     }
 
+    /// Torches posées, à leur place locale.
     pub fn torches(&self) -> impl Iterator<Item = ([i32; 3], Torch)> + '_ {
+        self.torches.iter().map(|(p, t)| (self.local_block(*p), *t))
+    }
+
+    /// (v309) Torches posées, à leur place absolue (pour la sauvegarde).
+    pub fn torches_abs(&self) -> impl Iterator<Item = ([i32; 3], Torch)> + '_ {
         self.torches.iter().map(|(p, t)| (*p, *t))
     }
 
     /// Rend la couleur de la torche en `pos` inépuisable (torches posées en créatif).
     pub fn set_torch_infinite(&mut self, pos: [i32; 3]) {
-        if let Some(t) = self.torches.get_mut(&pos) {
+        if let Some(t) = self.torches.get_mut(&self.abs_block(pos)) {
             t.infinite = true;
         }
     }
 
+    /// Recharge une torche enregistrée (place absolue).
     pub fn load_torch(&mut self, pos: [i32; 3], t: Torch) {
         self.torches.insert(pos, t);
     }
@@ -579,9 +714,11 @@ impl World {
             }
         }
         let index = lx as u32 + 16 * lz as u32 + 256 * y as u32;
-        self.edits.entry(pos).or_default().insert(index, id);
+        let at = self.abs_chunk(pos);
+        self.edits.entry(at).or_default().insert(index, id);
         if old.is_torch() && !id.is_torch() {
-            self.torches.remove(&[x, y, z]);
+            let p = self.abs_block([x, y, z]);
+            self.torches.remove(&p);
         }
         // (v283) Plus une pile de tapis : ses couleurs sont oubliées. (Une pile qui change de
         // hauteur garde les siennes jusqu'à ce que `set_carpet_layers` les remplace ; si elles
@@ -790,6 +927,95 @@ mod tests {
         w2.set(p[0], p[1], p[2], BlockId::AIR);
         assert_eq!(w2.carpets().count(), 0);
         assert_eq!(w2.carpet_layers(p), None);
+    }
+
+    /// (v309) La même partie du monde comptée depuis une autre origine : les mêmes blocs
+    /// (générés à leur place absolue), les modifications et les torches enregistrées à leur
+    /// place absolue, relues pareil depuis une troisième origine ; la lumière des torches au
+    /// même endroit ; `set_origin` remet les chunks chargés à leur nouvelle place.
+    #[test]
+    fn a_local_origin_changes_only_the_numbers() {
+        // ≈ 16,7 millions de blocs du centre.
+        let far = ChunkPos {
+            x: 1_043_712,
+            z: -1_043_200,
+        };
+        let mut a = World::new(7);
+        let mut b = World::new(7);
+        b.set_origin(far);
+        assert_eq!(b.origin_blocks(), [far.x * 16, 0, far.z * 16]);
+        let abs = ChunkPos {
+            x: far.x + 2,
+            z: far.z - 1,
+        };
+        let local = b.local_chunk(abs);
+        assert_eq!(local, ChunkPos { x: 2, z: -1 });
+        assert_eq!(b.abs_chunk(local), abs);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                a.ensure_chunk(ChunkPos {
+                    x: abs.x + dx,
+                    z: abs.z + dz,
+                });
+                b.ensure_chunk(ChunkPos {
+                    x: local.x + dx,
+                    z: local.z + dz,
+                });
+            }
+        }
+        assert_eq!(b.chunk(local).unwrap().pos, local);
+        for y in (0..300).step_by(7) {
+            for z in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(
+                        a.chunk(abs).unwrap().get(x, y, z),
+                        b.chunk(local).unwrap().get(x, y, z)
+                    );
+                }
+            }
+        }
+        let (lx, lz) = local.origin();
+        let (ax, az) = abs.origin();
+        assert_eq!(b.abs_block([lx, 5, lz]), [ax, 5, az]);
+        assert_eq!(b.local_block([ax, 5, az]), [lx, 5, lz]);
+        a.set(ax + 3, 200, az + 4, BlockId::BRICK);
+        b.set(lx + 3, 200, lz + 4, BlockId::BRICK);
+        assert_eq!(a.edits().collect::<Vec<_>>(), b.edits().collect::<Vec<_>>());
+        assert_eq!(b.edits_in(local), vec![([lx + 3, 200, lz + 4], BlockId::BRICK)]);
+        b.place_torch(lx + 8, 201, lz + 8, None);
+        assert_eq!(b.torches_abs().next().unwrap().0, [ax + 8, 201, az + 8]);
+        assert_eq!(b.torches().next().unwrap().0, [lx + 8, 201, lz + 8]);
+        assert!(b.torch([lx + 8, 201, lz + 8]).is_some());
+        assert!(b
+            .lights_near(local)
+            .iter()
+            .any(|l| l.pos == [lx + 8, 201, lz + 8]));
+        // Relu depuis ce qui est enregistré, avec une troisième origine.
+        let mut c = World::new(7);
+        for (ch, i, id) in b.edits() {
+            c.load_edit(ch, i, id);
+        }
+        for (p, t) in b.torches_abs() {
+            c.load_torch(p, t);
+        }
+        c.set_origin(ChunkPos {
+            x: far.x + 256,
+            z: far.z,
+        });
+        let lc = c.local_chunk(abs);
+        c.ensure_chunk(lc);
+        let (cx, cz) = lc.origin();
+        assert_eq!(c.get(cx + 3, 200, cz + 4), BlockId::BRICK);
+        assert_eq!(c.get(cx + 8, 201, cz + 8), BlockId::TORCH);
+        assert!(c.torch([cx + 8, 201, cz + 8]).is_some());
+        // Casser la torche (coordonnées locales) l'oublie à sa place absolue.
+        c.set(cx + 8, 201, cz + 8, BlockId::AIR);
+        assert_eq!(c.torches_abs().count(), 0);
+        // Les chunks chargés suivent un changement d'origine.
+        b.set_origin(ChunkPos { x: 0, z: 0 });
+        assert_eq!(b.chunk(abs).unwrap().pos, abs);
+        assert_eq!(b.get(ax + 3, 200, az + 4), BlockId::BRICK);
+        assert!(b.torch([ax + 8, 201, az + 8]).is_some());
     }
 
     #[test]

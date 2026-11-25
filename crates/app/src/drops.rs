@@ -15,8 +15,17 @@ use minelib_world::World;
 
 use crate::inventory::Item;
 
-/// Fichier des objets d'un monde (au sol et dans les coffres).
+/// Fichier des objets d'un monde (au sol et dans les coffres). (v309) Leurs places sont
+/// comptées depuis l'`objets_origine` du monde (`SaveData::objects_origin`, (0, 0) jusque-là).
 pub const FILE: &str = "objets.bin";
+/// (v309) Objets au sol laissés loin de l'origine de la partie (voir `PARK`) : chacun avec
+/// l'origine (blocs, x et z) depuis laquelle sa place est comptée, tels qu'enregistrés.
+pub const FAR_FILE: &str = "objets_loin.bin";
+/// (v309) Un objet au sol à plus de tant de blocs de l'origine de la partie (sur x ou sur z)
+/// n'est pas chargé : un f32 n'y vaudrait plus qu'à 1/128 de bloc (au bloc à 16 millions). Il
+/// reste « garé » tel qu'il a été enregistré, à sa place exacte, jusqu'à ce qu'on revienne près
+/// de lui. (Les coffres, comptés en entiers, sont toujours chargés.)
+const PARK: f64 = 65_536.0;
 /// On ramasse un objet à cette distance (blocs).
 pub const PICK_RANGE: f32 = 1.5;
 /// Délai avant de pouvoir ramasser un objet qui vient d'apparaître (le sien : plus long,
@@ -47,6 +56,62 @@ pub struct Items {
     /// Le monde a changé depuis le dernier enregistrement.
     pub dirty: bool,
     start: Instant,
+    /// (v309) Objets au sol garés loin de l'origine de la partie (voir `PARK`), avec l'origine
+    /// depuis laquelle leur place est comptée.
+    parked: Vec<([i32; 2], BuildMsg)>,
+}
+
+/// (v309) `m`, dont la place est comptée depuis l'origine `from` (blocs, x et z), comptée
+/// depuis `to`. `None` : un objet au sol qui serait à plus de `limit` blocs de `to` (sur x ou
+/// sur z). Calcul en double précision : la place ne se perd pas en route.
+pub fn shift(m: &BuildMsg, from: [i32; 2], to: [i32; 2], limit: f64) -> Option<BuildMsg> {
+    // (v309) Le décalage le plus court sur la carte bouclée.
+    let dx = minelib_world::lap::wrap_block(from[0] as i64 - to[0] as i64) as i64;
+    let dz = minelib_world::lap::wrap_block(from[1] as i64 - to[1] as i64) as i64;
+    match m {
+        BuildMsg::Item {
+            id,
+            at,
+            drop,
+            to: who,
+            seq,
+            got,
+        } => {
+            let x = at[0] as f64 + dx as f64;
+            let z = at[2] as f64 + dz as f64;
+            if !(x.abs() <= limit && z.abs() <= limit) {
+                return None;
+            }
+            Some(BuildMsg::Item {
+                id: *id,
+                at: [x as f32, at[1], z as f32],
+                drop: *drop,
+                to: who.clone(),
+                seq: *seq,
+                got: *got,
+            })
+        }
+        BuildMsg::Slot {
+            pos,
+            slot,
+            pile,
+            by,
+            seq,
+            got,
+        } => Some(BuildMsg::Slot {
+            pos: [
+                i32::try_from(pos[0] as i64 + dx).ok()?,
+                pos[1],
+                i32::try_from(pos[2] as i64 + dz).ok()?,
+            ],
+            slot: *slot,
+            pile: *pile,
+            by: by.clone(),
+            seq: *seq,
+            got: *got,
+        }),
+        other => Some(other.clone()),
+    }
 }
 
 fn chunk_at(x: f32, z: f32) -> [i32; 2] {
@@ -70,6 +135,7 @@ impl Items {
             asked: HashMap::new(),
             dirty: false,
             start: Instant::now(),
+            parked: Vec::new(),
         }
     }
 
@@ -86,26 +152,90 @@ impl Items {
             .unwrap_or_default()
     }
 
-    /// Enregistre les objets du monde (solo, ou propriétaire d'un monde en ligne).
-    pub fn save(&mut self, dir: &Path) {
-        if !self.dirty {
-            return;
+    /// (v309) Objets enregistrés avec le monde `dir`, chacun avec l'origine depuis laquelle sa
+    /// place est comptée : ceux de `FILE` depuis `origin` (l'`objets_origine` du monde), ceux
+    /// de `FAR_FILE` depuis la leur.
+    pub fn load_saved(dir: &Path, origin: [i32; 2]) -> Vec<([i32; 2], BuildMsg)> {
+        let mut out: Vec<([i32; 2], BuildMsg)> =
+            Self::load(dir).into_iter().map(|m| (origin, m)).collect();
+        if let Some(far) = std::fs::read(dir.join(FAR_FILE))
+            .ok()
+            .and_then(|b| minelib_net::game::decode::<Vec<([i32; 2], BuildMsg)>>(&b))
+        {
+            out.extend(far);
         }
-        let snap = self.view.snapshot();
-        let path = dir.join(FILE);
-        let ok = if snap.is_empty() {
-            std::fs::remove_file(&path).is_ok() || !path.exists()
-        } else {
-            std::fs::write(&path, minelib_net::game::encode(&snap)).is_ok()
-        };
-        self.dirty = !ok;
+        out
     }
 
-    /// Solo : les objets de la sauvegarde reviennent tels quels.
+    /// (v309) Les objets enregistrés, tous comptés depuis l'origine `to` (en ligne : (0, 0),
+    /// le centre du monde, comme chez les autres joueurs), garés compris.
+    pub fn saved_at(dir: &Path, origin: [i32; 2], to: [i32; 2]) -> Vec<BuildMsg> {
+        Self::load_saved(dir, origin)
+            .into_iter()
+            .filter_map(|(from, m)| shift(&m, from, to, f64::INFINITY))
+            .collect()
+    }
+
+    /// Enregistre les objets du monde (solo, ou propriétaire d'un monde en ligne). (v309) Leurs
+    /// places sont celles de la partie : le monde garde son origine (`objects_origin`) ; les
+    /// objets garés (solo) vont dans `FAR_FILE`. Rend vrai si tout est écrit.
+    pub fn save(&mut self, dir: &Path) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let write = |name: &str, bytes: Option<Vec<u8>>| {
+            let path = dir.join(name);
+            match bytes {
+                None => std::fs::remove_file(&path).is_ok() || !path.exists(),
+                Some(b) => std::fs::write(&path, b).is_ok(),
+            }
+        };
+        let snap = self.view.snapshot();
+        let mut ok = write(
+            FILE,
+            (!snap.is_empty()).then(|| minelib_net::game::encode(&snap)),
+        );
+        // (En ligne, le propriétaire a remis les garés au relais avec les autres, voir
+        // `saved_at` : ils sont dans ce qu'il vient d'écrire.)
+        ok &= write(
+            FAR_FILE,
+            (self.local && !self.parked.is_empty())
+                .then(|| minelib_net::game::encode(&self.parked)),
+        );
+        self.dirty = !ok;
+        ok
+    }
+
+    /// Solo : les objets de la sauvegarde reviennent tels quels. (v309) Pour les essais : le
+    /// jeu passe par `restore_saved`, qui les compte depuis l'origine de la partie.
+    #[cfg(test)]
     pub fn restore(&mut self, saved: &[BuildMsg]) {
         for m in saved {
             self.view.seed(m);
         }
+    }
+
+    /// (v309) Solo : les objets de la sauvegarde (`load_saved`) reviennent, comptés depuis
+    /// l'origine de la partie `origin` ; ceux trop loin d'elle restent garés (`PARK`). Rend
+    /// vrai si des objets ont changé d'origine (à réenregistrer depuis la nouvelle).
+    pub fn restore_saved(&mut self, saved: Vec<([i32; 2], BuildMsg)>, origin: [i32; 2]) -> bool {
+        let mut moved = false;
+        for (from, m) in saved {
+            match shift(&m, from, origin, PARK) {
+                Some(here) => {
+                    moved |= from != origin;
+                    self.view.seed(&here);
+                }
+                None => self.parked.push((from, m)),
+            }
+        }
+        moved
+    }
+
+    /// (v309) Objets au sol garés (loin de l'origine de la partie). Pour les essais.
+    #[cfg(test)]
+    pub fn parked(&self) -> usize {
+        self.parked.len()
     }
 
     /// (v241) Solo, à l'ouverture d'une carte : un seul objet légendaire (la Foudre de Zeus)
@@ -118,6 +248,26 @@ impl Items {
         }
         let mut found = !keep;
         let mut changed = false;
+        // (v309) Les garés aussi (loin de l'origine de la partie) : la Foudre reste unique.
+        self.parked.retain_mut(|(_, m)| {
+            let BuildMsg::Item {
+                drop: Some(pile), ..
+            } = m
+            else {
+                return true;
+            };
+            if pile.item != LEGEND_ITEM {
+                return true;
+            }
+            if found {
+                changed = true;
+                return false;
+            }
+            changed |= pile.count != 1;
+            pile.count = 1;
+            found = true;
+            true
+        });
         for d in self.view.drops.values_mut() {
             if let Some(drop) = d.as_mut().filter(|d| d.pile.item == LEGEND_ITEM) {
                 if found {
@@ -595,6 +745,62 @@ mod tests {
         // Rien à garder : rien ne change.
         let mut it = Items::new(true);
         assert!(!it.keep_one_legend(true) && !it.dirty);
+    }
+
+    /// (v309) Un objet laissé près du centre du monde, une partie jouée à 16,7 millions de
+    /// blocs, puis le retour : l'objet attend, garé, exactement à sa place ; celui lâché là-bas
+    /// est garé à son tour au retour ; les coffres sont toujours là. En ligne (centre du monde),
+    /// tous reviennent, garés compris.
+    #[test]
+    fn far_from_the_origin_ground_items_wait_at_their_exact_place() {
+        let dir = std::env::temp_dir().join(format!("minelib-objets-loin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let item = |id: u64, at: [f32; 3], n: u8| BuildMsg::Item {
+            id,
+            at,
+            drop: Some(stone(n)),
+            to: String::new(),
+            seq: 0,
+            got: None,
+        };
+        let chest = BuildMsg::Slot {
+            pos: [10, 64, 10],
+            slot: 2,
+            pile: Some(stone(5)),
+            by: String::new(),
+            seq: 0,
+            got: None,
+        };
+        let saved = vec![item(7, [100.3, 64.0, -20.7], 3), chest];
+        std::fs::write(dir.join(FILE), minelib_net::game::encode(&saved)).unwrap();
+        // Partie à 16,7 millions (origine 16 777 216 / 0).
+        let far = [16_777_216, 0];
+        let mut it = Items::new(true);
+        assert!(it.restore_saved(Items::load_saved(&dir, [0, 0]), far));
+        assert_eq!(it.parked(), 1, "l'objet du centre attend, garé");
+        assert!(it.view.chests.contains_key(&[10 - 16_777_216, 64, 10]));
+        it.view.seed(&item(8, [1.25, 70.0, 2.5], 1));
+        it.dirty = true;
+        assert!(it.save(&dir));
+        assert!(dir.join(FAR_FILE).exists());
+        // Retour près du centre (le monde garde l'origine du fichier : `far`).
+        let mut back = Items::new(true);
+        back.restore_saved(Items::load_saved(&dir, far), [0, 0]);
+        assert_eq!(back.parked(), 1, "celui lâché là-bas attend à son tour");
+        let at = |it: &Items, id: u64| it.view.live_drops().find(|(k, _)| *k == id).map(|(_, d)| d.pos);
+        assert_eq!(at(&back, 7), Some([100.3, 64.0, -20.7]), "exactement à sa place");
+        assert!(back.view.chests.contains_key(&[10, 64, 10]));
+        // Et de nouveau là-bas : celui lâché là-bas est à sa place lui aussi.
+        back.dirty = true;
+        assert!(back.save(&dir));
+        let mut again = Items::new(true);
+        again.restore_saved(Items::load_saved(&dir, [0, 0]), far);
+        assert_eq!(at(&again, 8), Some([1.25, 70.0, 2.5]));
+        // En ligne : tout, compté depuis le centre du monde.
+        let all = Items::saved_at(&dir, [0, 0], [0, 0]);
+        assert_eq!(all.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

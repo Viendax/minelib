@@ -148,11 +148,23 @@ pub struct Frames {
 }
 
 impl Frames {
-    pub fn load(dir: &std::path::Path) -> Self {
+    /// Cadres du monde `dir`. (v309) Le fichier a leurs places absolues ; gardés comptés depuis
+    /// l'origine de la partie `origin` (leur ligne reste celle du fichier, pour `remove`).
+    pub fn load(dir: &std::path::Path, origin: [i32; 3]) -> Self {
         let list: Vec<Frame> = std::fs::read_to_string(dir.join(crate::mcimport::HEADS_FILE))
             .unwrap_or_default()
             .lines()
             .filter_map(parse)
+            .map(|mut f| {
+                // (v309) La place la plus proche de l'origine, sur la carte bouclée.
+                let wb = minelib_world::lap::wrap_block;
+                f.pos = [
+                    wb(f.pos[0] as i64 - origin[0] as i64),
+                    f.pos[1],
+                    wb(f.pos[2] as i64 - origin[2] as i64),
+                ];
+                f
+            })
             .collect();
         Self {
             light: vec![None; list.len()],

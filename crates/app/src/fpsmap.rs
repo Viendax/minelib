@@ -29,6 +29,12 @@ fn parse_zone(v: &str) -> Option<Zone> {
     (n.len() == 6).then(|| Zone::new([n[0], n[1], n[2]], [n[3], n[4], n[5]]))
 }
 
+/// (v309) Le monde `dir` est-il une carte FPS (il a ses réglages FPS) ? Une carte se joue
+/// comptée depuis le centre du monde (voir `SessionConfig::far_origin`).
+pub fn exists(dir: &Path) -> bool {
+    dir.join(FILE).exists()
+}
+
 /// Réglages FPS d'un monde (vides si absents).
 pub fn load(dir: &Path) -> FpsMap {
     let mut m = FpsMap::default();

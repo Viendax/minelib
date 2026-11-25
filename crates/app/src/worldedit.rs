@@ -284,13 +284,15 @@ impl WorldEdit {
         let changed = |n: usize| Ok(format!("{n} bloc(s) modifié(s)"));
         match name {
             "help" | "?" => Ok(HELP.into()),
+            // (v309) Coins montrés à leur place absolue dans le monde (la partie peut compter
+            // depuis une origine proche du joueur, loin du centre).
             "pos1" => {
                 self.pos1 = Some(ctx.feet);
-                Ok(format!("Coin 1 : {:?}", ctx.feet))
+                Ok(format!("Coin 1 : {:?}", ctx.world.abs_block(ctx.feet)))
             }
             "pos2" => {
                 self.pos2 = Some(ctx.feet);
-                Ok(format!("Coin 2 : {:?}", ctx.feet))
+                Ok(format!("Coin 2 : {:?}", ctx.world.abs_block(ctx.feet)))
             }
             "hpos1" | "hpos2" => {
                 let t = ctx.target.ok_or("Aucun bloc visé")?;
@@ -299,7 +301,7 @@ impl WorldEdit {
                 } else {
                     self.pos2 = Some(t);
                 }
-                Ok(format!("Coin {} : {t:?}", &name[4..]))
+                Ok(format!("Coin {} : {:?}", &name[4..], ctx.world.abs_block(t)))
             }
             "sel" | "desel" | "deselect" => {
                 self.pos1 = None;

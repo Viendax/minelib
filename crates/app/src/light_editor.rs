@@ -1586,15 +1586,28 @@ impl Editor {
         p.y += p.pad;
         p.clip.1 = end;
         let mut changed = false;
+        // (v309) X / Y / Z montrés et tapés à leur place absolue dans le monde (la partie compte
+        // depuis une origine proche du joueur, loin du centre du monde).
+        let shown = lights.abs_of(lights.scene[i].position);
+        let back = |lights: &crate::lights::Lights, a: [f64; 3]| lights.local_of(a);
+        let mut moved_to = None;
+        if self.tab == Tab::Placement {
+            for (a, name) in ["X", "Y", "Z"].iter().enumerate() {
+                if let Some(v) = self.drag_value(p, 100 + a as u32, name, shown[a], 0.02) {
+                    let mut abs = moved_to.unwrap_or(shown);
+                    abs[a] = v;
+                    moved_to = Some(abs);
+                }
+            }
+        }
+        if let Some(abs) = moved_to {
+            let local = back(lights, abs);
+            lights.scene[i].position = local;
+            changed = true;
+        }
         let l = &mut lights.scene[i];
         match self.tab {
             Tab::Placement => {
-                for (a, name) in ["X", "Y", "Z"].iter().enumerate() {
-                    if let Some(v) = self.drag_value(p, 100 + a as u32, name, l.position[a], 0.02) {
-                        l.position[a] = v;
-                        changed = true;
-                    }
-                }
                 if p.buttons(&["Amener ici"], None).is_some() {
                     l.position = [cam.pos.x as f64, cam.pos.y as f64, cam.pos.z as f64];
                     changed = true;

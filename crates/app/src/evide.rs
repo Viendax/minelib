@@ -2378,11 +2378,16 @@ impl Horde {
     /// (v272) « Il n'est pas enregistré avec le monde : règle ça. » Les Évidés vivants dans
     /// `evides.txt`, dans le dossier du monde : une ligne `e x y z lacet rampe` par monstre,
     /// suivie d'une ligne `b pavé lo(3) hi(3) départ(3)` par morceau qu'on lui a mangé.
-    pub fn save(&self, dir: &std::path::Path) {
+    /// (v309) `origin` : origine des coordonnées locales de la partie (blocs, voir
+    /// `World::origin_blocks`) ; le fichier garde les places absolues.
+    pub fn save(&self, dir: &std::path::Path, origin: [i32; 3]) {
         let mut text = String::new();
         for e in self.list.iter().filter(|e| !e.frozen && e.dying.is_none()) {
             let p = e.pos;
-            text += &format!("e {} {} {} {} {}\n", p.x, p.y, p.z, e.yaw, e.crawling as u8);
+            // (v309) Sur la carte bouclée.
+            let wrap = minelib_world::lap::wrap_f64;
+            let (x, z) = (wrap(p.x as f64 + origin[0] as f64), wrap(p.z as f64 + origin[2] as f64));
+            text += &format!("e {} {} {} {} {}\n", x, p.y, z, e.yaw, e.crawling as u8);
             for b in e.flesh.bites() {
                 let n: Vec<String> = [b.lo, b.hi, b.start].iter().flatten().map(u8::to_string).collect();
                 text += &format!("b {} {}\n", b.part, n.join(" "));
@@ -2396,8 +2401,9 @@ impl Horde {
         }
     }
 
-    /// (v272) Les Évidés enregistrés avec ce monde (aucun si le fichier manque).
-    pub fn load(dir: &std::path::Path) -> Self {
+    /// (v272) Les Évidés enregistrés avec ce monde (aucun si le fichier manque). (v309)
+    /// Comptés depuis l'origine `origin` de la partie (voir `save`).
+    pub fn load(dir: &std::path::Path, origin: [i32; 3]) -> Self {
         let mut horde = Self::default();
         let Ok(text) = std::fs::read_to_string(dir.join("evides.txt")) else {
             return horde;
@@ -2414,9 +2420,17 @@ impl Horde {
             match f.next() {
                 Some("e") => {
                     close(&mut horde, &mut bites);
-                    let n: Vec<f32> = f.filter_map(|v| v.parse().ok()).collect();
+                    let n: Vec<f64> = f.filter_map(|v| v.parse().ok()).collect();
                     if n.len() >= 5 && n.iter().all(|v| v.is_finite()) {
-                        if horde.spawn(Vec3::new(n[0], n[1], n[2]), n[3]) {
+                        // (v309) La place la plus proche de l'origine, sur la carte bouclée.
+                        let wrap = minelib_world::lap::wrap_f64;
+                        let at = Vec3::new(
+                            wrap(n[0] - origin[0] as f64) as f32,
+                            n[1] as f32,
+                            wrap(n[2] - origin[2] as f64) as f32,
+                        );
+                        let n: Vec<f32> = n.iter().map(|&v| v as f32).collect();
+                        if horde.spawn(at, n[3]) {
                             if let Some(e) = horde.list.last_mut() {
                                 e.crawling = n[4] != 0.0;
                                 e.tall = if e.crawling { CRAWL_H } else { HEIGHT };
@@ -3369,8 +3383,8 @@ mod tests {
             h.list[1].flesh.bite_somewhere(k * 31 + 5, OUR_BITE, &[0, 2, 3, 5], &grids);
         }
         h.list[1].crawling = true;
-        h.save(&dir);
-        let back = Horde::load(&dir);
+        h.save(&dir, [0; 3]);
+        let back = Horde::load(&dir, [0; 3]);
         assert_eq!(back.list.len(), 2);
         for (a, b) in h.list.iter().zip(&back.list) {
             assert_eq!((a.pos, a.yaw, a.crawling), (b.pos, b.yaw, b.crawling));
@@ -3379,8 +3393,8 @@ mod tests {
         }
         assert!(back.list[1].flesh.eaten(&grids) > 0.05 && back.list[0].flesh.is_whole());
         h.list.clear();
-        h.save(&dir);
-        assert!(!dir.join("evides.txt").exists() && Horde::load(&dir).list.is_empty());
+        h.save(&dir, [0; 3]);
+        assert!(!dir.join("evides.txt").exists() && Horde::load(&dir, [0; 3]).list.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

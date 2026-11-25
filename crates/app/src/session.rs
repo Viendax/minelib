@@ -432,6 +432,59 @@ fn zeus_click(selected: Option<Item>, pressed: bool, held: bool) -> bool {
 #[derive(Clone, Copy)]
 pub struct SessionConfig {
     pub view_distance: i32,
+    /// (v309) Partie solo : loin du centre du monde, elle compte depuis une origine proche du
+    /// joueur (`World::origin`, voir `origin_near`). Faux en ligne et en partie FPS : tout y
+    /// est compté depuis le centre, comme chez les autres joueurs.
+    pub far_origin: bool,
+}
+
+/// (v309) « Aucun problème jusqu'à 16,7 millions » : à moins de tant de blocs du centre du
+/// monde (sur x ou sur z), l'origine reste le centre : les mondes et les cartes d'avant ne
+/// changent pas (un f32 y vaut encore au demi-millimètre près, et la v254 y garde l'image et
+/// les pas exacts).
+const ORIGIN_FREE: f64 = 32_768.0;
+/// (v309) L'origine est un multiple de tant de blocs (256 chunks, une zone du relais).
+const ORIGIN_STEP: f64 = 4_096.0;
+/// (v309) Plus loin que ça de l'origine (sur x ou sur z), la partie est rechargée avec une
+/// origine plus proche (`Session::take_rebase`) : un f32 y vaut encore au millimètre près.
+const REBASE_AT: f32 = 24_576.0;
+
+/// (v309) Origine (en chunks) des coordonnées locales d'une partie solo dont le joueur est
+/// en `abs` (place absolue) : le centre du monde à moins de `ORIGIN_FREE`, sinon le multiple
+/// de `ORIGIN_STEP` le plus proche, sur chaque axe.
+pub fn origin_near(abs: [f64; 3]) -> ChunkPos {
+    let axis = |a: f64| -> i32 {
+        if !a.is_finite() || a.abs() < ORIGIN_FREE {
+            return 0;
+        }
+        let blocks = (a / ORIGIN_STEP).round() * ORIGIN_STEP;
+        (blocks.clamp(-2.0e9, 2.0e9) as i64 / CHUNK_SIZE as i64) as i32
+    };
+    // (v309) Ramenée sur la carte bouclée (près de la limite, le multiple le plus proche peut
+    // être juste de l'autre côté).
+    ChunkPos {
+        x: minelib_world::lap::wrap_chunk(axis(abs[0]) as i64),
+        z: minelib_world::lap::wrap_chunk(axis(abs[2]) as i64),
+    }
+}
+
+/// (v309) Le point d'une partie dont l'origine est `ob` (blocs) de la place absolue `a` : la
+/// plus proche de l'origine, sur la carte bouclée.
+fn local_from(ob: [i32; 3], a: [f64; 3]) -> Vec3 {
+    let wrap = minelib_world::lap::wrap_f64;
+    Vec3::new(
+        wrap(a[0] - ob[0] as f64) as f32,
+        a[1] as f32,
+        wrap(a[2] - ob[2] as f64) as f32,
+    )
+}
+
+/// (v309) Ce que le tchat dit des tours de la carte bouclée `l` du joueur.
+fn laps_said(l: crate::laps::Laps) -> String {
+    match crate::laps::text(l) {
+        Some(t) => format!("Tour de la carte ! Tu en es à {t}."),
+        None => "De retour sur la carte de départ : aucun tour.".to_string(),
+    }
 }
 
 /// Pas de la simulation du joueur : 256 fois par seconde, quelle que soit la cadence
@@ -740,6 +793,23 @@ pub struct Session {
     items: crate::drops::Items,
     /// `items` est-il prêt (sauvegarde relue, ou remise au relais par le propriétaire) ?
     items_ready: bool,
+    /// (v309) Origine (blocs, x et z) depuis laquelle les places de `drops::FILE` du monde
+    /// sont comptées : celle de la partie une fois les objets enregistrés depuis elle.
+    items_origin: [i32; 2],
+    /// (v309) Partie qui peut compter depuis une origine proche du joueur (solo, pas une
+    /// carte FPS : `SessionConfig::far_origin`).
+    far_allowed: bool,
+    /// (v309) Téléporté loin de l'origine : sa place absolue exacte, enregistrée telle quelle
+    /// (la partie est rouverte depuis une origine proche d'elle à la fin de l'image).
+    teleport_to: Option<[f64; 3]>,
+    /// (v309) Tours de la carte bouclée de l'origine de la partie (`World::origin`, sur la
+    /// carte) : ceux du joueur, moins la limite qu'il a passée depuis elle (`laps_at`).
+    lap_base: crate::laps::Laps,
+    /// (v309) Les tours du joueur à l'image d'avant : un changement est dit au tchat
+    /// (`watch_laps`).
+    laps_seen: crate::laps::Laps,
+    /// (v309) Ceux d'un `/tp` loin de l'origine (avec `teleport_to`), enregistrés tels quels.
+    teleport_laps: Option<crate::laps::Laps>,
     /// (v220) Monde pas encore chargé (voir `LOAD_MIN_S` et `loading_done`, la seule porte) :
     /// on n'y apparaît pas. Ni touches ni physique (le joueur reste où il arrive), sa position
     /// ne part pas aux autres (construction en ligne) et il ne se présente pas à l'hôte (partie
@@ -926,36 +996,83 @@ impl Session {
     pub fn open(dir: PathBuf, cfg: SessionConfig) -> Result<Self> {
         let (data, mut world) = save::load_world(&dir)?;
         let dir_for_lights = dir.clone();
-        // (v272) Les Évidés enregistrés avec ce monde.
-        let evides_saved = crate::evide::Horde::load(&dir);
-        let (mut player, fresh) = match data.player {
+        // (v309) Place absolue du joueur (enregistrée en double précision).
+        let (mut abs, mut player, fresh) = match data.player {
             Some(p) => {
-                let mut pl = Player::new(Vec3::from(p.pos));
+                let mut pl = Player::new(Vec3::ZERO);
                 pl.yaw = p.yaw;
                 pl.pitch = p.pitch;
                 pl.flying = p.flying;
-                (pl, false)
+                (p.pos, pl, false)
             }
-            None => (Player::new(Vec3::new(8.5, 0.0, 8.5)), true),
+            None => ([8.5, 0.0, 8.5], Player::new(Vec3::ZERO), true),
         };
-        // (v198) Position de départ donnée (essais) : gardée aussi dans un monde neuf.
+        // (v198) Position de départ donnée (essais) : gardée aussi dans un monde neuf. (v309)
+        // Place absolue (jusqu'à 16,7 millions de blocs et au-delà).
         let mut start_given = false;
         let mut demo: Option<f64> = None;
-        if let Ok(start) = std::env::var("MINELIB_START") {
-            let v: Vec<f32> = start
+        // (v309) À la première ouverture seulement : une partie rouverte depuis une autre
+        // origine (`Game::rebase_world`) reprend la place enregistrée, pas celle des essais.
+        static START_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let start = std::env::var("MINELIB_START")
+            .ok()
+            .filter(|_| !START_USED.swap(true, std::sync::atomic::Ordering::Relaxed));
+        if let Some(start) = start {
+            let v: Vec<f64> = start
                 .split(',')
                 .filter_map(|s| s.trim().parse().ok())
                 .collect();
-            if v.len() >= 3 {
-                player.pos = Vec3::new(v[0], v[1], v[2]);
+            if v.len() >= 3 && v[..3].iter().all(|a| a.is_finite()) {
+                abs = [v[0], v[1], v[2]];
                 player.flying = true;
                 start_given = true;
             }
             if v.len() >= 5 {
-                player.yaw = v[3].to_radians();
-                player.pitch = v[4].to_radians();
+                player.yaw = (v[3] as f32).to_radians();
+                player.pitch = (v[4] as f32).to_radians();
             }
         }
+        // (v309) Origine des coordonnées locales : près du joueur, loin du centre du monde,
+        // en solo (pas en ligne ni dans une carte FPS : `origin_near`, `World`). Tout ce que
+        // la partie compte (joueur, chunks chargés, objets, lumières…) l'est depuis elle ; ce
+        // qui est enregistré reste absolu.
+        let far = cfg.far_origin
+            && data.game.mode != GameMode::Fps
+            && !crate::fpsmap::exists(&dir);
+        // (v309) Sur la carte bouclée (`laps`) : une place enregistrée ou donnée hors de la
+        // carte (`MINELIB_START`, une partie d'avant) y est ramenée, ses tours comptés.
+        let mut laps = if far { data.laps } else { [0, 0] };
+        if far {
+            for (k, i) in [(0usize, 0usize), (1, 2)] {
+                if let Some(e) = crate::laps::exact(0, abs[i]) {
+                    let (l, at) = crate::laps::on_map(e);
+                    laps[k] = laps[k].saturating_add(l);
+                    abs[i] = at;
+                }
+            }
+        }
+        let origin = if far { origin_near(abs) } else { ChunkPos { x: 0, z: 0 } };
+        world.set_origin(origin);
+        if origin != (ChunkPos { x: 0, z: 0 }) {
+            let o = world.origin_blocks();
+            log::info!(
+                "loin du centre du monde : la partie compte depuis l'origine {} / {} (place du joueur : {:.1} / {:.1} / {:.1})",
+                o[0], o[2], abs[0], abs[1], abs[2]
+            );
+        }
+        let ob = world.origin_blocks();
+        player.pos = local_from(ob, abs);
+        // (v309) Les tours de l'origine : ceux du joueur, moins la limite qu'il a passée depuis
+        // elle (près de la limite, l'origine peut être de l'autre côté).
+        let lap_base = {
+            let cross = |o: i32, v: f32| minelib_world::lap::split(o as i128 + v.floor() as i128).0;
+            [
+                laps[0].saturating_sub(cross(ob[0], player.pos.x)),
+                laps[1].saturating_sub(cross(ob[2], player.pos.z)),
+            ]
+        };
+        // (v272) Les Évidés enregistrés avec ce monde. (v309) Comptés depuis l'origine.
+        let evides_saved = crate::evide::Horde::load(&dir, ob);
         // Chunks autour du joueur générés tout de suite (sol sous ses pieds).
         let c = ChunkPos::containing(player.pos.x.floor() as i32, player.pos.z.floor() as i32);
         for dz in -1..=1 {
@@ -989,8 +1106,9 @@ impl Session {
             player.flying = false;
         }
         // (v223) Point d'apparition choisi par `/setspawn`, sinon là où l'on ouvre le monde.
+        // (v309) Enregistré à sa place absolue.
         let spawn_set = data.spawn.is_some();
-        let spawn = data.spawn.map_or(player.pos, Vec3::from);
+        let spawn = data.spawn.map_or(player.pos, |a| local_from(ob, a));
         // (v216) Météo du monde. MINELIB_METEO=clear|rain|storm : imposée et figée (essais).
         let mut storm = crate::storm::Storm::new(u64::from(world.seed));
         storm.weather.load(&data.weather);
@@ -1066,7 +1184,7 @@ impl Session {
             build_match: None,
             match_opening: false,
             dir,
-            workers: Workers::new(data.meta.seed, world.generator),
+            workers: Workers::new(data.meta.seed, world.generator, world.origin()),
             streamer: Streamer::new(radius),
             meta: data.meta,
             world,
@@ -1202,6 +1320,12 @@ impl Session {
             frame_aim: None,
             items: crate::drops::Items::new(true),
             items_ready: false,
+            items_origin: data.objects_origin,
+            far_allowed: far,
+            teleport_to: None,
+            lap_base,
+            laps_seen: laps,
+            teleport_laps: None,
             loading: Some(Loading::new()),
             items_seeded: false,
             sky_clock: 0.0,
@@ -1269,6 +1393,8 @@ impl Session {
             lights: {
                 let mut l =
                     crate::lights::Lights::load(&minelib_assets::data_dir(), &dir_for_lights);
+                // (v309) Comptées depuis l'origine de la partie.
+                l.set_origin(ob);
                 if let Some(ground) = demo {
                     demo_lights(&mut l, ground);
                 }
@@ -1375,12 +1501,29 @@ impl Session {
         if let Some(m) = self.saved_mode {
             game.mode = m;
         }
+        // (v309) Places absolues (la partie compte depuis `World::origin`) ; les objets au sol
+        // gardent la leur depuis l'origine (`objects_origin`).
+        let o = self.world.origin_blocks();
+        // Objets au sol et coffres : en solo, ou chez le propriétaire d'un monde en ligne.
+        // (v309) Réécrits depuis l'origine de la partie si le fichier en avait une autre ; le
+        // monde garde celle depuis laquelle le fichier compte vraiment.
+        if self.items_ready && self.build.as_ref().is_none_or(|b| b.is_owner()) {
+            let here = [o[0], o[2]];
+            if self.items_origin != here {
+                self.items.dirty = true;
+            }
+            if self.items.save(&self.dir) {
+                self.items_origin = here;
+            }
+        }
         let data = SaveData {
             game,
             generator: self.world.generator,
             meta: self.meta.clone(),
             player: Some(PlayerState {
-                pos: self.player.pos.into(),
+                pos: self
+                    .teleport_to
+                    .unwrap_or_else(|| self.abs_of(self.player.pos)),
                 yaw: self.player.yaw,
                 pitch: self.player.pitch,
                 flying: self.player.flying,
@@ -1391,16 +1534,14 @@ impl Session {
             weather: self.storm.weather.save(),
             zeus: self.legend_saved(),
             inventory: Some(inv),
-            spawn: self.spawn_set.then_some(self.spawn.to_array()),
+            spawn: self.spawn_set.then(|| self.abs_of(self.spawn)),
+            objects_origin: self.items_origin,
+            laps: self.teleport_laps.unwrap_or_else(|| self.laps()),
         };
-        // Objets au sol et coffres : en solo, ou chez le propriétaire d'un monde en ligne.
-        if self.items_ready && self.build.as_ref().is_none_or(|b| b.is_owner()) {
-            self.items.save(&self.dir);
-        }
         // (v272) Les Évidés : avec le monde (en ligne : avec la copie de ce joueur, ce sont
         // les siens).
         if self.net.is_none() {
-            self.evides.save(&self.dir);
+            self.evides.save(&self.dir, self.world.origin_blocks());
         }
         // Lumières de l'éditeur : avec la copie du monde de ce joueur (même en ligne).
         self.lights.save_now();
@@ -1424,8 +1565,9 @@ impl Session {
             game,
             generator: self.world.generator,
             meta,
+            // (v309) Places absolues, comme dans `save`.
             player: Some(PlayerState {
-                pos: self.player.pos.into(),
+                pos: self.abs_of(self.player.pos),
                 yaw: self.player.yaw,
                 pitch: self.player.pitch,
                 flying: self.player.flying,
@@ -1436,7 +1578,10 @@ impl Session {
             weather: self.storm.weather.save(),
             zeus: self.legend_saved(),
             inventory: None,
-            spawn: self.spawn_set.then_some(self.spawn.to_array()),
+            spawn: self.spawn_set.then(|| self.abs_of(self.spawn)),
+            // (La copie n'emporte pas les objets au sol.)
+            objects_origin: [0, 0],
+            laps: self.laps(),
         };
         save::save_world(&dir, &data, &self.world)?;
         Ok(dir)
@@ -1451,7 +1596,111 @@ impl Session {
     pub fn config(&self) -> SessionConfig {
         SessionConfig {
             view_distance: self.view_distance,
+            // (Le choix d'une partie, pas un réglage : `Game::play_with` le donne à chaque
+            // ouverture.)
+            far_origin: true,
         }
+    }
+
+    /// (v309) Place absolue (dans le monde, en double précision) du point `v` de la partie
+    /// (compté depuis `World::origin`).
+    pub fn abs_of(&self, v: Vec3) -> [f64; 3] {
+        let o = self.world.origin_blocks();
+        // (v309) Sur la carte bouclée (ses tours : `laps_at`).
+        let wrap = minelib_world::lap::wrap_f64;
+        [
+            wrap(v.x as f64 + o[0] as f64),
+            v.y as f64,
+            wrap(v.z as f64 + o[2] as f64),
+        ]
+    }
+
+    /// (v309) Tours de la carte bouclée du point `v` de la partie : ceux de l'origine, plus
+    /// la limite qu'il a passée depuis elle.
+    fn laps_at(&self, v: Vec3) -> crate::laps::Laps {
+        let o = self.world.origin_blocks();
+        let cross = |o: i32, v: f32| minelib_world::lap::split(o as i128 + v.floor() as i128).0;
+        [
+            self.lap_base[0].saturating_add(cross(o[0], v.x)),
+            self.lap_base[1].saturating_add(cross(o[2], v.z)),
+        ]
+    }
+
+    /// (v309) Tours de la carte bouclée faits par le joueur.
+    pub fn laps(&self) -> crate::laps::Laps {
+        self.laps_at(self.player.pos)
+    }
+
+    /// (v309) Le joueur en est à `target` tours (après un `/tp`) : l'origine en compte
+    /// d'autant.
+    fn set_laps(&mut self, target: crate::laps::Laps) {
+        let here = self.laps();
+        for k in 0..2 {
+            self.lap_base[k] = self.lap_base[k].saturating_add(target[k].saturating_sub(here[k]));
+        }
+        self.laps_seen = target;
+    }
+
+    /// (v309) « Tu indiques combien de fois on a fait le tour de la map quand on en fait au
+    /// moins un, dans quelle direction et quel degré » : passé la limite à pied (ou en
+    /// volant), le tchat le dit.
+    fn watch_laps(&mut self) {
+        if self.teleport_to.is_some() || !self.far_allowed {
+            return;
+        }
+        let now = self.laps();
+        if now != self.laps_seen {
+            self.laps_seen = now;
+            self.chat.say(laps_said(now), chat::YELLOW);
+        }
+    }
+
+    /// (v309) La partie compte-t-elle depuis une autre origine que le centre du monde (joueur
+    /// à plus de `ORIGIN_FREE` blocs de lui à l'ouverture, voir `origin_near`) ?
+    pub fn far_from_center(&self) -> bool {
+        self.world.origin() != ChunkPos { x: 0, z: 0 }
+    }
+
+    /// (v309) Ce qui n'est pas permis loin du centre du monde : dit au tchat.
+    fn say_far_from_center(&mut self, what: &str) {
+        let p = self.abs_of(self.player.pos);
+        self.chat.say(
+            format!(
+                "{what} se joue à moins de {} blocs du centre du monde (tu es en {:.0} / {:.0}).",
+                ORIGIN_FREE as i64, p[0], p[2]
+            ),
+            chat::RED,
+        );
+    }
+
+    /// (v309) La partie doit-elle repartir d'une origine plus proche ? En solo, quand le joueur
+    /// s'est éloigné de plus de `REBASE_AT` blocs de l'origine (sur x ou sur z) et qu'une autre
+    /// lui conviendrait (`origin_near`). Le jeu enregistre alors la partie et la rouvre
+    /// (`Game::rebase`) : tout ce qui est compté depuis l'origine (chunks, maillages, objets,
+    /// lumières…) repart de la nouvelle, sans rien perdre.
+    pub fn wants_rebase(&self) -> bool {
+        // (Même pendant un chargement : un `/tp` au loin repart tout de suite de la bonne
+        // origine, au lieu de charger d'abord autour d'une place arrondie.)
+        if !self.far_allowed || self.net.is_some() || self.build.is_some() {
+            return false;
+        }
+        let p = self.player.pos;
+        if !(p.x.abs() > REBASE_AT || p.z.abs() > REBASE_AT) {
+            return false;
+        }
+        origin_near(self.abs_of(p)) != self.world.origin()
+    }
+
+    /// (v309) Point de la partie (compté depuis `World::origin`) de la place absolue `a`.
+    pub fn local_of(&self, a: [f64; 3]) -> Vec3 {
+        let o = self.world.origin_blocks();
+        // (v309) La place la plus proche de l'origine, sur la carte bouclée.
+        let wrap = minelib_world::lap::wrap_f64;
+        Vec3::new(
+            wrap(a[0] - o[0] as f64) as f32,
+            a[1] as f32,
+            wrap(a[2] - o[2] as f64) as f32,
+        )
     }
 
     fn settings_changed(&mut self) {
@@ -1499,6 +1748,8 @@ impl Session {
         self.streamer.set_loading(self.loading.is_some());
         // (v220) Monde pas encore chargé : on n'y apparaît pas (voir `loading`).
         self.check_loaded(renderer);
+        // (v309) Passé la limite de la carte bouclée : dit au tchat.
+        self.watch_laps();
         // Test des touches : il lit le clavier et la souris, le jeu ne reçoit rien.
         let quiet;
         let input = if self.key_test.is_some() {
@@ -2157,11 +2408,16 @@ impl Session {
             // Têtes (blocs « tête », têtes des entités des cartes) : textures téléchargées,
             // têtes proches.
             if self.heads.is_none() {
+                // (v309) Comptés depuis l'origine de la partie.
                 self.heads = Some(crate::heads::Heads::load(
                     &self.dir,
                     minelib_assets::data_dir().join("tetes"),
+                    self.world.origin_blocks(),
                 ));
-                self.frames = Some(crate::frames::Frames::load(&self.dir));
+                self.frames = Some(crate::frames::Frames::load(
+                    &self.dir,
+                    self.world.origin_blocks(),
+                ));
                 // Lumière des têtes d'entités et des cadres : mesurée par le maillage de
                 // leurs chunks.
                 self.set_probes(None);
@@ -2959,7 +3215,7 @@ impl Session {
     /// vidéos YouTube partagées (voir `crate::watch`) ; seul leur propriétaire les casse.
     fn update_screens(&mut self, input: &Input, dt: f32, typing: bool) {
         if !self.screens_loaded {
-            self.screens = crate::screen::load(&self.dir);
+            self.screens = crate::screen::load(&self.dir, self.world.origin_blocks());
             self.screens_loaded = true;
         }
         if self.build.is_none() {
@@ -3382,7 +3638,7 @@ impl Session {
     fn screens_changed(&mut self, save: bool) {
         self.player.solids = self.screens.iter().map(|s| s.hitbox()).collect();
         if save {
-            crate::screen::save(&self.dir, &self.screens);
+            crate::screen::save(&self.dir, &self.screens, self.world.origin_blocks());
         }
         self.party.screens_changed();
     }
@@ -3421,7 +3677,13 @@ impl Session {
             self.items_ready = true;
             self.items_seeded = false;
             if !online && self.net.is_none() {
-                self.items.restore(&Items::load(&self.dir));
+                // (v309) Comptés depuis l'origine de la partie (les trop lointains restent
+                // garés, voir `drops::PARK`).
+                let o = self.world.origin_blocks();
+                let saved = Items::load_saved(&self.dir, self.items_origin);
+                if self.items.restore_saved(saved, [o[0], o[2]]) {
+                    self.items.dirty = true;
+                }
                 // (v241) La Foudre de Zeus est unique : une carte d'avant peut en avoir des
                 // piles de 64, au sol et dans des coffres aussi. Il n'en reste qu'une, celle
                 // de l'inventaire d'abord. Aucune nulle part : elle peut de nouveau être
@@ -3439,7 +3701,8 @@ impl Session {
         if let Some(b) = &self.build {
             if b.is_owner() && !self.items_seeded {
                 self.items_seeded = true;
-                b.seed_items(&Items::load(&self.dir));
+                // (v309) En ligne, tout est compté depuis le centre du monde.
+                b.seed_items(&Items::saved_at(&self.dir, self.items_origin, [0, 0]));
             }
         }
         let me = self
@@ -6746,6 +7009,12 @@ impl Session {
 
     /// Change le mode de jeu du joueur.
     pub fn set_mode(&mut self, mode: GameMode) {
+        // (v309) Le mode FPS (ses cartes, ses bots, la simulation partagée) compte tout depuis
+        // le centre du monde : loin de lui (partie comptée depuis une autre origine), refusé.
+        if mode == GameMode::Fps && self.far_from_center() {
+            self.say_far_from_center("Le mode FPS");
+            return;
+        }
         // (v232) Un mode choisi en jeu (autre que FPS) est celui que le monde garde.
         if mode != GameMode::Fps && mode != GameMode::Spectator {
             self.saved_mode = None;
@@ -7606,35 +7875,41 @@ impl Session {
     fn tp_command(&mut self, args: &[&str]) {
         let usage = "Utilisation : /tp <x> <y> <z> (« ~ » : par rapport à toi), /tp <pseudo>, \
                      /tp <pseudo> <x> <y> <z>, /tp <pseudo> <pseudo2>";
-        let here = self.player.pos;
-        let coords = |a: &[&str]| -> Option<Vec3> {
-            let mut out = [0.0f32; 3];
-            for (k, t) in a.iter().enumerate() {
-                let (rel, rest) = match t.strip_prefix('~') {
-                    Some(r) => (true, r),
-                    None => (false, *t),
-                };
-                let v: f32 = if rest.is_empty() { 0.0 } else { rest.parse().ok()? };
-                out[k] = if rel { here[k] + v } else { v };
-            }
-            let p = Vec3::from(out);
-            (p.is_finite() && p.y.abs() <= 4096.0).then_some(p)
-        };
-        // (Qui part, et où : coordonnées ou « @pseudo ».)
-        let (who, to): (&str, String) = match args {
-            [x, y, z] => match coords(&[x, y, z]) {
-                Some(p) => ("", format!("{} {} {}", p.x, p.y, p.z)),
-                None => return self.chat.say(usage, chat::RED),
-            },
-            [name] => ("", format!("@{name}")),
-            [name, x, y, z] => match coords(&[x, y, z]) {
-                Some(p) => (name, format!("{} {} {}", p.x, p.y, p.z)),
-                None => return self.chat.say(usage, chat::RED),
-            },
-            [name, other] => (name, format!("@{other}")),
+        // (Qui part, et où : trois coordonnées ou un pseudo.)
+        let (who, at, other): (&str, Option<[&str; 3]>, Option<&str>) = match args {
+            [x, y, z] => ("", Some([x, y, z]), None),
+            [name] => ("", None, Some(name)),
+            [name, x, y, z] => (name, Some([x, y, z]), None),
+            [name, other] => (name, None, Some(other)),
             _ => return self.chat.say(usage, chat::RED),
         };
         if self.build.is_some() {
+            // En ligne : places comptées depuis le centre (le relais vérifie, puis place celui
+            // qui part : `BuildSpawn`).
+            let here = self.player.pos;
+            let to = match (at, other) {
+                (Some(a), _) => {
+                    let mut out = [0.0f32; 3];
+                    for (k, t) in a.iter().enumerate() {
+                        let (rel, rest) = match t.strip_prefix('~') {
+                            Some(r) => (true, r),
+                            None => (false, *t),
+                        };
+                        let Ok(v) = (if rest.is_empty() { Ok(0.0) } else { rest.parse::<f32>() })
+                        else {
+                            return self.chat.say(usage, chat::RED);
+                        };
+                        out[k] = if rel { here[k] + v } else { v };
+                    }
+                    let p = Vec3::from(out);
+                    if !(p.is_finite() && p.y.abs() <= 4096.0) {
+                        return self.chat.say(usage, chat::RED);
+                    }
+                    format!("{} {} {}", p.x, p.y, p.z)
+                }
+                (None, Some(o)) => format!("@{o}"),
+                (None, None) => return self.chat.say(usage, chat::RED),
+            };
             self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
                 action: minelib_net::proto::SERVER_TELEPORT,
                 pseudo: who.to_string(),
@@ -7644,19 +7919,84 @@ impl Session {
         }
         // Solo : soi seulement (« /tp <son pseudo> x y z » aussi).
         let me = !who.is_empty() && who.eq_ignore_ascii_case(&self.pseudo);
-        if (!who.is_empty() && !me) || to.starts_with('@') {
+        let Some(a) = at.filter(|_| who.is_empty() || me) else {
             self.chat
                 .say("En solo, on ne téléporte que soi, vers des coordonnées.", chat::RED);
             return;
-        }
-        let v: Vec<f32> = to.split(' ').filter_map(|t| t.parse().ok()).collect();
-        if let [x, y, z] = v[..] {
-            self.teleport(Vec3::new(x, y, z), None);
+        };
+        // (v309) La place visée, lue exactement (`laps::parse_exact`) et ramenée sur la carte
+        // bouclée : aussi loin qu'on veut (38 chiffres), sans rien perdre ni déborder.
+        let Some((laps, p)) = self.tp_target(&a) else {
             self.chat.say(
-                format!("Téléporté en {x:.1} {y:.1} {z:.1}."),
-                chat::YELLOW,
+                format!(
+                    "{usage}. Coordonnées : des nombres (« 12 », « -3.5 »), {} chiffres au plus \
+                     avant la virgule ; hauteur entre -4096 et 4096.",
+                    crate::laps::MAX_DIGITS
+                ),
+                chat::RED,
             );
+            return;
+        };
+        let before = self.laps();
+        self.teleport_abs(p);
+        if self.teleport_to.is_some() {
+            self.teleport_laps = Some(laps);
+            self.laps_seen = laps;
+        } else {
+            self.set_laps(laps);
         }
+        self.chat.say(
+            format!("Téléporté en {:.1} {:.1} {:.1}.", p[0], p[1], p[2]),
+            chat::YELLOW,
+        );
+        if laps != before {
+            self.chat.say(laps_said(laps), chat::YELLOW);
+        }
+    }
+
+    /// (v309) La place visée par `/tp x y z` en solo : x et z lus exactement (partie entière
+    /// sur 128 bits), par rapport à la place exacte du joueur avec « ~ » (ses tours compris),
+    /// puis ramenés sur la carte bouclée ; y en double précision, entre −4 096 et 4 096.
+    /// `None` : pas un nombre, trop de chiffres, ou une somme qui déborderait.
+    fn tp_target(&self, a: &[&str; 3]) -> Option<(crate::laps::Laps, [f64; 3])> {
+        use crate::laps::{add_exact, exact, on_map, parse_exact};
+        let here = self.abs_of(self.player.pos);
+        let now = self.laps();
+        let mut out = [0.0f64; 3];
+        let mut laps = [0i128; 2];
+        for (k, t) in a.iter().enumerate() {
+            let (rel, rest) = match t.strip_prefix('~') {
+                Some(r) => (true, r),
+                None => (false, *t),
+            };
+            if k == 1 {
+                let v: f64 = if rest.is_empty() { 0.0 } else { rest.parse().ok()? };
+                let y = if rel { here[1] + v } else { v };
+                if !(y.is_finite() && y.abs() <= 4096.0) {
+                    return None;
+                }
+                out[1] = y;
+                continue;
+            }
+            let axis = k / 2;
+            let v = if rest.is_empty() { (0, 0.0) } else { parse_exact(rest)? };
+            let v = if rel { add_exact(exact(now[axis], here[k])?, v)? } else { v };
+            let (l, at) = on_map(v);
+            laps[axis] = l;
+            out[k] = at;
+        }
+        Some((laps, out))
+    }
+
+    /// (v309) `/tp` vers la place absolue `a`. Loin de l'origine de la partie (solo), la place
+    /// exacte est gardée pour l'enregistrement : la partie repart aussitôt d'une origine proche
+    /// d'elle (`wants_rebase`), sans l'arrondi d'un f32 loin de l'origine.
+    fn teleport_abs(&mut self, a: [f64; 3]) {
+        let local = self.local_of(a);
+        self.teleport_to = (self.far_allowed
+            && (local.x.abs() > REBASE_AT || local.z.abs() > REBASE_AT))
+            .then_some(a);
+        self.teleport(local, None);
     }
 
     /// (v223) Placé ailleurs (`/tp`, arrivée sur un serveur) : sans vitesse ni chute en cours.
@@ -7691,8 +8031,10 @@ impl Session {
         }
         self.spawn = p;
         self.spawn_set = true;
+        // (v309) À sa place absolue.
+        let a = self.abs_of(p);
         self.chat.say(
-            format!("Point d'apparition : {:.0} {:.0} {:.0}.", p.x, p.y, p.z),
+            format!("Point d'apparition : {:.0} {:.0} {:.0}.", a[0], a[1], a[2]),
             chat::YELLOW,
         );
     }
@@ -8546,8 +8888,15 @@ impl Session {
                 )
             })
             .unwrap_or_default();
+        // (v309) À sa place absolue.
+        let o = self.world.origin_blocks();
         self.chat.say(
-            format!("Coin {n} : {} {} {}{size}", p[0], p[1], p[2]),
+            format!(
+                "Coin {n} : {} {} {}{size}",
+                p[0].wrapping_add(o[0]),
+                p[1],
+                p[2].wrapping_add(o[2])
+            ),
             chat::LIGHT_PURPLE,
         );
     }
@@ -9063,6 +9412,12 @@ impl Session {
     /// `/fps clear …`, `/fps info`.
     fn fps_command(&mut self, args: &[&str]) {
         use minelib_net::game::Zone;
+        // (v309) Les réglages d'une carte FPS (départs, sites, portes) sont des places comptées
+        // depuis le centre du monde : pas loin de lui.
+        if self.far_from_center() {
+            self.say_far_from_center("Une carte FPS");
+            return;
+        }
         const USAGE: &str = "Usage : /fps set spawn ct | spawn t | site a | site b | site c \
                              (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door on|off, /fps set doorsync on|off, /fps clear …, \
                              /fps showelements on|off, /fps info";
@@ -11448,6 +11803,8 @@ impl Session {
         self.overlay = debug::build(&debug::DebugInfo {
             frames,
             player: &self.player,
+            origin: self.world.origin_blocks(),
+            laps: self.laps(),
             hit,
             seed: self.world.seed,
             chunks_loaded: self.world.len(),
@@ -14320,6 +14677,37 @@ mod loading_tests {
         assert!(load_bar(60.0, left) < 0.1);
         // En ligne, la météo du serveur pas encore là : pas pleine non plus.
         assert!(load_left(10.0, (800, 800), 0.0, false) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod far_origin_tests {
+    use super::*;
+
+    /// (v309) L'origine des coordonnées d'une partie solo : le centre du monde à moins de
+    /// 32 768 blocs (rien ne change pour les mondes d'avant), sinon le multiple de 4 096 blocs
+    /// le plus proche du joueur, sur chaque axe. Rouverte depuis elle, la partie a le joueur à
+    /// moins de 2 048 blocs de son origine : bien en deçà du seuil où elle repart d'une autre
+    /// (pas d'aller-retour).
+    #[test]
+    fn a_far_game_counts_from_an_origin_close_to_the_player() {
+        let c = |x: i32, z: i32| ChunkPos { x, z };
+        assert_eq!(origin_near([0.0, 70.0, 0.0]), c(0, 0));
+        assert_eq!(origin_near([32_767.9, 70.0, -32_767.9]), c(0, 0));
+        assert_eq!(origin_near([32_768.0, 70.0, 0.0]), c(2_048, 0));
+        assert_eq!(
+            origin_near([16_777_216.5, 70.0, -16_777_216.5]),
+            c(1_048_576, -1_048_576)
+        );
+        assert_eq!(origin_near([16_777_216.0 + 2_047.0, 0.0, 0.0]).x, 1_048_576);
+        assert_eq!(origin_near([16_777_216.0 + 2_049.0, 0.0, 0.0]).x, 1_048_576 + 256);
+        assert_eq!(origin_near([f64::NAN, 0.0, 1e300]).x, 0);
+        assert!(ORIGIN_STEP / 2.0 < REBASE_AT as f64);
+        for a in [33_000.0, 16_777_216.7, -9_999_999.25, 123_456_789.0] {
+            let o = origin_near([a, 0.0, a]);
+            let local = a - (o.x as f64) * CHUNK_SIZE as f64;
+            assert!(local.abs() <= ORIGIN_STEP / 2.0, "{a} : {local}");
+        }
     }
 }
 

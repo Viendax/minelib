@@ -7022,7 +7022,9 @@ mod tests {
             let (data, _) = crate::save::load_world(&dir).expect("monde");
             let spawn = data
                 .player
-                .map(|p| Vec3::from(p.pos))
+                // (v309) Place enregistrée en double précision (une carte FPS est au centre
+                // du monde : rien n'y est perdu).
+                .map(|p| Vec3::new(p.pos[0] as f32, p.pos[1] as f32, p.pos[2] as f32))
                 .unwrap_or(Vec3::new(0.5, 80.0, 0.5));
             let world = crate::radar::load_map_world(&dir, &map).expect("monde");
             let loaded = t.elapsed().as_secs_f32();

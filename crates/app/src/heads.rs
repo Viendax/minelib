@@ -226,6 +226,30 @@ pub fn parse(line: &str) -> Option<Head> {
     })
 }
 
+/// (v309) La tête `h` d'un fichier (place absolue) comptée depuis l'origine `o` de la partie :
+/// sa case, et la place de son modèle pour une tête d'entité (porte-armure…).
+fn at_origin(mut h: Head, o: [i32; 3]) -> Head {
+    if o == [0; 3] {
+        return h;
+    }
+    // (v309) La place la plus proche de l'origine, sur la carte bouclée.
+    let (wb, wf) = (minelib_world::lap::wrap_block, minelib_world::lap::wrap_f64);
+    h.pos = [
+        wb(h.pos[0] as i64 - o[0] as i64),
+        h.pos[1],
+        wb(h.pos[2] as i64 - o[2] as i64),
+    ];
+    let shift = |m: &mut [f32; 12]| {
+        m[9] = wf(m[9] as f64 - o[0] as f64) as f32;
+        m[11] = wf(m[11] as f64 - o[2] as f64) as f32;
+    };
+    match &mut h.pose {
+        Pose::Free(m) | Pose::Stand(m, _) => shift(m),
+        Pose::Floor(_) | Pose::Wall(_) => {}
+    }
+    h
+}
+
 /// Ligne d'une tête (voir `parse`).
 pub fn line(h: &Head) -> String {
     let join = |a: &[f32]| {
@@ -400,6 +424,9 @@ struct Entry {
 }
 
 pub struct Heads {
+    /// (v309) Origine de la partie (`World::origin_blocks`) : les têtes sont gardées à leur
+    /// place dans la partie, les fichiers ont leur place absolue.
+    origin: [i32; 3],
     /// Têtes des blocs, par position.
     on_blocks: HashMap<[i32; 3], Entry>,
     /// Têtes et porte-armures des entités des cartes.
@@ -466,10 +493,12 @@ fn lod_for(d: f32, current: usize) -> usize {
 }
 
 impl Heads {
-    /// Têtes du monde `dir` ; textures gardées dans `cache`.
-    pub fn load(dir: &Path, cache: PathBuf) -> Self {
+    /// Têtes du monde `dir` ; textures gardées dans `cache`. (v309) `origin` : celle de la
+    /// partie (les fichiers ont les places absolues).
+    pub fn load(dir: &Path, cache: PathBuf, origin: [i32; 3]) -> Self {
         let (tx, rx) = channel();
         let mut h = Self {
+            origin,
             on_blocks: HashMap::new(),
             free: Vec::new(),
             cache,
@@ -487,7 +516,7 @@ impl Heads {
         for file in [crate::mcimport::HEADS_FILE, PLACED_FILE] {
             let text = std::fs::read_to_string(dir.join(file)).unwrap_or_default();
             for head in text.lines().filter_map(parse) {
-                h.add(head);
+                h.add(at_origin(head, origin));
             }
         }
         h
@@ -587,7 +616,7 @@ impl Heads {
         if self.on_blocks.remove(&pos).is_none() {
             return;
         }
-        let prefix = format!("{},{},{},", pos[0], pos[1], pos[2]);
+        let prefix = self.prefix(pos);
         let path = dir.join(crate::mcimport::HEADS_FILE);
         if let Ok(text) = std::fs::read_to_string(&path) {
             // Lignes de ce bloc (pas celles des cadres ni des têtes d'entités de la case).
@@ -605,11 +634,28 @@ impl Heads {
         self.touch(pos);
     }
 
+    /// (v309) Place absolue de la case `pos` de la partie.
+    fn abs(&self, pos: [i32; 3]) -> [i32; 3] {
+        // (v309) Sur la carte bouclée.
+        let wb = minelib_world::lap::wrap_block;
+        [
+            wb(pos[0] as i64 + self.origin[0] as i64),
+            pos[1],
+            wb(pos[2] as i64 + self.origin[2] as i64),
+        ]
+    }
+
+    /// Début des lignes des fichiers pour la case `pos` de la partie (place absolue).
+    fn prefix(&self, pos: [i32; 3]) -> String {
+        let [x, y, z] = self.abs(pos);
+        format!("{x},{y},{z},")
+    }
+
     /// Réécrit la ligne de `pos` dans `PLACED_FILE`.
     fn save_placed(&self, pos: [i32; 3], dir: &Path) {
         let path = dir.join(PLACED_FILE);
         let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let prefix = format!("{},{},{},", pos[0], pos[1], pos[2]);
+        let prefix = self.prefix(pos);
         let mut lines: Vec<String> = text
             .lines()
             .filter(|l| !l.starts_with(&prefix))
@@ -617,7 +663,7 @@ impl Heads {
             .collect();
         if let Some(e) = self.on_blocks.get(&pos) {
             lines.push(line(&Head {
-                pos,
+                pos: self.abs(pos),
                 pose: e.pose,
                 skin: e.skin.clone(),
             }));
@@ -1209,7 +1255,7 @@ mod tests {
             format!("3,64,5,w4,{HASH}\n3,64,5,f4,bloc:stone\n"),
         )
         .unwrap();
-        let mut h = Heads::load(&dir, dir.join("cache"));
+        let mut h = Heads::load(&dir, dir.join("cache"), [0; 3]);
         assert_eq!(h.skin_at([3, 64, 5]), HeadSkin::Mc(HASH.into()));
         let wall = minelib_world::registry::skull_block(true, 4);
         let floor = minelib_world::registry::skull_block(false, 3);
@@ -1268,7 +1314,7 @@ mod tests {
             skin: HeadSkin::Mc(HASH.into()),
         };
         std::fs::write(dir.join(crate::mcimport::HEADS_FILE), line(&head) + "\n").unwrap();
-        let h = Heads::load(&dir, dir.join("cache"));
+        let h = Heads::load(&dir, dir.join("cache"), [0; 3]);
         assert_eq!(
             h.probes(),
             vec![(ChunkPos { x: 0, z: 0 }, vec![[0, 65, 0]])]

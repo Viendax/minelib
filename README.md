@@ -136,7 +136,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 
 ## 🧱 Le mode construction
 
-- **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts. Loin du centre (40 000 blocs et bien au-delà), l'image reste nette : tout est dessiné depuis la caméra, sans les tremblements, les faces qui disparaissent ni les textures qui grésillent des grandes coordonnées ; et on y marche, s'accroupit ou vole à la même vitesse qu'au centre, même à 300 images par seconde.
+- **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts. Loin du centre (40 000 blocs et bien au-delà), l'image reste nette : tout est dessiné depuis la caméra, sans les tremblements, les faces qui disparaissent ni les textures qui grésillent des grandes coordonnées ; et on y marche, s'accroupit ou vole à la même vitesse qu'au centre, même à 300 images par seconde. En solo, plus de « terres lointaines » du tout : la partie compte depuis une origine proche de toi (à plus de 24 576 blocs d'elle, ou après un `/tp` lointain, elle se rouvre d'elle-même depuis une plus proche : un court écran de chargement), le relief et tes sauvegardes sont en double précision, et à 16 millions de blocs comme à un milliard tout est net et va à la bonne vitesse. Le monde n'a pas de bord : la carte fait 2 147 483 520 blocs de tour, et passé ±1 073 741 760 (sur x ou sur z) tu arrives de l'autre côté, sans raccord ni falaise ; tout droit, tu reviens à ton point de départ. Le jeu compte tes tours (combien, vers où, à quel angle) : au tchat quand tu passes la limite, et dans l'écran F3.
 - **Survie, créatif, spectateur** (`/gm 0`, `1`, `3`), et **FPS** (`/gm 2`) pour essayer sa carte, même sur un serveur de construction. En survie, un bloc se casse après une demi-seconde de clic tenu, la main frappant à petits coups, et tombe en objet au sol, là où il était (un écran aussi), à ramasser en passant dessus ; en créatif, tout de suite, d'un petit coup de la main. Avec le vol permis (`/fly`), aucune chute ne blesse. Le bras pivote depuis l'épaule, qui ne bouge pas : seul le bout descend, avec ce qu'il tient.
 - **Arrivée dans un monde** : un écran de chargement tant que tout n'est pas prêt : chaque chunk jusqu'à ta distance de rendu affiché, les shaders du monde, et en ligne la météo du serveur ; jamais avant, même si c'est long (pas d'entrée forcée au bout d'un temps ; Échap reste possible). De même après une téléportation ou une réapparition là où le monde n'est pas chargé. Tu n'y apparais, chez toi comme chez les autres joueurs (en construction en ligne, en partie FPS), qu'une fois tout chargé. Derrière l'écran, tous les cœurs du processeur chargent le monde et ses maillages partent à la carte graphique par grosses fournées. Sa barre avance au rythme de toute l'attente : les chunks, mais aussi les shaders du monde encore en compilation juste après le lancement du jeu (leur durée aux lancements précédents est gardée dans `durees_shaders.txt`) ; elle n'est pleine qu'à l'entrée.
 - **WorldEdit intégré** : plus de 40 commandes `//` (remplir, copier, coller, tourner, sphères, cylindres, annuler…). Sur un serveur de construction en ligne, réservé à ses OP : le relais vérifie et envoie les blocs à tous.
@@ -223,7 +223,7 @@ Le tchat se navigue avec ← → (Début, Fin, Suppr) ; un clic dans la saisie y
 | `/gm <0-3> [pseudo]` | Mode de jeu (`survival`, `creative`, `fps`, `spectator` marchent aussi) ; celui d'un autre joueur : OP d'un serveur de construction |
 | `/defaultgamemode <mode\|none>` | Mode de jeu des nouveaux venus sur un serveur de construction (OP) ; `none` : plus de mode imposé |
 | `/kill [pseudo]` | Mourir, ou tuer un joueur (OP d'un serveur de construction) |
-| `/tp <x> <y> <z>` · `/tp <pseudo>` · `/tp <pseudo> <x> <y> <z>` · `/tp <pseudo> <pseudo2>` | Se téléporter (« ~ » : par rapport à soi, `~ ~10 ~`), ou téléporter un joueur ; en solo, soi seulement ; sur un serveur de construction, OP seulement |
+| `/tp <x> <y> <z>` · `/tp <pseudo>` · `/tp <pseudo> <x> <y> <z>` · `/tp <pseudo> <pseudo2>` | Se téléporter (« ~ » : par rapport à soi, `~ ~10 ~`), ou téléporter un joueur ; en solo, soi seulement, et x et z lus exactement jusqu'à 38 chiffres : au-delà de la carte, tu en fais le tour (le tchat dit combien) ; sur un serveur de construction, OP seulement |
 | `/setspawn` | Le point d'apparition là où tu es : gardé avec le monde en solo ; sur un serveur de construction (OP), là où arrivent les nouveaux venus |
 | `/report <pseudo>` · `/unreport <pseudo>` | Signaler un joueur de ta partie, ou annuler |
 | `/ami <pseudo>` · `/ami retirer <pseudo>` · `/amis` | Amis (aussi `/friend add <pseudo>`) ; tout le reste dans le module d'amis (accueil, Échap) |
@@ -318,6 +318,16 @@ crates/
   matrice pour les shaders, ou un nouveau `view_proj * vec4(p, 1.0)`, doit suivre la même
   règle ; le test `camera_relative_matrices_stay_exact_far_from_the_origin` vérifie les
   aides.
+- **(v309) Toute place absolue passe par la carte bouclée** (`minelib_world::lap`). En solo, la
+  partie compte depuis une origine proche du joueur (`World::origin`) ; ce qui est enregistré
+  est absolu, sur la carte (entre −1 073 741 760 et +1 073 741 760). Une place absolue tirée
+  d'une place de la partie se ramène sur la carte (`wrap_block`, `wrap_chunk`, `wrap_f64`), et
+  une place de la partie tirée d'une place absolue prend l'écart le plus court sur la carte
+  (de l'autre côté de la limite, un voisin reste un voisin) : `World::abs_block`,
+  `local_block`, `Session::abs_of`, `local_of`, `Lights::abs_of`, `drops::shift`… Un nouveau
+  bruit du relief doit avoir un nombre pair de cases par tour (`LAP` en est un multiple) et
+  boucler ses cases (`noise::*_lap`) : sinon une falaise sur la limite (essai
+  `the_map_comes_back_around_without_a_seam`).
 - **Une image à part s'écrit en entier** (`ColorWrites::ALL`). Seule l'image du monde, où
   l'on ajoute la lumière, garde son alpha. De la v151 à la v186, les rayons n'écrivaient
   pas leur alpha, qui portait la profondeur : la recomposition ne savait plus séparer un

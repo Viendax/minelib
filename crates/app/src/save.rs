@@ -43,7 +43,10 @@ pub struct WorldSummary {
 /// État du joueur enregistré.
 #[derive(Clone, Copy, Debug)]
 pub struct PlayerState {
-    pub pos: [f32; 3],
+    /// (v309) Place absolue (dans le monde), en double précision : la partie compte depuis
+    /// une origine proche du joueur (`World::origin`), jusqu'à 16,7 millions de blocs et
+    /// au-delà, une place enregistrée en f32 n'y vaudrait qu'au bloc près.
+    pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
     pub flying: bool,
@@ -139,8 +142,16 @@ pub struct SaveData {
     pub zeus: String,
     pub inventory: Option<Inventory>,
     /// (v223) Point d'apparition choisi par `/setspawn` (sinon : là où l'on a ouvert le
-    /// monde).
-    pub spawn: Option<[f32; 3]>,
+    /// monde). (v309) Place absolue, en double précision.
+    pub spawn: Option<[f64; 3]>,
+    /// (v309) Origine (en blocs, x et z) depuis laquelle sont comptées les places des objets
+    /// au sol de `objets.bin` (des f32 : comptées depuis une origine proche, elles restent
+    /// précises loin du centre). (0, 0) : places absolues, comme avant.
+    pub objects_origin: [i32; 2],
+    /// (v309) Tours de la carte bouclée faits par le joueur (`laps`) : sur x (vers l'est en
+    /// plus), sur z (vers le sud en plus) ; `player.pos` est sa place sur la carte. Écrits en
+    /// texte (« tours=x,z ») : des entiers de 128 bits, exacts.
+    pub laps: [i128; 2],
 }
 
 pub fn now() -> u64 {
@@ -285,6 +296,8 @@ pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
             zeus: String::new(),
             inventory: None,
             spawn: None,
+            objects_origin: [0, 0],
+            laps: [0, 0],
         },
     )?;
     Ok(dir)
@@ -364,6 +377,12 @@ fn write_level(dir: &Path, d: &SaveData) -> Result<()> {
     }
     if let Some(p) = d.spawn {
         s += &format!("spawn={},{},{}\n", p[0], p[1], p[2]);
+    }
+    if d.objects_origin != [0, 0] {
+        s += &format!("objets_origine={},{}\n", d.objects_origin[0], d.objects_origin[1]);
+    }
+    if d.laps != [0, 0] {
+        s += &format!("tours={},{}\n", d.laps[0], d.laps[1]);
     }
     if let Some(inv) = &d.inventory {
         s += &format!("selected={}\n", inv.selected);
@@ -486,7 +505,8 @@ fn write_chunks_bin(dir: &Path, world: &World) -> Result<()> {
 /// `torches.txt` : torches posées.
 fn write_torches(dir: &Path, world: &World) -> Result<()> {
     let mut f = fs::File::create(dir.join("torches.txt"))?;
-    for (p, t) in world.torches() {
+    // (v309) À leur place absolue.
+    for (p, t) in world.torches_abs() {
         let chem = t.chemical.map_or(-1, |c| c as i32);
         let inf = if t.infinite { ",inf" } else { "" };
         writeln!(f, "{},{},{},{},{}{inf}", p[0], p[1], p[2], chem, t.lit_at)?;
@@ -508,11 +528,11 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
         &dir.file_name().unwrap_or_default().to_string_lossy(),
     );
     let player = kv.get("player").and_then(|v| {
-        let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        (f.len() >= 6).then(|| PlayerState {
+        let f: Vec<f64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (f.len() >= 6 && f[..3].iter().all(|v| v.is_finite())).then(|| PlayerState {
             pos: [f[0], f[1], f[2]],
-            yaw: f[3],
-            pitch: f[4],
+            yaw: f[3] as f32,
+            pitch: f[4] as f32,
             flying: f[5] != 0.0,
         })
     });
@@ -569,12 +589,27 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
         player,
         inventory,
         spawn: kv.get("spawn").and_then(|v| {
-            let c: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            let c: Vec<f64> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
             match c[..] {
                 [x, y, z] if x.is_finite() && y.is_finite() && z.is_finite() => Some([x, y, z]),
                 _ => None,
             }
         }),
+        objects_origin: kv
+            .get("objets_origine")
+            .and_then(|v| {
+                let c: Vec<i32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                (c.len() == 2).then(|| [c[0], c[1]])
+            })
+            .unwrap_or([0, 0]),
+        // (v309) Deux entiers de 128 bits ; illisibles (trop longs, abîmés) : aucun tour.
+        laps: kv
+            .get("tours")
+            .and_then(|v| {
+                let c: Vec<i128> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                (c.len() == 2).then(|| [c[0], c[1]])
+            })
+            .unwrap_or([0, 0]),
     };
 
     let mut world = World::new(data.meta.seed);
@@ -715,7 +750,7 @@ fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
         .filter(|(p, _)| p.iter().any(|v| *v != 0.0))
     {
         Some((p, rot)) => PlayerState {
-            pos: [p[0] as f32, p[1] as f32 + off, p[2] as f32],
+            pos: [p[0], p[1] + off as f64, p[2]],
             // Minecraft : lacet 0 = sud (+Z), tangage positif = vers le bas.
             yaw: rot[0].to_radians() + std::f32::consts::PI,
             pitch: -rot[1].to_radians(),
@@ -728,7 +763,7 @@ fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
                 .top_solid(sx, sz)
                 .map_or(imp.level.spawn[1] + imp.y_offset, |t| t + 1);
             PlayerState {
-                pos: [sx as f32 + 0.5, y as f32, sz as f32 + 0.5],
+                pos: [sx as f64 + 0.5, y as f64, sz as f64 + 0.5],
                 yaw: 0.0,
                 pitch: 0.0,
                 flying: false,
@@ -753,6 +788,8 @@ fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
         zeus: String::new(),
         inventory: None,
         spawn: None,
+        objects_origin: [0, 0],
+        laps: [0, 0],
     };
     Ok((data, world))
 }
@@ -829,6 +866,111 @@ mod tests {
         let inv = d2.inventory.unwrap();
         assert_eq!(inv.selected, 4);
         assert_eq!(inv.slots, Inventory::starter().slots);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// (v309) « Aucun problème jusqu'à 16,7 millions » : loin du centre du monde, la partie
+    /// compte depuis une origine proche du joueur ; ce qui est enregistré reste à sa place
+    /// absolue, au millième de bloc près : le joueur, le point d'apparition, les blocs, les
+    /// torches, l'origine des objets au sol. Relu depuis une autre origine (ou depuis le
+    /// centre), tout est au même endroit.
+    #[test]
+    fn far_away_everything_is_saved_at_its_exact_place() {
+        let dir = std::env::temp_dir().join(format!("minelib-loin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let w1 = create_world(&dir, "Très loin", 42).unwrap();
+        let (mut data, mut world) = load_world(&w1).unwrap();
+        // La partie compte depuis 16 777 216 / 0 (4 096 × 4 096 blocs, 1 048 576 chunks).
+        let far = ChunkPos {
+            x: 16_777_216 / 16,
+            z: 0,
+        };
+        world.set_origin(far);
+        world.ensure_chunk(ChunkPos { x: 0, z: 0 });
+        world.set(3, 150, 4, BlockId::PLANKS);
+        world.place_torch(5, 150, 5, Some(2));
+        data.player = Some(PlayerState {
+            pos: [16_777_216.0 + 1.537, 80.25, -3.125],
+            yaw: 1.0,
+            pitch: -0.2,
+            flying: true,
+        });
+        data.spawn = Some([16_777_219.5, 81.0, 7.75]);
+        data.objects_origin = [16_777_216, 0];
+        save_world(&w1, &data, &world).unwrap();
+
+        let (d2, mut w) = load_world(&w1).unwrap();
+        let p = d2.player.unwrap().pos;
+        assert_eq!(p, [16_777_216.0 + 1.537, 80.25, -3.125], "au millième près");
+        assert!((p[0] - 16_777_217.537).abs() < 1e-6);
+        assert_eq!(d2.spawn, Some([16_777_219.5, 81.0, 7.75]));
+        assert_eq!(d2.objects_origin, [16_777_216, 0]);
+        // Relu depuis le centre du monde : le bloc et la torche à leur place absolue.
+        let c = ChunkPos::containing(16_777_219, 4);
+        w.ensure_chunk(c);
+        assert_eq!(w.get(16_777_219, 150, 4), BlockId::PLANKS);
+        assert_eq!(w.get(3, 150, 4), BlockId::AIR, "pas au centre du monde");
+        assert_eq!(w.torch([16_777_221, 150, 5]).unwrap().chemical, Some(2));
+        // Et depuis une autre origine (8 192 blocs plus loin) : à leur place, comptée depuis
+        // elle.
+        let (_, mut w3) = load_world(&w1).unwrap();
+        w3.set_origin(ChunkPos {
+            x: (16_777_216 + 8_192) / 16,
+            z: 0,
+        });
+        w3.ensure_chunk(ChunkPos::containing(3 - 8_192, 4));
+        assert_eq!(w3.get(3 - 8_192, 150, 4), BlockId::PLANKS);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// (v309) La carte bouclée : les tours du joueur enregistrés exactement (entiers de 128
+    /// bits), et un bloc posé juste au-delà de la limite (la partie comptant depuis une origine
+    /// de ce côté-ci) relu à sa place depuis une origine de l'autre côté.
+    #[test]
+    fn laps_and_blocks_across_the_edge_of_the_map_are_kept() {
+        use minelib_world::lap::{HALF, LAP_CHUNKS};
+        let dir = std::env::temp_dir().join(format!("minelib-tour-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let w1 = create_world(&dir, "Le tour", 42).unwrap();
+        let (mut data, mut world) = load_world(&w1).unwrap();
+        // L'origine 4 096 blocs avant la limite, à l'est.
+        let east = ChunkPos {
+            x: ((HALF - 4_096) / 16) as i32,
+            z: 0,
+        };
+        world.set_origin(east);
+        // 4 100 blocs plus loin : de l'autre côté (−HALF + 4).
+        let local = ChunkPos::containing(4_100, 7);
+        assert_eq!(world.abs_chunk(local).x as i64, -(LAP_CHUNKS / 2));
+        world.ensure_chunk(local);
+        world.set(4_100, 150, 7, BlockId::PLANKS);
+        assert_eq!(world.abs_block([4_100, 150, 7]), [-(HALF as i32) + 4, 150, 7]);
+        data.laps = [i128::MAX / 7, -3];
+        save_world(&w1, &data, &world).unwrap();
+
+        let (d2, _) = load_world(&w1).unwrap();
+        assert_eq!(d2.laps, [i128::MAX / 7, -3]);
+        // Depuis une origine de l'autre côté (4 096 blocs après la limite) : le bloc est là, à
+        // 4 092 blocs avant elle.
+        let (_, mut w) = load_world(&w1).unwrap();
+        w.set_origin(ChunkPos {
+            x: ((-HALF + 4_096) / 16) as i32,
+            z: 0,
+        });
+        let back = ChunkPos::containing(-4_092, 7);
+        w.ensure_chunk(back);
+        assert_eq!(w.get(-4_092, 150, 7), BlockId::PLANKS);
+        assert_eq!(w.local_block([-(HALF as i32) + 4, 150, 7]), [-4_092, 150, 7]);
+        // Et depuis l'origine d'avant, toujours de l'autre côté de la limite.
+        let (_, mut w) = load_world(&w1).unwrap();
+        w.set_origin(east);
+        w.ensure_chunk(local);
+        assert_eq!(w.get(4_100, 150, 7), BlockId::PLANKS);
+        // Un monde d'avant (sans tours) : aucun.
+        let w2 = create_world(&dir, "Sans tour", 1).unwrap();
+        assert_eq!(load_world(&w2).unwrap().0.laps, [0, 0]);
         let _ = fs::remove_dir_all(&dir);
     }
 

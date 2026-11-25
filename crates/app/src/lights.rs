@@ -1092,9 +1092,40 @@ pub struct Lights {
     /// est refait au suivant, et chaque fois que la caméra a assez bougé.
     pub scene_gen: u64,
     loaded_at: Option<(u64, Vec3)>,
+    /// (v309) Origine des coordonnées locales de la partie (blocs ; voir `World::origin`) :
+    /// les lumières de `scene` y sont comptées, `lumieres.json` les garde à leur place
+    /// absolue.
+    origin: [f64; 3],
 }
 
 impl Lights {
+    /// (v309) La partie compte depuis l'origine `o` (blocs, voir `World::origin_blocks`) :
+    /// les lumières lues (places absolues) y passent ; à faire juste après `load`.
+    pub fn set_origin(&mut self, o: [i32; 3]) {
+        let o = [o[0] as f64, 0.0, o[2] as f64];
+        // (v309) Le décalage le plus court sur la carte bouclée.
+        let wrap = minelib_world::lap::wrap_f64;
+        let d = [wrap(o[0] - self.origin[0]), 0.0, wrap(o[2] - self.origin[2])];
+        self.origin = o;
+        for l in &mut self.scene {
+            l.position[0] -= d[0];
+            l.position[2] -= d[2];
+        }
+    }
+
+    /// (v309) Place absolue d'une place locale de la partie (pour l'éditeur).
+    pub fn abs_of(&self, p: [f64; 3]) -> [f64; 3] {
+        // (v309) Sur la carte bouclée.
+        let wrap = minelib_world::lap::wrap_f64;
+        [wrap(p[0] + self.origin[0]), p[1], wrap(p[2] + self.origin[2])]
+    }
+
+    /// (v309) Place locale d'une place absolue.
+    pub fn local_of(&self, a: [f64; 3]) -> [f64; 3] {
+        // (v309) La plus proche de l'origine, sur la carte bouclée.
+        let wrap = minelib_world::lap::wrap_f64;
+        [wrap(a[0] - self.origin[0]), a[1], wrap(a[2] - self.origin[2])]
+    }
     /// Lumières du monde `dir` (et réglages de `root`, le dossier `.minelib`).
     pub fn load(root: &Path, dir: &Path) -> Self {
         let mut s = Self {
@@ -1116,6 +1147,7 @@ impl Lights {
             loaded: Vec::new(),
             scene_gen: 0,
             loaded_at: None,
+            origin: [0.0; 3],
         };
         for i in 0..s.scene.len() {
             s.scene[i].id = s.new_id();
@@ -1222,7 +1254,17 @@ impl Lights {
     pub fn save_now(&mut self) {
         if self.scene_dirty {
             self.scene_dirty = false;
-            if let Err(e) = save_scene(&self.dir, &self.scene) {
+            // (v309) À leur place absolue.
+            let abs: Vec<PlacedLight> = self
+                .scene
+                .iter()
+                .map(|l| {
+                    let mut l = l.clone();
+                    l.position = self.abs_of(l.position);
+                    l
+                })
+                .collect();
+            if let Err(e) = save_scene(&self.dir, &abs) {
                 log::warn!("lumières non enregistrées : {e}");
             }
         }
