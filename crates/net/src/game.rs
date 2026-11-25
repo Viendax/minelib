@@ -695,6 +695,36 @@ pub enum BuildMsg {
         by: String,
         seq: u32,
     },
+    /// (v312) Les Évidés que mène un joueur (paquet de `crate::evide`), envoyés comme ses
+    /// positions (`Request::Nearby`) au relais qui les suit : il les surveille
+    /// (`evide::Watch` : place, vie, morceaux mangés) et remet aux joueurs à `evide::CHUNKS`
+    /// chunks de lui ce qu'il en admet, avec le pseudo de sa session (`owner`).
+    Evide { owner: String, data: Vec<u8> },
+    /// (v312) L'Évidé `id` de `owner` mord `victim` (`low` : en rampant, aux jambes ; `aim` :
+    /// le tirage de l'endroit visé, `seed` : celui de la morsure). Demandé par son meneur ; le
+    /// relais ne le publie (aux joueurs proches, à la victime, au meneur) que si le monstre
+    /// peut mordre maintenant un joueur qu'il voit à sa portée. La victime s'ôte chez elle
+    /// `evide::BITE_HURTS` points de vie.
+    EvideBite {
+        owner: String,
+        id: u16,
+        victim: String,
+        low: bool,
+        aim: u32,
+        seed: u32,
+    },
+    /// (v312) Un joueur mange le morceau (`part`, `cell`) de l'Évidé `id` de `owner`.
+    /// Demandé par celui qui mange ; le relais ne le publie (aux joueurs proches, au meneur, à
+    /// lui) que s'il est à portée et le morceau encore là, avec le pseudo de sa session (`by`)
+    /// et la vie qui reste au monstre (`health` ; 0 : il meurt).
+    EvideEat {
+        owner: String,
+        id: u16,
+        part: u8,
+        cell: [u8; 3],
+        by: String,
+        health: u8,
+    },
 }
 
 pub const THOR_NOT_OP: u8 = 0;

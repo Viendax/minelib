@@ -60,9 +60,11 @@ use serde::{Deserialize, Serialize};
 /// pavés du modèle (onze : chaque jambe et chaque bras en deux), doivent être les mêmes chez
 /// l'hôte, ses invités et le vérificateur.
 /// (v301) 75 : tunnels iroh par les passeurs (`Request::TunnelWant`, `Response::TunnelWay`).
-/// (v304-v311, toujours 75 : pas encore publié) chaînes de deux passeurs (`PasseurLink`),
+/// (v304-v312, toujours 75 : pas encore publié) chaînes de deux passeurs (`PasseurLink`),
 /// journal réseau (`NetLog`, `NetLogWanted`), signalement d'une carte (`MapReport`), mondes
-/// endormis (`ServerEntry` : record, dernière activité, gardien) et `DeleteWorld`.
+/// endormis (`ServerEntry` : record, dernière activité, gardien) et `DeleteWorld` ; (v312)
+/// L'Évidé partagé en construction en ligne (`BuildMsg::Evide`, `EvideBite`, `EvideEat`,
+/// surveillés par le relais : `evide::Watch`).
 pub const PROTOCOL: u32 = 75;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre

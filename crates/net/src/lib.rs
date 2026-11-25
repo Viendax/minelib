@@ -10,6 +10,7 @@ pub mod cells;
 pub mod client;
 pub mod crowd;
 pub mod crypto;
+pub mod evide;
 pub mod fast;
 pub mod game;
 pub mod guard;

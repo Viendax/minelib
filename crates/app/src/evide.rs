@@ -75,6 +75,18 @@ const BITE_INWARD: f32 = 0.3;
 /// refermer.
 const SCREAM_S: f32 = 1.5;
 const MAW_SHUT_S: f32 = 0.2;
+// (v312) Les règles que le relais surveille en ligne sont celles d'ici.
+const _: () = assert!(LIFE == minelib_net::evide::LIFE);
+const _: () = assert!(OUR_BITE_HURTS == minelib_net::evide::EAT_HURTS);
+const _: () = assert!(MAX <= minelib_net::evide::MAX_PER_OWNER);
+/// (v312) Sur le fil (`Evide::wire`) : sa penche et les angles de sa tête sont dits sur un
+/// octet, jusqu'à tant (rad). Un pantin sans nouvelles depuis tant de secondes s'en va.
+const WIRE_HUNCH: f32 = 2.0;
+const WIRE_HEAD: f32 = 1.6;
+const PUPPET_GONE_S: f32 = 3.0;
+/// Pantins au plus dans un jeu ; leurs numéros commencent là (ceux de nos Évidés sont petits).
+const PUPPETS: usize = 64;
+const PUPPET_IDS: u32 = 0x4000_0000;
 /// Une morsure : durée du geste (s), instant où la bouche se referme.
 const BITE_S: f32 = 1.8;
 const BITE_AT: f32 = 1.04;
@@ -1283,6 +1295,9 @@ pub struct Prey {
     /// (v290) Le milieu du membre (ou du buste) où est cet endroit : « il tourne la tête vers
     /// le centre du membre attaqué ».
     pub limb: Option<Vec3>,
+    /// (v312) Qui c'est : 0 nous ; sinon un autre joueur du monde en ligne (son rang, plus
+    /// un, dans la liste que la partie a donnée à `Horde::update`).
+    pub tag: u16,
 }
 
 /// Ce qui vient de se passer, pour la partie (sons, blessures).
@@ -1291,10 +1306,19 @@ pub enum Event {
     /// Il grogne ou ricane, là.
     Voice(Vec3),
     /// Sa bouche vient de se refermer sur nous (`low` : en rampant, sur nos jambes).
-    Bites { low: bool, at: Vec3, seed: u32 },
+    /// (v312) `who` : son numéro ; `victim` : sur qui (`Prey::tag`) ; `aim` : le tirage de
+    /// l'endroit qu'il visait (celui de son `Aims`).
+    Bites {
+        low: bool,
+        at: Vec3,
+        seed: u32,
+        who: u32,
+        victim: u16,
+        aim: u32,
+    },
     /// (v272) Il choisit où mordre ensuite (`low` : en rampant, nos jambes seulement) : à la
-    /// partie de lui dire où c'est (`Prey::spot`).
-    Aims { low: bool, seed: u32 },
+    /// partie de lui dire où c'est (`Prey::spot`). (v312) `victim` : sur qui.
+    Aims { low: bool, seed: u32, victim: u16 },
     /// (v299) « Quand on mange le monstre, de la gelée coule comme le sang » ; mort, il fond
     /// en gelée, puis ses veines en gouttes de leur couleur : `count` gouttes de ce liquide
     /// partent de là (`spurt` : un jet, la bouchée vient d'arracher le morceau).
@@ -1372,6 +1396,17 @@ pub struct Evide {
     voice: f32,
     age: f32,
     rng: u32,
+    /// (v312) Le tirage de l'endroit visé pour la morsure en cours (son dernier `Aims`).
+    aim_seed: u32,
+    /// (v312) En ligne, le pantin d'un Évidé que mène un autre joueur : (pseudo du meneur,
+    /// son numéro chez lui). Figé (`frozen`) : il ne pense pas, il suit ce que le relais en
+    /// publie (`goal`, depuis `silent` secondes ; `fed` : morceaux mangés déjà retirés ;
+    /// `cry` : il vient de se mettre à crier).
+    pub lead: Option<(String, u16)>,
+    goal: Option<minelib_net::evide::Mob>,
+    silent: f32,
+    fed: usize,
+    cry: bool,
     /// Essais : figé dans cette posture (aucun mouvement, aucune pensée).
     frozen: bool,
     /// (v290) Essais : il va et vient autour de ce point (voir `update`).
@@ -1422,6 +1457,12 @@ impl Evide {
             voice: 0.0,
             age: 0.0,
             rng: seed.wrapping_mul(0x9e37_79b9) | 1,
+            aim_seed: 0,
+            lead: None,
+            goal: None,
+            silent: 0.0,
+            fed: 0,
+            cry: false,
             frozen: false,
             shuttle: None,
         };
@@ -1709,6 +1750,15 @@ impl Evide {
             let side = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
             self.pos = from + side * (3.0 * (self.age * 1.6).sin());
             self.anim.walk += dt * 9.0;
+        }
+        // (v312) Le pantin d'un Évidé mené ailleurs : il rejoint ce que le relais en publie,
+        // et crie quand l'autre crie.
+        if self.lead.is_some() && dt > 0.0 {
+            self.silent += dt;
+            self.follow((dt * 14.0).min(1.0), false);
+            if std::mem::take(&mut self.cry) {
+                events.push(Event::Voice(self.eye()));
+            }
         }
         if self.frozen || dt <= 0.0 || !world.contains(here) {
             return events;
@@ -2006,9 +2056,11 @@ impl Evide {
                 self.aimed = true;
                 let seed = self.rng;
                 self.unit();
+                self.aim_seed = seed;
                 events.push(Event::Aims {
                     low: self.crawling,
                     seed,
+                    victim: p.tag,
                 });
             }
             let was = self.feed % BITE_S;
@@ -2025,6 +2077,9 @@ impl Evide {
                         low: self.crawling,
                         at: mouth,
                         seed,
+                        who: self.id,
+                        victim: p.tag,
+                        aim: self.aim_seed,
                     });
                 }
                 self.aimed = false;
@@ -2273,19 +2328,131 @@ impl Evide {
         self.spurt = Some((part, cell));
         let dead = self.health() == 0;
         if dead {
-            self.dying = Some(0.0);
-            // Il s'effondre de là où il est, dans sa posture du moment, poussé loin de nous.
-            let l = limbs(self.pos, self.yaw, &self.anim);
-            let stance = crate::corpse::Stance {
-                parts: l.parts,
-                lower: l.lower,
-            };
-            let away = self.pos - from;
-            let push = Vec3::new(away.x, 0.0, away.z).normalize_or(forward(self.yaw + PI)) * 1.6;
-            self.corpse = Some(crate::corpse::Ragdoll::new(&stance, self.vel, push, self.rng));
-            (self.scream, self.maw) = (0.0, false);
+            self.die(from);
         }
         Some(dead)
+    }
+
+    /// (v299) Il meurt : il s'effondre de là où il est, dans sa posture du moment, poussé loin
+    /// de `from`.
+    fn die(&mut self, from: Vec3) {
+        if self.dying.is_some() {
+            return;
+        }
+        self.dying = Some(0.0);
+        let l = limbs(self.pos, self.yaw, &self.anim);
+        let stance = crate::corpse::Stance {
+            parts: l.parts,
+            lower: l.lower,
+        };
+        let away = self.pos - from;
+        let push = Vec3::new(away.x, 0.0, away.z).normalize_or(forward(self.yaw + PI)) * 1.6;
+        self.corpse = Some(crate::corpse::Ragdoll::new(&stance, self.vel, push, self.rng));
+        (self.scream, self.maw) = (0.0, false);
+    }
+
+    /// (v312) Tel que le relais et les autres joueurs le voient (`minelib_net::evide::Mob`) :
+    /// sa place, sa posture sur dix octets, ce qu'on lui a mangé.
+    pub fn wire(&self) -> minelib_net::evide::Mob {
+        use minelib_net::evide as net;
+        let a = &self.anim;
+        let unit = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let sym = |v: f32| unit(v / (2.0 * WIRE_HEAD) + 0.5);
+        net::Mob {
+            id: self.id as u16,
+            pos: self.pos.to_array(),
+            yaw: self.yaw,
+            tall: self.tall,
+            pose: [
+                unit(a.walk.rem_euclid(TAU) / TAU),
+                unit(a.swing),
+                unit(a.crawl),
+                unit(a.hunch / WIRE_HUNCH),
+                unit(a.arms / PI),
+                unit(a.grab),
+                unit((a.mouth + 0.5) / 1.5),
+                sym(a.head_yaw),
+                sym(a.head_pitch),
+                sym(a.head_roll),
+            ],
+            flags: u8::from(self.crawling) * net::CRAWLING
+                | u8::from(self.maw) * net::MAW
+                | u8::from(self.dying.is_some()) * net::DYING,
+            health: self.health(),
+            bites: self
+                .flesh
+                .bites()
+                .iter()
+                .map(|b| [b.part, b.start[0], b.start[1], b.start[2]])
+                .collect(),
+        }
+    }
+
+    /// (v312) Le pantin de l'Évidé `m` que mène `owner` : figé, il suit ce que le relais en
+    /// publie (`hear`).
+    pub fn puppet(owner: &str, m: minelib_net::evide::Mob) -> Self {
+        let mut e = Evide::new(Vec3::from(m.pos), m.yaw, u32::from(m.id) + 1);
+        e.frozen = true;
+        e.lead = Some((owner.to_string(), m.id));
+        e.goal = Some(m);
+        e.follow(1.0, true);
+        e
+    }
+
+    /// (v312) Ce que le relais vient de publier de lui.
+    pub fn hear(&mut self, m: minelib_net::evide::Mob) {
+        self.goal = Some(m);
+        self.silent = 0.0;
+    }
+
+    /// (v312) Le pantin rejoint ce que le relais a publié (`k` : la part du chemin faite à ce
+    /// pas) : sa place, sa posture ; les morceaux qu'on lui a mangés depuis (`quiet` : sans
+    /// jet de gelée, il arrive déjà entamé) ; sa mort.
+    fn follow(&mut self, k: f32, quiet: bool) {
+        use minelib_net::evide as net;
+        let Some(m) = self.goal.take() else {
+            return;
+        };
+        let unit = |b: u8| f32::from(b) / 255.0;
+        let sym = |b: u8| (unit(b) - 0.5) * 2.0 * WIRE_HEAD;
+        let turn = crate::player_model::turn_toward;
+        if self.dying.is_none() {
+            let to = Vec3::from(m.pos);
+            self.pos = if self.pos.distance(to) > 6.0 { to } else { self.pos.lerp(to, k) };
+            self.yaw = turn(self.yaw, m.yaw, k);
+            let a = &mut self.anim;
+            a.walk = turn(a.walk, unit(m.pose[0]) * TAU, k);
+            a.swing = lerp(a.swing, unit(m.pose[1]), k);
+            a.crawl = lerp(a.crawl, unit(m.pose[2]), k);
+            a.hunch = lerp(a.hunch, unit(m.pose[3]) * WIRE_HUNCH, k);
+            a.arms = lerp(a.arms, unit(m.pose[4]) * PI, k);
+            a.grab = lerp(a.grab, unit(m.pose[5]), k);
+            a.mouth = lerp(a.mouth, unit(m.pose[6]) * 1.5 - 0.5, k);
+            a.head_yaw = lerp(a.head_yaw, sym(m.pose[7]), k);
+            a.head_pitch = lerp(a.head_pitch, sym(m.pose[8]), k);
+            a.head_roll = lerp(a.head_roll, sym(m.pose[9]), k);
+            self.tall = lerp(self.tall, m.tall.clamp(CRAWL_H, HEIGHT), k);
+            self.crawling = m.flags & net::CRAWLING != 0;
+            let maw = m.flags & net::MAW != 0;
+            self.cry |= maw && !self.maw && !quiet;
+            self.maw = maw;
+        }
+        let dims = grids();
+        while self.fed < m.bites.len() {
+            let [part, x, y, z] = m.bites[self.fed];
+            self.fed += 1;
+            let (part, cell) = (usize::from(part), [x, y, z].map(usize::from));
+            let eaten = part < PARTS && self.flesh.bite_at(part, cell, OUR_BITE, &dims).is_some();
+            if eaten && !quiet && self.dying.is_none() {
+                self.flinch = 0.25;
+                self.spurt = Some((part, cell));
+            }
+        }
+        if m.flags & net::DYING != 0 {
+            // (Poussé en arrière : celui qui l'a mangé était devant lui.)
+            self.die(self.pos + forward(self.yaw));
+        }
+        self.goal = Some(m);
     }
 
     /// (v290) Ce qu'il lui reste de vie (sur `LIFE`, la vie d'un joueur) : chacune de nos
@@ -2326,7 +2493,7 @@ impl Horde {
 
     /// Un Évidé de plus, là (sorti d'un œuf). Faux : il y en a déjà trop.
     pub fn spawn(&mut self, pos: Vec3, yaw: f32) -> bool {
-        if self.list.len() >= MAX {
+        if self.list.iter().filter(|e| e.lead.is_none()).count() >= MAX {
             return false;
         }
         let seed = (self.unit() * 16_777_216.0) as u32;
@@ -2361,15 +2528,21 @@ impl Horde {
     }
 
     /// Un pas pour tous. `night` : il fait nuit (ils apparaissent tout seuls, rarement).
-    pub fn update(&mut self, world: &World, dt: f32, prey: Option<Prey>, night: bool) -> Vec<Event> {
+    /// (v312) `preys` : nous (`Prey::tag` 0) et, en ligne, les autres joueurs du monde ;
+    /// chacun de nos Évidés s'en prend au plus proche de lui.
+    pub fn update(&mut self, world: &World, dt: f32, preys: &[Prey], night: bool) -> Vec<Event> {
         let mut events = Vec::new();
         for e in &mut self.list {
+            let near = |p: &Prey| p.feet.distance_squared(e.pos);
+            let prey = preys.iter().copied().min_by(|a, b| near(a).total_cmp(&near(b)));
             events.extend(e.update(world, dt, prey));
         }
+        let prey = preys.iter().copied().find(|p| p.tag == 0);
         let before = self.list.len();
         self.list.retain(|e| {
             !e.is_dead()
                 && e.pos.y > -80.0
+                && (e.lead.is_none() || e.dying.is_some() || e.silent < PUPPET_GONE_S)
                 && prey.is_none_or(|p| e.frozen || p.feet.distance(e.pos) < DESPAWN)
         });
         self.natural = self.natural.saturating_sub(before - self.list.len());
@@ -2484,6 +2657,45 @@ impl Horde {
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
 
+    /// (v312) En ligne : nos Évidés tels que le relais doit les voir, les plus proches de
+    /// `center` d'abord (`minelib_net::evide::MAX_PER_OWNER` au plus).
+    pub fn wire(&self, center: Vec3) -> Vec<minelib_net::evide::Mob> {
+        let mut own: Vec<&Evide> =
+            self.list.iter().filter(|e| e.lead.is_none() && !e.frozen).collect();
+        own.sort_by(|a, b| a.pos.distance_squared(center).total_cmp(&b.pos.distance_squared(center)));
+        own.truncate(minelib_net::evide::MAX_PER_OWNER);
+        own.into_iter().map(Evide::wire).collect()
+    }
+
+    /// (v312) En ligne : les Évidés que mène `owner`, tels que le relais vient de les
+    /// publier : leurs pantins les suivent (`Evide::hear`), les nouveaux arrivent.
+    pub fn remote(&mut self, owner: &str, mobs: Vec<minelib_net::evide::Mob>) {
+        for m in mobs {
+            let known = self.list.iter().position(|e| {
+                e.lead
+                    .as_ref()
+                    .is_some_and(|(o, id)| *id == m.id && o.eq_ignore_ascii_case(owner))
+            });
+            match known {
+                Some(i) => self.list[i].hear(m),
+                None if self.list.iter().filter(|e| e.lead.is_some()).count() < PUPPETS => {
+                    let mut e = Evide::puppet(owner, m);
+                    self.count += 1;
+                    e.id = PUPPET_IDS + self.count;
+                    self.list.push(e);
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// (v312) Notre Évidé qui porte ce numéro sur le fil (`Evide::wire`).
+    pub fn own(&mut self, id: u16) -> Option<&mut Evide> {
+        self.list
+            .iter_mut()
+            .find(|e| e.lead.is_none() && e.id as u16 == id)
+    }
+
     /// (v272) Celui qui porte ce numéro, s'il est encore là.
     pub fn by_id(&mut self, id: u32) -> Option<&mut Evide> {
         self.list.iter_mut().find(|e| e.id == id)
@@ -2557,6 +2769,7 @@ mod tests {
             eye: at + Vec3::Y * 1.62,
             spot: None,
             limb: None,
+            tag: 0,
         }
     }
 
@@ -2920,6 +3133,84 @@ mod tests {
             assert!(!(e.feeding && e.maw), "sa gueule ronde en mordant");
         }
         assert!(bites >= 5 && cries >= 1, "{bites} morsures, {cries} cris");
+    }
+
+    /// (v312) En ligne : un Évidé dit sur le fil (`Horde::wire`) a, dans le jeu d'un autre
+    /// joueur, un pantin qui le suit (`Horde::remote`) : sa place, sa posture, les morceaux
+    /// qu'on lui mange (les mêmes cubes), sa mort (il tombe aussi là-bas) ; le pantin ne pense
+    /// pas, n'est pas compté parmi nos Évidés, et s'en va quand on n'en dit plus rien.
+    #[test]
+    fn a_puppet_follows_what_the_relay_publishes() {
+        let w = flat();
+        let p = prey(Vec3::new(0.5, 11.0, -9.0));
+        let mut ours = Horde::default();
+        assert!(ours.spawn(Vec3::new(0.5, 11.0, 6.5), 0.0));
+        let mut theirs = Horde::default();
+        let dims = grids();
+        let pass = |ours: &Horde, theirs: &mut Horde| {
+            let data = minelib_net::evide::pack(&ours.wire(p.feet));
+            theirs.remote("Meneur", minelib_net::evide::unpack(&data).unwrap());
+        };
+        for step in 0..(3 * 60) {
+            ours.update(&w, 1.0 / 60.0, &[p], false);
+            if step % 3 == 0 {
+                pass(&ours, &mut theirs);
+            }
+            // Sans proie : s'il pensait, il resterait en ronde ; il ne fait que suivre.
+            theirs.update(&w, 1.0 / 60.0, &[], false);
+        }
+        assert_eq!(theirs.list.len(), 1);
+        let (a, b) = (&ours.list[0], &theirs.list[0]);
+        assert_eq!(b.lead, Some(("Meneur".to_string(), a.id as u16)));
+        assert!(b.id >= PUPPET_IDS && b.frozen);
+        // Il a couru vers nous, et le pantin avec lui (à son retard près).
+        assert!(a.pos.z < 3.0, "{}", a.pos);
+        assert!(a.pos.distance(b.pos) < 1.2, "{} {}", a.pos, b.pos);
+        let near = |x: f32, y: f32| (x - y).abs() < 0.15;
+        assert!(near(a.anim.mouth, b.anim.mouth) && near(a.anim.hunch, b.anim.hunch), "{:?} {:?}", a.anim, b.anim);
+        assert!(near(a.anim.arms, b.anim.arms) && near(a.tall, b.tall));
+        assert_eq!(theirs.wire(p.feet), Vec::new(), "un pantin n'est pas à nous");
+        // On lui mange un morceau chez son meneur : le pantin perd les mêmes cubes, et la
+        // gelée en coule là-bas aussi.
+        let from = ours.list[0].pos + Vec3::new(0.0, 1.5, -1.0);
+        assert_eq!(ours.list[0].eaten_at(CHEST, [1, 2, 0], from), Some(false));
+        pass(&ours, &mut theirs);
+        let drips: Vec<Event> = (0..3).flat_map(|_| theirs.update(&w, 1.0 / 60.0, &[], false)).collect();
+        assert!(drips.iter().any(|e| matches!(e, Event::Drips { spurt: true, .. })), "{drips:?}");
+        for part in 0..PARTS {
+            assert_eq!(
+                ours.list[0].flesh.eaten_of(part, dims[part]),
+                theirs.list[0].flesh.eaten_of(part, dims[part]),
+                "pavé {part}"
+            );
+        }
+        assert_eq!(theirs.list[0].health(), LIFE - OUR_BITE_HURTS);
+        // Mangé jusqu'à sa mort : le pantin meurt et tombe aussi.
+        for part in [LEG_L, LEG_R, ARM_L, ARM_R] {
+            assert!(ours.list[0].eaten_at(part, [0, 0, 0], from).is_some());
+        }
+        assert!(ours.list[0].is_dying());
+        pass(&ours, &mut theirs);
+        theirs.update(&w, 1.0 / 60.0, &[], false);
+        assert!(theirs.list[0].is_dying() && theirs.list[0].corpse.is_some());
+        assert_eq!(theirs.list[0].health(), 0);
+        // Un pantin vivant dont on ne dit plus rien s'en va ; rien n'en est enregistré.
+        let mut quiet = Horde::default();
+        let mut one = Horde::default();
+        assert!(one.spawn(Vec3::new(0.5, 11.0, 6.5), 0.0));
+        quiet.remote("Meneur", one.wire(p.feet));
+        assert_eq!(quiet.list.len(), 1);
+        for _ in 0..((PUPPET_GONE_S + 0.5) * 60.0) as usize {
+            quiet.update(&w, 1.0 / 60.0, &[p], false);
+        }
+        assert!(quiet.list.is_empty());
+        // Et il n'est pas compté parmi les nôtres : seize à nous, même avec des pantins.
+        let mut crowd = Horde::default();
+        crowd.remote("Meneur", one.wire(p.feet));
+        for _ in 0..MAX {
+            assert!(crowd.spawn(Vec3::new(0.5, 11.0, 0.5), 0.0));
+        }
+        assert!(!crowd.spawn(Vec3::new(0.5, 11.0, 0.5), 0.0));
     }
 
     /// Près de nous il s'arrête, se penche, et sa bouche se referme sur nous à intervalles ;
@@ -3437,13 +3728,13 @@ mod tests {
         let p = prey(Vec3::new(0.5, 11.0, 0.5));
         let mut h = Horde::default();
         for _ in 0..(3600.0 / SPAWN_TICK) as usize {
-            h.update(&w, SPAWN_TICK, Some(p), false);
+            h.update(&w, SPAWN_TICK, &[p], false);
         }
         assert!(h.list.is_empty(), "le jour");
         // Dix heures de nuit, les monstres retirés à mesure : une trentaine d'apparitions.
         let mut came = 0;
         for _ in 0..(36_000.0 / SPAWN_TICK) as usize {
-            h.update(&w, SPAWN_TICK, Some(p), true);
+            h.update(&w, SPAWN_TICK, &[p], true);
             for e in h.list.drain(..) {
                 let d = Vec3::new(e.pos.x - 0.5, 0.0, e.pos.z - 0.5).length();
                 assert!((SPAWN_NEAR - 1.0..=SPAWN_FAR + 1.0).contains(&d), "à {d}");

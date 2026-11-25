@@ -976,6 +976,10 @@ struct Conn {
     /// (`CROWD_RATE`, `CROWD_HIT_RATE`).
     crowd_rate: (Instant, u32),
     crowd_hit_rate: (Instant, u32),
+    /// (v312) Paquets de ses Évidés, et ses morsures et bouchées, dans la seconde en cours
+    /// (`EVIDE_RATE`, `EVIDE_ACT_RATE`).
+    evide_rate: (Instant, u32),
+    evide_act_rate: (Instant, u32),
     /// (v231) Invisible pour ses amis (`Request::Presence`) : hors ligne pour eux, pas
     /// d'invitations.
     hidden_presence: bool,
@@ -1035,6 +1039,8 @@ impl Conn {
             zeus_seen: VecDeque::new(),
             crowd_rate: (Instant::now(), 0),
             crowd_hit_rate: (Instant::now(), 0),
+            evide_rate: (Instant::now(), 0),
+            evide_act_rate: (Instant::now(), 0),
             hidden_presence: false,
             passkey_challenge: None,
             invite_rate: (Instant::now(), 0),
@@ -1395,6 +1401,12 @@ struct State {
     sov_committed: Arc<std::sync::atomic::AtomicUsize>,
     conns: HashMap<u64, Conn>,
     rooms: HashMap<u64, Room>,
+    /// (v312) Les Évidés partagés de chaque monde de construction (par salle) : ce que ce
+    /// relais en surveille (`minelib_net::evide::Watch`) ; où il voit chaque joueur (ses
+    /// pieds, d'après sa dernière position admise) ; l'horloge de cette surveillance.
+    evides: HashMap<u64, minelib_net::evide::Watch>,
+    evide_seen: HashMap<u64, [f32; 3]>,
+    evide_clock: Instant,
     /// Passeurs de la voie rapide des parties FPS, et parties qu'ils portent.
     fast: passeurs::Fast,
     /// (v287) Santé du relais sur la minute en cours (`Health`).
@@ -1552,6 +1564,9 @@ pub fn start(cfg: Config) -> Result<Handle> {
         provinces::PROVINCE_FROM,
     ));
     let state = Arc::new(Mutex::new(State {
+        evides: HashMap::new(),
+        evide_seen: HashMap::new(),
+        evide_clock: Instant::now(),
         whois: whois.clone(),
         peer_servers: peer_servers.clone(),
         shard_from: shard_from.clone(),
@@ -2752,6 +2767,10 @@ const THOR_REACH: i32 = 20;
 /// coups à ses PNJ par joueur et par seconde (un par clic).
 const CROWD_RATE: u32 = 40;
 const CROWD_HIT_RATE: u32 = 20;
+/// (v312) Paquets de ses Évidés par seconde et par meneur, au plus ; morsures et bouchées par
+/// seconde et par joueur.
+const EVIDE_RATE: u32 = 30;
+const EVIDE_ACT_RATE: u32 = 8;
 
 /// (v231) Invitations dans un monde de construction et demandes d'ami poussées, par joueur et
 /// par minute, au plus.
@@ -3834,6 +3853,151 @@ pub(crate) fn crowd_request(
             }
         }
         _ => {}
+    }
+}
+
+/// (v312) L'Évidé partagé en construction en ligne (`minelib_net::evide`), arrivé avec les
+/// positions de celui qui l'envoie (`chunk` : le sien). Les états des monstres qu'il mène :
+/// surveillés (place, vie, morceaux mangés : ceux du relais) puis remis aux joueurs proches.
+/// Une morsure (demandée par le meneur) : publiée seulement si le monstre peut mordre
+/// maintenant un joueur que ce relais voit à sa portée. Une bouchée (demandée par celui qui
+/// mange) : publiée seulement s'il est à portée et le morceau encore là, avec la vie qui reste.
+/// Refusé : rien n'est publié, rien n'arrive.
+pub(crate) fn evide_request(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    pseudo: &str,
+    chunk: [i32; 2],
+    m: game::BuildMsg,
+) {
+    use minelib_net::evide;
+    if !st.rooms.get(&rid).is_some_and(|r| r.kind == 1) {
+        return;
+    }
+    let now = st.evide_clock.elapsed().as_secs_f64();
+    let name: String = pseudo.chars().take(32).collect();
+    // Où ce relais voit celui qui envoie (rien : il n'a pas encore dit où il est).
+    let Some(here) = st.evide_seen.get(&id).copied() else {
+        return;
+    };
+    if st.evide_seen.len() > st.conns.len() + 64 {
+        let conns = &st.conns;
+        st.evide_seen.retain(|k, _| conns.contains_key(k));
+    }
+    // Le joueur de cette salle qui porte ce pseudo.
+    let find = |st: &State, who: &str| -> Option<u64> {
+        st.rooms.get(&rid)?.everyone().find(|m| {
+            st.conns
+                .get(m)
+                .and_then(|c| c.pseudo.as_deref())
+                .is_some_and(|p| p.eq_ignore_ascii_case(who))
+        })
+    };
+    let (out, extra): (Vec<u8>, Vec<u64>) = match m {
+        game::BuildMsg::Evide { data, .. } => {
+            let calm = st
+                .conns
+                .get_mut(&id)
+                .is_some_and(|c| within_rate(&mut c.evide_rate, EVIDE_RATE));
+            if !calm || data.len() > evide::MAX_BYTES {
+                return;
+            }
+            let watch = st.evides.entry(rid).or_default();
+            watch.sweep(now);
+            let Some(data) = watch.states(&name.to_lowercase(), here, now, &data) else {
+                return;
+            };
+            (game::encode(&game::BuildMsg::Evide { owner: name, data }), Vec::new())
+        }
+        game::BuildMsg::EvideBite {
+            id: mob,
+            victim,
+            low,
+            aim,
+            seed,
+            ..
+        } => {
+            let calm = st
+                .conns
+                .get_mut(&id)
+                .is_some_and(|c| within_rate(&mut c.evide_act_rate, EVIDE_ACT_RATE));
+            let Some(target) = find(st, &victim).filter(|_| calm) else {
+                return;
+            };
+            let Some(at) = st.evide_seen.get(&target).copied() else {
+                return;
+            };
+            let allowed = st
+                .evides
+                .get_mut(&rid)
+                .is_some_and(|w| w.bite(&name.to_lowercase(), mob, at, now));
+            if !allowed {
+                return;
+            }
+            let victim = st
+                .conns
+                .get(&target)
+                .and_then(|c| c.pseudo.clone())
+                .unwrap_or(victim);
+            let out = game::encode(&game::BuildMsg::EvideBite {
+                owner: name,
+                id: mob,
+                victim: victim.chars().take(32).collect(),
+                low,
+                aim,
+                seed,
+            });
+            (out, vec![id, target])
+        }
+        game::BuildMsg::EvideEat {
+            owner,
+            id: mob,
+            part,
+            cell,
+            ..
+        } => {
+            let calm = st
+                .conns
+                .get_mut(&id)
+                .is_some_and(|c| within_rate(&mut c.evide_act_rate, EVIDE_ACT_RATE));
+            if !calm {
+                return;
+            }
+            let owner: String = owner.chars().take(32).collect();
+            let left = st
+                .evides
+                .get_mut(&rid)
+                .and_then(|w| w.eat(&owner.to_lowercase(), mob, part, cell, here, now));
+            let Some(health) = left else {
+                return;
+            };
+            let lead = find(st, &owner);
+            let out = game::encode(&game::BuildMsg::EvideEat {
+                owner,
+                id: mob,
+                part,
+                cell,
+                by: name,
+                health,
+            });
+            (out, std::iter::once(id).chain(lead).collect())
+        }
+        _ => return,
+    };
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let mut to = room.build.within(chunk, evide::CHUNKS, id);
+    for m in extra {
+        if !to.contains(&m) {
+            to.push(m);
+        }
+    }
+    for m in to {
+        if let Some(c) = st.conns.get(&m) {
+            push_zone(&c.tx, chunk, out.clone());
+        }
     }
 }
 
@@ -8342,6 +8506,18 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 }
                 return None;
             }
+            // (v312) Ses Évidés, une morsure, une bouchée : surveillés avant d'être publiés.
+            if let Some(
+                m @ (game::BuildMsg::Evide { .. }
+                | game::BuildMsg::EvideBite { .. }
+                | game::BuildMsg::EvideEat { .. }),
+            ) = msg
+            {
+                if let Some(rid) = my_room {
+                    evide_request(st, rid, id, pseudo, chunk, m);
+                }
+                return None;
+            }
             // Position sur ce serveur, gardée pour son retour.
             if let Some(game::BuildMsg::Player {
                 pos, yaw, pitch, ..
@@ -8362,6 +8538,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // Le pseudo montré est celui de la session (pas celui que le joueur annonce) ;
             // une position absurde (infinie, hors du monde) n'est pas diffusée.
             let (_, pose) = game::pose_of(&data)?;
+            // (v312) Où ce relais le voit : la portée des morsures et des bouchées de L'Évidé
+            // se compte de là, pas de ce qu'en dit un autre joueur.
+            st.evide_seen.insert(id, pose.pos);
             if let Some(room) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
                 // Plus de positions que le jeu n'en envoie : pas diffusée.
                 if !room.build.pos_due(id) {
@@ -8405,6 +8584,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // Elle compte dans la même limite que les autres (`pos_due`) ; rien d'autre
             // n'en dépend (ni la place gardée du joueur, ni les modifications en retard).
             let (_, pose) = game::pose_of(&data)?;
+            // (v312) Où ce relais le voit (portées de L'Évidé partagé), ici aussi.
+            st.evide_seen.insert(id, pose.pos);
             let room = my_room.and_then(|r| st.rooms.get_mut(&r))?;
             if room.kind != 1 {
                 return None;
@@ -12544,6 +12725,196 @@ mod tests {
             match next_light(c) {
                 game::BuildMsg::Light { light, seq, .. } => assert_eq!((light, seq), (None, 4)),
                 m => panic!("{m:?}"),
+            }
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v312) L'Évidé partagé : le relais publie les monstres d'un joueur aux joueurs proches
+    /// à son nom à lui (le pseudo de sa session) ; il tient leur vie et ce qu'on leur a mangé
+    /// (une bouchée demandée par un joueur à portée est publiée avec la vie qui reste, pas
+    /// deux fois le même morceau ; le meneur a beau l'annoncer entier) ; une morsure n'est
+    /// publiée que sur un joueur à portée, pas deux d'affilée, pas au nom du monstre d'un autre.
+    #[test]
+    fn the_relay_watches_the_shared_evide() {
+        use minelib_net::evide;
+        let dir = std::env::temp_dir().join(format!("minelib-evide-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        // Prochain message de L'Évidé reçu.
+        let next = |c: &Client| loop {
+            if let Event::FromZone { peer, data, .. } =
+                wait(c, |e| matches!(e, Event::FromZone { .. }))
+            {
+                match game::decode::<game::BuildMsg>(&data) {
+                    Some(
+                        m @ (game::BuildMsg::Evide { .. }
+                        | game::BuildMsg::EvideBite { .. }
+                        | game::BuildMsg::EvideEat { .. }),
+                    ) => {
+                        assert_eq!(peer, 0, "remis par le relais");
+                        return m;
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        let near = |chunk: [i32; 2], m: game::BuildMsg| Request::Nearby {
+            chunk,
+            data: game::encode(&m),
+        };
+        let stand = |pseudo: &str, pos: [f32; 3]| game::BuildMsg::Player {
+            pseudo: pseudo.into(),
+            pos,
+            yaw: 0.0,
+            pitch: 0.0,
+            crouch: 0.0,
+            speed: 0.0,
+            ping: 0,
+            held: 0,
+        };
+        let mob = |health: u8| evide::Mob {
+            id: 1,
+            pos: [9.0, 70.0, 8.0],
+            yaw: 0.0,
+            tall: 3.5,
+            pose: [0; evide::POSE],
+            flags: 0,
+            health,
+            bites: Vec::new(),
+        };
+        let states = |owner: &str| game::BuildMsg::Evide {
+            owner: owner.into(),
+            data: evide::pack(&[mob(evide::LIFE)]),
+        };
+        let bite = |owner: &str, victim: &str| game::BuildMsg::EvideBite {
+            owner: owner.into(),
+            id: 1,
+            victim: victim.into(),
+            low: false,
+            aim: 5,
+            seed: 6,
+        };
+        let (createur, clink) = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        transport::push(&clink, &Request::Position { chunk: [0, 0] });
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&elink, &Request::Position { chunk: [0, 0] });
+        let (loin, llink) = login("Loin");
+        loin.send(Cmd::Join(room));
+        wait(&loin, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&llink, &Request::Position { chunk: [400, 0] });
+        std::thread::sleep(Duration::from_millis(100));
+        // Chacun dit où il est : le relais comptera les portées de là.
+        transport::push(&clink, &near([0, 0], stand("Createur", [8.0, 70.0, 8.0])));
+        transport::push(&elink, &near([0, 0], stand("Eve", [10.0, 70.0, 8.0])));
+        transport::push(&llink, &near([400, 0], stand("Loin", [6400.0, 70.0, 8.0])));
+        std::thread::sleep(Duration::from_millis(100));
+        // Le monstre du créateur : Eve le reçoit, au nom de sa session, entier.
+        transport::push(&clink, &near([0, 0], states("Quelqu'un")));
+        match next(&eve) {
+            game::BuildMsg::Evide { owner, data } => {
+                assert_eq!(owner, "Createur");
+                let mobs = evide::unpack(&data).unwrap();
+                assert_eq!((mobs[0].id, mobs[0].health, mobs[0].bites.len()), (1, evide::LIFE, 0));
+            }
+            m => panic!("{m:?}"),
+        }
+        // Eve lui mange un morceau : publié aux deux, à son nom, avec la vie qui reste.
+        let eat = game::BuildMsg::EvideEat {
+            owner: "createur".into(),
+            id: 1,
+            part: 2,
+            cell: [1, 2, 3],
+            by: "Createur".into(),
+            health: 20,
+        };
+        transport::push(&elink, &near([0, 0], eat.clone()));
+        let want = game::BuildMsg::EvideEat {
+            owner: "createur".into(),
+            id: 1,
+            part: 2,
+            cell: [1, 2, 3],
+            by: "Eve".into(),
+            health: evide::LIFE - evide::EAT_HURTS,
+        };
+        assert_eq!(next(&eve), want);
+        assert_eq!(next(&createur), want);
+        // Le même morceau, puis le créateur l'annonce entier : le relais publie sa vie à lui
+        // et le morceau mangé (la deuxième bouchée n'a rien donné).
+        transport::push(&elink, &near([0, 0], eat));
+        std::thread::sleep(Duration::from_millis(50));
+        transport::push(&clink, &near([0, 0], states("Createur")));
+        match next(&eve) {
+            game::BuildMsg::Evide { data, .. } => {
+                let mobs = evide::unpack(&data).unwrap();
+                assert_eq!(mobs[0].health, evide::LIFE - evide::EAT_HURTS);
+                assert_eq!(mobs[0].bites, vec![[2, 1, 2, 3]]);
+            }
+            m => panic!("{m:?}"),
+        }
+        // Il mord Eve, à portée : publié à Eve et au créateur. Tout de suite après, une
+        // deuxième morsure, une morsure sur le joueur du bout du monde, et Eve qui mord au
+        // nom du monstre du créateur : rien de tout cela (l'état suivant arrive d'abord).
+        transport::push(&clink, &near([0, 0], bite("Quelqu'un", "eve")));
+        let bitten = bite("Createur", "Eve");
+        assert_eq!(next(&eve), bitten);
+        assert_eq!(next(&createur), bitten);
+        transport::push(&clink, &near([0, 0], bite("Createur", "Eve")));
+        transport::push(&clink, &near([0, 0], bite("Createur", "Loin")));
+        transport::push(&elink, &near([0, 0], bite("Createur", "Createur")));
+        std::thread::sleep(Duration::from_millis(50));
+        transport::push(&clink, &near([0, 0], states("Createur")));
+        assert!(matches!(next(&eve), game::BuildMsg::Evide { .. }));
+        // Celui qui est à l'autre bout du monde n'a rien reçu de tout cela.
+        std::thread::sleep(Duration::from_millis(200));
+        while let Some(e) = loin.poll() {
+            if let Event::FromZone { data, .. } = e {
+                let m = game::decode::<game::BuildMsg>(&data);
+                assert!(
+                    !matches!(
+                        m,
+                        Some(
+                            game::BuildMsg::Evide { .. }
+                                | game::BuildMsg::EvideBite { .. }
+                                | game::BuildMsg::EvideEat { .. }
+                        )
+                    ),
+                    "{m:?}"
+                );
             }
         }
         drop(h);

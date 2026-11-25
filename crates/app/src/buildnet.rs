@@ -389,6 +389,13 @@ pub struct BuildNet {
     pub crowd_inbox: Vec<(String, Vec<u8>)>,
     /// (v227) Coups des autres joueurs à notre foule d'essai : qui, quel PNJ, d'où (ses yeux).
     pub crowd_hits: Vec<(String, u16, [f32; 3])>,
+    /// (v312) L'Évidé partagé, publié par un relais (jamais par un joueur) : les monstres que
+    /// mènent d'autres joueurs (pseudo du meneur, paquet de `minelib_net::evide`) ; les
+    /// morsures admises (meneur, monstre, victime, en rampant, tirages de l'endroit et de la
+    /// morsure) ; les bouchées admises (meneur, monstre, pavé, cube, qui, vie qui reste).
+    pub evide_inbox: Vec<(String, Vec<u8>)>,
+    pub evide_bites: Vec<(String, u16, String, bool, u32, u32)>,
+    pub evide_eats: Vec<(String, u16, u8, [u8; 3], String, u8)>,
     /// (v227) Notre foule d'essai a été refusée par le relais (pas OP, trop de paquets).
     pub crowd_denied: bool,
     /// (v140) Tout ce qu'on avait en vue au dernier passage était servi par des relais de
@@ -609,6 +616,9 @@ impl BuildNet {
             light_queue: Vec::new(),
             crowd_inbox: Vec::new(),
             crowd_hits: Vec::new(),
+            evide_inbox: Vec::new(),
+            evide_bites: Vec::new(),
+            evide_eats: Vec::new(),
             crowd_denied: false,
             was_deep: false,
             root_province: None,
@@ -1505,6 +1515,23 @@ impl BuildNet {
         );
     }
 
+    /// (v312) Une demande pour L'Évidé partagé (`BuildMsg::Evide` : les monstres qu'on mène ;
+    /// `EvideBite` : l'un d'eux mord ; `EvideEat` : on en mange un morceau) : avec nos
+    /// positions, au relais qui les suit, qui la vérifie et la publie. Pas encore placé dans
+    /// le monde : rien.
+    pub fn send_evide(&self, msg: BuildMsg) {
+        let Some(chunk) = self.chunk else {
+            return;
+        };
+        self.send_at(
+            chunk,
+            Request::Nearby {
+                chunk,
+                data: game::encode(&msg),
+            },
+        );
+    }
+
     /// (v227) Coup au PNJ `id` de la foule d'essai que mène `owner`, depuis nos yeux en `from` :
     /// au relais qui suit nos positions, qui le remet à `owner`.
     pub fn send_crowd_hit(&self, owner: &str, id: u16, from: [f32; 3]) {
@@ -2350,6 +2377,39 @@ impl BuildNet {
             BuildMsg::CrowdDenied => {
                 if peer == 0 {
                     self.crowd_denied = true;
+                }
+                Vec::new()
+            }
+            // (v312) L'Évidé partagé : seulement ce qu'un relais publie (`peer` 0).
+            BuildMsg::Evide { owner, data } => {
+                if peer == 0 && !owner.eq_ignore_ascii_case(&self.pseudo) {
+                    self.evide_inbox.push((owner, data));
+                }
+                Vec::new()
+            }
+            BuildMsg::EvideBite {
+                owner,
+                id,
+                victim,
+                low,
+                aim,
+                seed,
+            } => {
+                if peer == 0 {
+                    self.evide_bites.push((owner, id, victim, low, aim, seed));
+                }
+                Vec::new()
+            }
+            BuildMsg::EvideEat {
+                owner,
+                id,
+                part,
+                cell,
+                by,
+                health,
+            } => {
+                if peer == 0 {
+                    self.evide_eats.push((owner, id, part, cell, by, health));
                 }
                 Vec::new()
             }
@@ -7212,6 +7272,50 @@ mod tests {
         assert_eq!(b.others["Lampe"].held, Some(Held::Zeus));
         b.receive(7, [0, 0], &msg(0), &mut w);
         assert_eq!(b.others["Lampe"].held, None);
+    }
+
+    /// (v312) L'Évidé partagé : ce qu'un relais publie arrive (les monstres des autres, les
+    /// morsures, les bouchées) ; rien de ce que dirait un joueur lui-même ; nos propres
+    /// monstres ne nous reviennent pas.
+    #[test]
+    fn the_shared_evide_only_comes_from_a_relay() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut b = BuildNet::new(tx, "Moi".into(), false);
+        let mut w = World::new(0);
+        let states = |owner: &str| {
+            game::encode(&BuildMsg::Evide {
+                owner: owner.into(),
+                data: vec![0],
+            })
+        };
+        let bite = game::encode(&BuildMsg::EvideBite {
+            owner: "Meneur".into(),
+            id: 3,
+            victim: "Moi".into(),
+            low: true,
+            aim: 5,
+            seed: 6,
+        });
+        let eat = game::encode(&BuildMsg::EvideEat {
+            owner: "Moi".into(),
+            id: 1,
+            part: 2,
+            cell: [1, 2, 3],
+            by: "Eve".into(),
+            health: 16,
+        });
+        // D'un joueur (`peer` 9) : rien.
+        for m in [&states("Meneur"), &bite, &eat] {
+            b.receive(9, [0, 0], m, &mut w);
+        }
+        assert!(b.evide_inbox.is_empty() && b.evide_bites.is_empty() && b.evide_eats.is_empty());
+        // D'un relais : tout, sauf nos propres monstres.
+        for m in [&states("Meneur"), &states("moi"), &bite, &eat] {
+            b.receive(0, [0, 0], m, &mut w);
+        }
+        assert_eq!(b.evide_inbox, vec![("Meneur".to_string(), vec![0])]);
+        assert_eq!(b.evide_bites, vec![("Meneur".to_string(), 3, "Moi".to_string(), true, 5, 6)]);
+        assert_eq!(b.evide_eats, vec![("Moi".to_string(), 1, 2, [1, 2, 3], "Eve".to_string(), 16)]);
     }
 
     /// (v227) Foule d'essai : celle d'un OP arrive (remise par un relais, pas par un joueur ; la

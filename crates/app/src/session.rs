@@ -44,6 +44,10 @@ fn npc_cry_gain(d: f32) -> Option<f32> {
 /// moins mal quand il croque, arrondis un truc cool » : 2 (un cœur) au lieu de 3, la moitié
 /// de ce que lui retire une de nos bouchées (`evide::OUR_BITE_HURTS`).
 const EVIDE_BITE: u8 = 2;
+/// (v312) En ligne : les Évidés qu'on mène sont dits au relais tous les tant de secondes ;
+/// les règles que le relais surveille sont celles du jeu.
+const EVIDE_EVERY: f32 = 0.05;
+const _: () = assert!(EVIDE_BITE == minelib_net::evide::BITE_HURTS);
 /// (v272) Une morsure saigne : gouttes du premier jet, puis gouttes par seconde au début,
 /// qui s'espacent (divisées par e toutes les `BLEED_FADE_S` secondes), pendant `BLEED_S`.
 const BLEED_SPURT: usize = 14;
@@ -700,6 +704,8 @@ pub struct Session {
     /// (v269) Les Évidés du monde (`evide`). (v272) En ligne, dans un monde de construction :
     /// ceux de ce joueur (les autres ne les voient pas) ; jamais en partie FPS.
     evides: crate::evide::Horde,
+    /// (v312) En ligne : temps depuis le dernier envoi au relais des Évidés qu'on mène (s).
+    evide_out: f32,
     /// (v272) Notre bouchée en cours sur un Évidé : (son numéro, pavé, cube visés, temps écoulé
     /// en s, déjà mordu). On se plie vers le morceau, on le mange si notre bouche le touche.
     eating: Option<(u32, usize, [usize; 3], f32, bool)>,
@@ -1253,6 +1259,7 @@ impl Session {
             // Essais : MINELIB_EVIDE="x,y,z,lacet°[,posture]" pose d'avance un Évidé (figé dans
             // la posture nommée : debout, court, rampe, mord, mange ; vivant sans posture) ;
             // plusieurs séparés par « ; ».
+            evide_out: 0.0,
             evides: {
                 let mut horde = evides_saved;
                 for one in std::env::var("MINELIB_EVIDE").unwrap_or_default().split(';') {
@@ -1995,12 +2002,34 @@ impl Session {
                         let far = crate::evide::EAT_REACH + EAT_SLACK;
                         if self.player.eye().distance(target) <= far {
                             let eye = self.player.eye();
-                            let eaten =
-                                self.evides.by_id(id).and_then(|e| e.eaten_at(part, cell, eye));
-                            if let Some(dead) = eaten {
-                                crate::audio::jelly_bite(0.0);
-                                if dead {
-                                    crate::audio::evide_voice(0.0);
+                            if let Some(b) = &self.build {
+                                // (v312) En ligne : demandée au relais, qui vérifie qu'on est
+                                // à portée et que le morceau est encore là ; elle arrive
+                                // quand il la publie (`evides_online`).
+                                let me = b.pseudo().to_string();
+                                let whose = self.evides.by_id(id).map(|e| {
+                                    e.lead.clone().unwrap_or((me, e.id as u16))
+                                });
+                                if let Some((owner, id)) = whose {
+                                    b.send_evide(minelib_net::game::BuildMsg::EvideEat {
+                                        owner,
+                                        id,
+                                        part: part as u8,
+                                        cell: cell.map(|c| c as u8),
+                                        by: String::new(),
+                                        health: 0,
+                                    });
+                                }
+                            } else {
+                                let eaten = self
+                                    .evides
+                                    .by_id(id)
+                                    .and_then(|e| e.eaten_at(part, cell, eye));
+                                if let Some(dead) = eaten {
+                                    crate::audio::jelly_bite(0.0);
+                                    if dead {
+                                        crate::audio::evide_voice(0.0);
+                                    }
                                 }
                             }
                         }
@@ -2019,19 +2048,39 @@ impl Session {
             // pas en partie FPS. La nuit, il en vient tout seuls, rarement
             // (`evide::SPAWN_EVERY_S`).
             if self.net.is_none() {
-                let prey = (self.game.mode != GameMode::Spectator && self.spectating.is_none())
-                    .then(|| crate::evide::Prey {
+                let mut preys = Vec::new();
+                if self.game.mode != GameMode::Spectator && self.spectating.is_none() {
+                    preys.push(crate::evide::Prey {
                         feet: self.player.pos,
                         eye: self.player.eye(),
                         spot: self.evide_spot.and(self.bite_points.borrow().0),
                         limb: self.evide_spot.and(self.bite_points.borrow().2),
+                        tag: 0,
                     });
+                }
+                // (v312) En ligne, L'Évidé est partagé : ceux qu'on mène s'en prennent au
+                // joueur le plus proche d'eux, nous ou un autre (`names` : leurs pseudos,
+                // dans l'ordre des `Prey::tag`).
+                let mut names: Vec<String> = Vec::new();
+                if let Some(b) = &self.build {
+                    for o in b.others.values() {
+                        names.push(o.pseudo.clone());
+                        preys.push(crate::evide::Prey {
+                            feet: o.pos,
+                            eye: eye_of(o.pos, o.crouch),
+                            spot: None,
+                            limb: None,
+                            tag: names.len() as u16,
+                        });
+                    }
+                }
                 let night = self.game.mode != GameMode::Fps
                     && self.time_h >= 0.0
                     && crate::daytime::daylight(self.time_h) < 0.15;
-                for ev in self.evides.update(&self.world, dt, prey, night) {
-                    self.evide_event(ev);
+                for ev in self.evides.update(&self.world, dt, &preys, night) {
+                    self.evide_event(ev, &names);
                 }
+                self.evides_online(dt);
             }
             for p in &mut self.pings {
                 p.1 += dt;
@@ -7724,7 +7773,8 @@ impl Session {
     /// (v269) Ce que vient de faire un Évidé : sa voix (grognement ou rire, d'où il est), sa
     /// morsure (« il retire un cube de notre corps, depuis les bords » : un morceau de notre
     /// modèle part, qui reviendra en cinq minutes, et on perd des points de vie).
-    fn evide_event(&mut self, ev: crate::evide::Event) {
+    /// `names` : en ligne, les pseudos des autres joueurs (`evide::Prey::tag` moins un).
+    fn evide_event(&mut self, ev: crate::evide::Event, names: &[String]) {
         let ear = self.player.eye();
         match ev {
             crate::evide::Event::Voice(at) => crate::audio::evide_voice(at.distance(ear)),
@@ -7739,7 +7789,9 @@ impl Session {
                 count,
                 spurt,
             } => self.fps.ooze(liquid, at, Vec3::ZERO, usize::from(count), spurt),
-            crate::evide::Event::Aims { low, seed } => {
+            // (v312) Il vise un autre joueur : rien à suivre chez nous.
+            crate::evide::Event::Aims { victim, .. } if victim != 0 => {}
+            crate::evide::Event::Aims { low, seed, .. } => {
                 let grids = crate::player_model::flesh_grids();
                 self.evide_spot = self
                     .flesh
@@ -7748,37 +7800,180 @@ impl Session {
                     .pick(seed, bite_parts(low), &grids);
                 self.bite_points.borrow_mut().0 = None;
             }
-            crate::evide::Event::Bites { low, at, seed } => {
-                crate::audio::jelly_bite(at.distance(ear));
-                if self.game.mode == GameMode::Spectator {
+            crate::evide::Event::Bites {
+                low,
+                at,
+                seed,
+                who,
+                victim,
+                aim,
+            } => {
+                // (v312) En ligne : la morsure est demandée au relais, qui ne la publie que
+                // si le monstre peut mordre maintenant un joueur qu'il voit à sa portée ; elle
+                // arrive (à la victime, à nous, aux autres) quand il la publie.
+                if let Some(b) = &self.build {
+                    let victim = match victim {
+                        0 => b.pseudo().to_string(),
+                        k => match names.get(usize::from(k) - 1) {
+                            Some(n) => n.clone(),
+                            None => return,
+                        },
+                    };
+                    b.send_evide(minelib_net::game::BuildMsg::EvideBite {
+                        owner: b.pseudo().to_string(),
+                        id: who as u16,
+                        victim,
+                        low,
+                        aim,
+                        seed,
+                    });
                     return;
                 }
-                // (v272) « La morsure n'est pas assez grande » : un cube de 3 ou 4 de côté
-                // (2 ou 3 en v269), là où il visait.
-                let size = 3 + (seed >> 9) as usize % 2;
-                let grids = crate::player_model::flesh_grids();
-                let flesh = self
-                    .flesh
-                    .entry(String::new())
-                    .or_insert_with(|| crate::flesh::Flesh::of(crate::flesh::Hard::Bones));
-                let bite = match self.evide_spot.take() {
-                    Some((part, cell)) => flesh.bite_at(part, cell, size, &grids),
-                    None => flesh.bite_somewhere(seed, size, bite_parts(low), &grids),
-                };
-                if let Some(b) = bite {
-                    // Le sang part du bas de la morsure : un jet tout de suite, puis des
-                    // gouttes.
-                    let mid = |a: usize| ((b.lo[a] + b.hi[a]) / 2) as usize;
-                    let cell = [mid(0), b.lo[1] as usize, mid(2)];
-                    let from = self.bite_points.borrow().0.unwrap_or(at);
-                    self.fps.bleed(from, self.player.vel, BLEED_SPURT, true);
-                    self.bleeding.push((b.part as usize, cell, 0.0, 0.0));
+                self.evide_bitten(low, at, seed);
+            }
+        }
+    }
+
+    /// (v312) Sorti de `evide_event` : la morsure d'un Évidé tombe sur nous (son bruit, le
+    /// morceau retiré là où il visait, le sang, le cri, les points de vie).
+    fn evide_bitten(&mut self, low: bool, at: Vec3, seed: u32) {
+        let ear = self.player.eye();
+        crate::audio::jelly_bite(at.distance(ear));
+        if self.game.mode == GameMode::Spectator {
+            return;
+        }
+        // (v272) « La morsure n'est pas assez grande » : un cube de 3 ou 4 de côté
+        // (2 ou 3 en v269), là où il visait.
+        let size = 3 + (seed >> 9) as usize % 2;
+        let grids = crate::player_model::flesh_grids();
+        let flesh = self
+            .flesh
+            .entry(String::new())
+            .or_insert_with(|| crate::flesh::Flesh::of(crate::flesh::Hard::Bones));
+        let bite = match self.evide_spot.take() {
+            Some((part, cell)) => flesh.bite_at(part, cell, size, &grids),
+            None => flesh.bite_somewhere(seed, size, bite_parts(low), &grids),
+        };
+        if let Some(b) = bite {
+            // Le sang part du bas de la morsure : un jet tout de suite, puis des
+            // gouttes.
+            let mid = |a: usize| ((b.lo[a] + b.hi[a]) / 2) as usize;
+            let cell = [mid(0), b.lo[1] as usize, mid(2)];
+            let from = self.bite_points.borrow().0.unwrap_or(at);
+            self.fps.bleed(from, self.player.vel, BLEED_SPURT, true);
+            self.bleeding.push((b.part as usize, cell, 0.0, 0.0));
+        }
+        // (v290) « Notre joueur doit faire le bruit d'avoir mal habituel aussi à une
+        // morsure » : le cri des coups reçus (celui des PNJ frappés, des joueurs
+        // touchés en partie FPS).
+        self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.7));
+        self.damage(EVIDE_BITE);
+    }
+
+    /// (v312) L'Évidé partagé en construction en ligne (`minelib_net::evide`). Ceux qu'on mène
+    /// sont dits au relais vingt fois par seconde ; ceux des autres arrivent publiés par lui
+    /// (leurs pantins : `Horde::remote`) ; une morsure ou une bouchée n'a lieu que quand le
+    /// relais la publie.
+    fn evides_online(&mut self, dt: f32) {
+        use minelib_net::game::BuildMsg;
+        let Some(b) = self.build.as_mut() else {
+            return;
+        };
+        let me = b.pseudo().to_string();
+        self.evide_out += dt;
+        if self.evide_out >= EVIDE_EVERY {
+            self.evide_out = 0.0;
+            let mobs = self.evides.wire(self.player.pos);
+            if !mobs.is_empty() {
+                b.send_evide(BuildMsg::Evide {
+                    owner: me.clone(),
+                    data: minelib_net::evide::pack(&mobs),
+                });
+            }
+        }
+        for (owner, data) in std::mem::take(&mut b.evide_inbox) {
+            if let Some(mobs) = minelib_net::evide::unpack(&data) {
+                self.evides.remote(&owner, mobs);
+            }
+        }
+        let bites = std::mem::take(&mut b.evide_bites);
+        let eats = std::mem::take(&mut b.evide_eats);
+        // Où sont les autres joueurs (leurs pieds), par pseudo.
+        let others: Vec<(String, Vec3)> =
+            b.others.values().map(|o| (o.pseudo.clone(), o.pos)).collect();
+        let place = |who: &str| {
+            others
+                .iter()
+                .find(|(p, _)| p.eq_ignore_ascii_case(who))
+                .map(|(_, at)| *at)
+        };
+        let ear = self.player.eye();
+        for (owner, id, victim, low, aim, seed) in bites {
+            // La bouche du monstre : le nôtre, ou le pantin de celui d'un autre.
+            let mine = owner.eq_ignore_ascii_case(&me);
+            let mouth = self
+                .evides
+                .list
+                .iter()
+                .find(|e| match &e.lead {
+                    None => mine && e.id as u16 == id,
+                    Some((o, n)) => !mine && *n == id && o.eq_ignore_ascii_case(&owner),
+                })
+                .map(crate::evide::Evide::eye);
+            if victim.eq_ignore_ascii_case(&me) {
+                // Mené par un autre : l'endroit visé se tire comme chez lui.
+                if self.evide_spot.is_none() {
+                    let grids = crate::player_model::flesh_grids();
+                    self.evide_spot = self
+                        .flesh
+                        .entry(String::new())
+                        .or_insert_with(|| crate::flesh::Flesh::of(crate::flesh::Hard::Bones))
+                        .pick(aim, bite_parts(low), &grids);
                 }
-                // (v290) « Notre joueur doit faire le bruit d'avoir mal habituel aussi à une
-                // morsure » : le cri des coups reçus (celui des PNJ frappés, des joueurs
-                // touchés en partie FPS).
-                self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.7));
-                self.damage(EVIDE_BITE);
+                let chest = self.player.pos + Vec3::Y * 1.1;
+                self.evide_bitten(low, mouth.unwrap_or(chest), seed);
+            } else if let Some(at) = place(&victim) {
+                // Un autre joueur est mordu : le bruit, et son sang.
+                let chest = at + Vec3::Y * 1.1;
+                crate::audio::jelly_bite(chest.distance(ear));
+                self.fps.bleed(chest, Vec3::ZERO, BLEED_SPURT, true);
+            }
+        }
+        for (owner, id, part, cell, by, _health) in eats {
+            let from = if by.eq_ignore_ascii_case(&me) {
+                Some(ear)
+            } else {
+                place(&by).map(|at| at + Vec3::Y * 1.5)
+            };
+            if owner.eq_ignore_ascii_case(&me) {
+                // Le nôtre : c'est ici qu'il perd le morceau (et meurt à la cinquième bouchée).
+                let Some(e) = self.evides.own(id) else {
+                    continue;
+                };
+                let (at, from) = (e.pos, from.unwrap_or(e.pos + Vec3::X));
+                let eaten = e.eaten_at(usize::from(part), cell.map(usize::from), from);
+                if let Some(dead) = eaten {
+                    crate::audio::jelly_bite(at.distance(ear));
+                    if dead {
+                        crate::audio::evide_voice(at.distance(ear));
+                    }
+                }
+            } else {
+                // Celui d'un autre : son pantin perd le morceau avec l'état que le relais
+                // publie ; ici, le bruit.
+                let at = self
+                    .evides
+                    .list
+                    .iter()
+                    .find(|e| {
+                        e.lead
+                            .as_ref()
+                            .is_some_and(|(o, n)| *n == id && o.eq_ignore_ascii_case(&owner))
+                    })
+                    .map(|e| e.pos);
+                if let Some(at) = at {
+                    crate::audio::jelly_bite(at.distance(ear));
+                }
             }
         }
     }
