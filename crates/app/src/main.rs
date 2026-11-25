@@ -3957,8 +3957,31 @@ impl Game {
             c.text_center(line, y, ds, GREY);
             y += 7.0 * ds;
         }
+        y += 12.0 * s;
+        // (v327) Liens directs (`hote_direct`), avec ce qu'ils montrent.
+        let direct = self.options.host_direct == Some(true);
+        let label = if direct {
+            "Liens directs avec les autres joueurs : oui"
+        } else {
+            "Liens directs avec les autres joueurs : non"
+        };
+        let flip_direct = c.button(label, cx, y, 300.0, true);
+        y += 23.0 * s;
+        for line in [
+            "Oui : ton jeu se relie en direct aux joueurs qui l'ont mis à oui eux aussi (un peu moins de",
+            "retard). Eux voient alors ton adresse IP, et toi la leur ; quand ton PC sert une région, une",
+            "province ou un relais, ceux qui y jouent en direct savent que c'est toi. Pour tous les autres,",
+            "rien ne change : personne ne voit ton adresse. Pris en compte au prochain lancement du jeu.",
+        ] {
+            c.text_center(line, y, ds, if direct { WHITE } else { GREY });
+            y += 7.0 * ds;
+        }
         y += 14.0 * s;
         let done = c.button("Terminé", cx, (c.h * 0.78).max(y), 200.0, true);
+        if flip_direct {
+            self.options.host_direct = Some(!direct);
+            minelib_p2p::set_hosts_direct(Some(!direct));
+        }
         if flip_pass {
             self.options.passeur = Some(!pass);
             minelib_net::fast::set_passeur_allowed(!pass);
@@ -3971,7 +3994,13 @@ impl Game {
             self.options.receive_netlogs = !recv;
             minelib_relay::set_receive_logs(!recv);
         }
-        if flip_share || flip_recv || flip_pass || done || input.pressed(KeyCode::Escape) {
+        if flip_share
+            || flip_recv
+            || flip_pass
+            || flip_direct
+            || done
+            || input.pressed(KeyCode::Escape)
+        {
             if let Err(e) = self.options.save(&self.paths.options) {
                 log::error!("options : {e:#}");
             }

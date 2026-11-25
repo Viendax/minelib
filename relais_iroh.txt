@@ -1,0 +1,14 @@
+# Serveurs relais d'iroh de Minelib (v327) : le chemin de secours des connexions quand il
+# n'y a ni passeur ni lien direct. Sans eux, ce sont ceux de l'équipe d'iroh (gratuits mais
+# limités en débit : environ 45 Ko/s mesurés, prévus pour le développement).
+#
+# Une adresse par ligne, par exemple `https://203-0-113-7.sslip.io` : un serveur
+# `iroh-relay` (logiciel libre de l'équipe d'iroh) que l'on fait tourner soi-même, par
+# exemple sur une machine gratuite d'Oracle Cloud (voir deploiement/oracle-gratuit). Le jeu
+# les essaie au lancement (`/ping`, 2 secondes au plus) et ne garde que ceux qui
+# répondent ; s'il n'en reste aucun, il prend ceux de l'équipe d'iroh, comme avant.
+#
+# Ce que voit un tel serveur : l'adresse IP des jeux qui passent par lui, comme ceux de
+# l'équipe d'iroh aujourd'hui ; jamais le contenu (chiffré de bout en bout). Les joueurs,
+# eux, ne voient pas l'adresse les uns des autres. Aucune clé secrète : la liste est
+# compilée dans le jeu, comme relais_officiels.txt. Lignes vides et lignes « # » ignorées.

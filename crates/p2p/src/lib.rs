@@ -157,6 +157,97 @@ fn dht() -> Result<mainline::Dht> {
     Ok(g.clone().expect("DHT"))
 }
 
+/// (v327) Nos serveurs relais d'iroh (`relais_iroh.txt`, compilé dans le jeu ; la variable
+/// `MINELIB_RELAIS_IROH`, des adresses séparées par des virgules, les remplace) : le chemin
+/// de secours des connexions, à la place de ceux de l'équipe d'iroh, limités en débit.
+pub fn own_relay_urls() -> Vec<String> {
+    match std::env::var("MINELIB_RELAIS_IROH") {
+        Ok(v) => parse_relay_urls(&v.replace(',', "\n")),
+        Err(_) => parse_relay_urls(include_str!("../../../relais_iroh.txt")),
+    }
+}
+
+/// Une adresse `http(s)://…` par ligne ; lignes vides et « # » ignorées.
+pub fn parse_relay_urls(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("https://") || l.starts_with("http://"))
+        .map(|l| l.trim_end_matches('/').to_string())
+        .collect()
+}
+
+/// Ceux de `urls` qui répondent maintenant (`/ping`, `wait` au plus, tous en même temps).
+pub fn reachable_relays(urls: &[String], wait: Duration) -> Vec<String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .timeout_global(Some(wait))
+        .build()
+        .into();
+    let checks: Vec<_> = urls
+        .iter()
+        .map(|u| {
+            let (agent, u) = (agent.clone(), u.clone());
+            std::thread::spawn(move || {
+                let ok = agent
+                    .get(&format!("{u}/ping"))
+                    .call()
+                    .is_ok_and(|r| r.status().is_success());
+                (u, ok)
+            })
+        })
+        .collect();
+    checks
+        .into_iter()
+        .filter_map(|c| c.join().ok())
+        .filter(|(_, ok)| *ok)
+        .map(|(u, _)| u)
+        .collect()
+}
+
+/// (v327) Nos serveurs relais qui répondent, vérifiés au plus toutes les 10 minutes (chaque
+/// nœud du jeu ne les réinterroge pas).
+fn own_relays_up() -> Vec<iroh::RelayUrl> {
+    static UP: std::sync::Mutex<Option<(std::time::Instant, Vec<iroh::RelayUrl>)>> =
+        std::sync::Mutex::new(None);
+    let mut g = UP.lock().unwrap();
+    if let Some((t, v)) = g.as_ref() {
+        if t.elapsed() < Duration::from_secs(600) {
+            return v.clone();
+        }
+    }
+    let urls = own_relay_urls();
+    let up: Vec<iroh::RelayUrl> = if urls.is_empty() {
+        Vec::new()
+    } else {
+        reachable_relays(&urls, Duration::from_secs(2))
+            .into_iter()
+            .filter_map(|u| u.parse().ok())
+            .collect()
+    };
+    if !urls.is_empty() {
+        log::info!(
+            "serveurs relais d'iroh à nous : {} sur {} répondent{}",
+            up.len(),
+            urls.len(),
+            if up.is_empty() { " (ceux de l'équipe d'iroh à la place)" } else { "" }
+        );
+    }
+    *g = Some((std::time::Instant::now(), up.clone()));
+    up
+}
+
+/// (v327) Le dernier nœud créé passe-t-il par nos serveurs relais (rapides, sans limite d'un
+/// tiers) plutôt que par ceux de l'équipe d'iroh ?
+static OWN_IN_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn own_relays_in_use() -> bool {
+    OWN_IN_USE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// (v326) Le DHT de BitTorrent est-il permis à ce programme ? Seulement à une machine sans
 /// joueur (`minelib-relay`, relais ou passeur seul : `allow_dht`). Un jeu n'y parle jamais
 /// lui-même : les nœuds du DHT verraient l'adresse IP du joueur.
@@ -415,6 +506,11 @@ impl Node {
     }
 
     fn build_with(secret: Option<[u8; 32]>, private: bool, offline: bool) -> Result<Self> {
+        // (v327) Nos serveurs relais, s'ils répondent : à la place de ceux de l'équipe d'iroh.
+        let ours = if offline { Vec::new() } else { own_relays_up() };
+        if !offline {
+            OWN_IN_USE.store(!ours.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("iroh")
@@ -429,8 +525,11 @@ impl Node {
                     iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                         .relay_mode(iroh::RelayMode::Disabled)
                         .clear_address_lookup()
+                } else if ours.is_empty() {
+                    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                 } else {
                     iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                        .relay_mode(iroh::RelayMode::Custom(ours.iter().cloned().collect()))
                 };
                 let mut b = b
                     .alpns(vec![ALPN.to_vec()])
@@ -692,6 +791,39 @@ mod tests {
 
     /// (v279) Les relais écrits un par ligne se relisent ; une ligne fausse est ignorée, et
     /// la liste officielle compilée dans le jeu se lit sans erreur.
+    /// (v327) Nos serveurs relais : la liste compilée se lit (adresses seulement), et seuls
+    /// ceux qui répondent à `/ping` sont gardés.
+    #[test]
+    fn our_relay_servers_are_kept_only_when_they_answer() {
+        let urls = parse_relay_urls(
+            "# commentaire\n\nhttps://a.example/\n  http://127.0.0.1:9  \npas une adresse\n",
+        );
+        assert_eq!(urls, vec!["https://a.example", "http://127.0.0.1:9"]);
+        assert!(own_relay_urls().iter().all(|u| u.starts_with("http")));
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let up = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for c in l.incoming().flatten() {
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = r.read_line(&mut line);
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut c = c;
+                let status = if line.starts_with("GET /ping ") { "200 OK" } else { "404 Not Found" };
+                let _ = write!(c, "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            }
+        });
+        let down = "http://127.0.0.1:1".to_string();
+        let got = reachable_relays(&[down, up.clone()], Duration::from_secs(2));
+        assert_eq!(got, vec![up]);
+    }
+
     /// (v297, v301) Un hôte n'est joint en direct que si le joueur l'a demandé : jamais de
     /// lui-même, même quand sa box est ouverte (il porte alors ses tunnels comme passeur).
     #[test]

@@ -48,7 +48,9 @@ pub(crate) fn world_link_slow() -> bool {
     let Some(ad) = CHOSEN.lock().unwrap().clone() else {
         return false;
     };
-    minelib_p2p::node_direct(ad.node) == Some(false)
+    // (v327) Par nos serveurs relais d'iroh : rapide (pas la limite de ceux de l'équipe
+    // d'iroh).
+    minelib_p2p::node_direct(ad.node) == Some(false) && !minelib_p2p::own_relays_in_use()
 }
 
 /// Nœud iroh du jeu (un seul, gardé pour la durée du jeu). Son identité est gardée à côté
@@ -1561,6 +1563,10 @@ impl Accounts {
             || self.room_at.is_some_and(|t| t.elapsed() < Duration::from_secs(20))
             || self.move_next.is_some_and(|t| now < t)
             || !minelib_net::fast::passeurs_known()
+            // (v327) Par nos serveurs relais d'iroh, le lien est déjà rapide, et aucun joueur
+            // n'y voit l'adresse de personne : pas de passeur (un joueur volontaire, qui verrait
+            // la sienne) pour ce lien.
+            || minelib_p2p::own_relays_in_use()
         {
             return None;
         }

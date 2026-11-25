@@ -1,4 +1,5 @@
-# Relais officiels de Minelib (v279) : essayés avant tout autre, sans passer par le DHT.
+# Relais officiels de Minelib (v279) : essayés avant tout autre, sans passer par la liste
+# ouverte des relais (v326 : chez les relais pkarr ; avant, dans le DHT de BitTorrent).
 #
 # Un relais par ligne : <nœud iroh, 64 caractères hexadécimaux> <clé du canal chiffré, 64
 # caractères hexadécimaux> <nom>. `minelib-relay` écrit cette ligne toute faite à son
@@ -8,5 +9,4 @@
 #
 # Cette liste est compilée dans le jeu : c'est la publication d'une version qui fait foi,
 # il n'y a aucune clé secrète à garder. Tant qu'elle est vide, le jeu fait comme avant
-# (relais déjà utilisés, puis liste ouverte du DHT), et n'importe quel PC peut devenir un
-# relais.
+# (relais déjà utilisés, puis liste ouverte), et n'importe quel PC peut devenir un relais.

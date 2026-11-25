@@ -1,0 +1,20 @@
+# Passeur sans joueur (une machine toujours allumée). Remplacer <IP_PUBLIQUE> par l'adresse
+# publique de cette machine et <LIGNE_DU_RELAIS> par la ligne que le relais écrit à son
+# lancement (« Ligne pour relais_officiels.txt : … »).
+[Unit]
+Description=Passeur Minelib
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=minelib
+# Nos serveurs relais d'iroh, sans attendre une version du jeu qui les connaît
+# (relais_iroh.txt) : remplacer les deux noms, ou supprimer la ligne.
+Environment=MINELIB_RELAIS_IROH=https://<nom>1.duckdns.org,https://<nom>2.duckdns.org
+WorkingDirectory=/var/lib/minelib
+ExecStart=/opt/minelib/minelib-relay --passeur --dir /var/lib/minelib/passeur_data --ip <IP_PUBLIQUE> --port 40000 --relais "<LIGNE_DU_RELAIS>"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
