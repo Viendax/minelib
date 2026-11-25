@@ -167,6 +167,16 @@ pub enum Cmd {
     /// (v320) Silence complet du relais au-delà duquel on le tient pour perdu (lien par
     /// des passeurs : plus long).
     Patience(Duration),
+    /// (v326) Nouveau monde de construction qui fait place en supprimant le monde `replace`
+    /// (celui que dit `Event::WorldLimit`), avec le code de double authentification si le
+    /// compte en a une.
+    HostReplacing {
+        name: String,
+        map: String,
+        map_sig: [u8; 32],
+        replace: String,
+        code: Option<u32>,
+    },
     /// (v325) Réveille le monde endormi `world` (son entrée dans la liste) : il garde son
     /// créateur, ses OP, ses bannis, sa liste blanche ; son contenu est la copie en ligne
     /// de ce jeu (`map_sig`), jamais une version solo.
@@ -341,6 +351,14 @@ pub enum Event {
     World(String),
     /// (v325) Le relais n'a pas ouvert (ou pas réveillé) ce monde de construction : pourquoi.
     HostRefused(String),
+    /// (v326) Ce nouveau monde ne s'ouvre qu'en supprimant le plus ancien monde endormi du
+    /// joueur (`world`, nommé `name`), qu'il confirme (`Cmd::HostReplacing`) ; `totp` : avec
+    /// un code de double authentification.
+    WorldLimit {
+        world: String,
+        name: String,
+        totp: bool,
+    },
     Joined {
         room: u64,
         host: String,
@@ -2074,13 +2092,50 @@ impl Worker {
                 map_sig,
                 max_players,
                 wake: String::new(),
+                replace: String::new(),
+                code: None,
             })? {
                 Response::Hosted { room, world } => {
                     self.emit_world(world);
                     self.emit(Event::Hosted(room));
                     Ok(())
                 }
+                Response::WorldLimit { world, name, totp } => {
+                    self.emit(Event::WorldLimit { world, name, totp });
+                    Ok(())
+                }
                 Response::Error { code, message } if kind == 1 => {
+                    self.emit(Event::HostRefused(error_text(code, &message)));
+                    Ok(())
+                }
+                r => self.unexpected(r),
+            },
+            Cmd::HostReplacing {
+                name,
+                map,
+                map_sig,
+                replace,
+                code,
+            } => match self.request(&Request::Host {
+                kind: 1,
+                name,
+                map,
+                map_sig,
+                max_players: 0,
+                wake: String::new(),
+                replace,
+                code,
+            })? {
+                Response::Hosted { room, world } => {
+                    self.emit_world(world);
+                    self.emit(Event::Hosted(room));
+                    Ok(())
+                }
+                Response::WorldLimit { world, name, totp } => {
+                    self.emit(Event::WorldLimit { world, name, totp });
+                    Ok(())
+                }
+                Response::Error { code, message } => {
                     self.emit(Event::HostRefused(error_text(code, &message)));
                     Ok(())
                 }
@@ -2098,6 +2153,8 @@ impl Worker {
                 map_sig,
                 max_players: 0,
                 wake: world,
+                replace: String::new(),
+                code: None,
             })? {
                 Response::Hosted { room, world } => {
                     self.emit_world(world);

@@ -14,6 +14,10 @@ minelib-net = { path = "../net" }
 n0-watcher = "1"
 noq-udp = "1.4"
 mainline = "8"
+# (v326) Rendez-vous par les relais pkarr (HTTPS) : le jeu ne parle plus au DHT lui-même.
+iroh-dns = "1.4.1"
+ureq = { version = "3", features = ["platform-verifier"] }
+data-encoding = "2"
 # Ouverture d'un port sur la box (passeurs de la voie rapide) : déjà là avec iroh.
 portmapper = "0.19"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }

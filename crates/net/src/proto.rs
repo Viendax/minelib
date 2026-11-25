@@ -78,7 +78,13 @@ use serde::{Deserialize, Serialize};
 /// ligne (`game::BuildMsg::CarpetPut`, `Carpet`, en fin d'énumération).
 /// (v325, toujours 75) `Host::wake`, `Hosted::world`, `Joined::world`, `ServerEntry::world`
 /// et `ServerEntry::creator`.
+/// (v326, toujours 75) `Host::replace`, `Host::code` et `Response::WorldLimit`.
 pub const PROTOCOL: u32 = 75;
+
+/// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
+/// monde ne s'ouvre qu'en supprimant son plus ancien monde endormi, ce que le joueur
+/// confirme (`Response::WorldLimit`).
+pub const WORLDS_PER_CREATOR: usize = 20;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -339,6 +345,12 @@ pub enum Request {
         /// ou celui qui en garde le dernier état. Vide : un nouveau monde, même si ce monde
         /// solo a déjà été ouvert en ligne (chaque monde en ligne a sa propre copie).
         wake: String,
+        /// (v326) Un nouveau monde alors que son créateur en a déjà `mondes::PER_CREATOR` :
+        /// le monde que le joueur a accepté de supprimer pour lui faire place (celui que dit
+        /// `Response::WorldLimit`), et le code de double authentification si son compte en a
+        /// une (la même protection que `DeleteWorld`). Vide : aucun.
+        replace: String,
+        code: Option<u32>,
     },
     /// Mode FPS : cherche une partie en attente sur cette carte (compatible : personne
     /// qu'on a signalé, réputation proche) ; sans résultat, en ouvre une dont on est l'hôte.
@@ -1260,6 +1272,15 @@ pub enum Response {
     Hosted {
         room: u64,
         world: String,
+    },
+    /// (v326) Réponse à un nouveau monde quand son créateur en a déjà le nombre permis : pour
+    /// l'ouvrir, son plus ancien monde endormi (`world`, nommé `name`) doit être supprimé, ce
+    /// que le joueur confirme (`Request::Host::replace`), avec un code si son compte a la
+    /// double authentification (`totp`). Rien n'est ouvert ni supprimé.
+    WorldLimit {
+        world: String,
+        name: String,
+        totp: bool,
     },
     Joined {
         room: u64,

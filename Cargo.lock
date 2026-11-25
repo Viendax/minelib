@@ -2850,8 +2850,10 @@ name = "minelib-p2p"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "data-encoding",
  "iroh",
  "iroh-base",
+ "iroh-dns",
  "log",
  "mainline",
  "minelib-net",
@@ -2862,6 +2864,7 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "tokio",
+ "ureq",
 ]
 
 [[package]]

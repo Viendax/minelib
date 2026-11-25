@@ -176,6 +176,9 @@ enum Screen {
     Advanced,
     /// (v311) `/deleteworld` : le créateur confirme la suppression de son monde.
     DeleteWorld,
+    /// (v326) Un nouveau monde en ligne, à la limite : confirmer la suppression du plus ancien
+    /// monde endormi.
+    WorldLimit,
     /// Conversion d'un monde Minecraft en cours (une image affichée avant de bloquer).
     Loading,
     Playing,
@@ -256,6 +259,37 @@ struct Hosting {
     /// Le monde à envoyer au relais une fois ouvert (signature, nom, paquet) : rien ne part
     /// pour une ouverture refusée.
     upload: ([u8; 32], String, Vec<u8>),
+    /// (v326) Le monde endormi supprimé pour faire place à celui-ci (sa copie sur ce PC est
+    /// effacée une fois celui-ci ouvert).
+    replaced: Option<String>,
+}
+
+/// (v326) Comment ouvrir un monde en ligne.
+enum Open {
+    /// Un nouveau serveur.
+    New,
+    /// Un nouveau serveur qui fait place en supprimant le monde endormi `world` (confirmé ;
+    /// `code` : double authentification).
+    Replacing { world: String, code: Option<u32> },
+    /// Le monde endormi `world` réveillé, sous son nom `title`.
+    Wake { title: String, world: String },
+}
+
+/// (v326) Nouveau monde à la limite : ce que le relais demande de confirmer.
+struct LimitAsk {
+    /// La copie qui attend d'être ouverte, faite pour cette ouverture ou non, et sa carte.
+    dir: PathBuf,
+    fresh: bool,
+    map: String,
+    /// Le monde endormi qui ferait place (clé, nom), avec un code de double
+    /// authentification (`totp`) ; le code tapé, et s'il vient d'être refusé.
+    world: String,
+    name: String,
+    totp: bool,
+    code: String,
+    wrong: bool,
+    /// Un code est parti avec la dernière confirmation.
+    sent_code: bool,
 }
 
 struct Game {
@@ -313,6 +347,8 @@ struct Game {
     /// (v325) Réveil d'un monde par son créateur alors qu'un autre en garde le dernier état :
     /// le deuxième clic (même monde, peu après) le confirme.
     wake_confirm: Option<(String, f32)>,
+    /// (v326) Nouveau monde à la limite : la confirmation demandée.
+    limit_ask: Option<LimitAsk>,
     fps_status: Option<String>,
     /// Mise à jour automatique (GitHub).
     updater: update::Updater,
@@ -543,6 +579,7 @@ impl Game {
             world_key: None,
             hosting: None,
             wake_confirm: None,
+            limit_ask: None,
             fps_status: None,
             updater: update::Updater::new(),
             was_playing: false,
@@ -1545,6 +1582,7 @@ impl Game {
                 // (v325) Monde pas ouvert (ou pas réveillé) : on n'y reste pas ; une copie
                 // toute neuve, où l'on n'a rien fait, est oubliée.
                 Event::HostRefused(m) => {
+                    self.limit_ask = None;
                     if let Some(h) = self.hosting.take() {
                         if self.session.as_ref().is_some_and(|s| s.dir == h.dir) {
                             self.session = None;
@@ -1560,8 +1598,41 @@ impl Game {
                     }
                     self.notify(m.clone());
                 }
+                // (v326) Ce nouveau monde ne s'ouvre qu'en supprimant le plus ancien endormi :
+                // on n'y reste pas, la copie attend la confirmation du joueur.
+                Event::WorldLimit { world, name, totp } => {
+                    if let Some(h) = self.hosting.take() {
+                        if self.session.as_ref().is_some_and(|s| s.dir == h.dir) {
+                            self.session = None;
+                            self.clear_meshes = true;
+                            self.current_room = None;
+                            self.world_key = None;
+                        }
+                        let again = self.limit_ask.take();
+                        let wrong = again
+                            .as_ref()
+                            .is_some_and(|a| a.sent_code && a.world == *world);
+                        self.limit_ask = Some(LimitAsk {
+                            dir: h.dir,
+                            fresh: h.fresh,
+                            map: h.upload.1,
+                            world: world.clone(),
+                            name: name.clone(),
+                            totp: *totp,
+                            code: String::new(),
+                            wrong,
+                            sent_code: false,
+                        });
+                        self.screen = Screen::WorldLimit;
+                    }
+                }
                 Event::Hosted(room) => {
                     self.current_room = Some(*room);
+                    // (v326) Le monde supprimé pour faire place : sa copie sur ce PC aussi.
+                    if let Some(old) = self.hosting.as_ref().and_then(|h| h.replaced.clone()) {
+                        online_copies::forget(&self.paths.root, &self.accounts.relay_hex(), &old);
+                    }
+                    self.limit_ask = None;
                     // (v325) Monde ouvert (ou réveillé) : sa météo (celle qu'un OP y a
                     // imposée, gardée par le relais), et le monde pour ceux qui le rejoignent.
                     if let Some(h) = self.hosting.take() {
@@ -2822,7 +2893,7 @@ impl Game {
                 return;
             }
         };
-        self.host_online(dir, true, name, None);
+        self.host_online(dir, true, name, Open::New);
     }
 
     /// (v325) Réveille le monde endormi `e` (son entrée dans la liste), joué dans sa copie :
@@ -2890,7 +2961,15 @@ impl Game {
             }
         };
         log::info!("réveil du monde {} depuis {}", e.world, dir.display());
-        self.host_online(dir, fresh, e.map.clone(), Some((e.name.clone(), e.world.clone())));
+        self.host_online(
+            dir,
+            fresh,
+            e.map.clone(),
+            Open::Wake {
+                title: e.name.clone(),
+                world: e.world.clone(),
+            },
+        );
     }
 
     /// (v325) Propriétaire d'un monde en ligne qui s'en va : sa copie (`dir`) en garde le
@@ -2911,15 +2990,9 @@ impl Game {
     }
 
     /// (v325) Ouvre en ligne le monde joué dans `dir` (sa copie en ligne ; `fresh` : faite
-    /// à l'instant), sous le nom de carte `map`. `wake` : le monde endormi qu'on réveille
-    /// (son nom dans la liste, sa clé) ; sans lui, un nouveau serveur.
-    fn host_online(
-        &mut self,
-        dir: PathBuf,
-        fresh: bool,
-        name: String,
-        wake: Option<(String, String)>,
-    ) {
+    /// à l'instant), sous le nom de carte `name` : un nouveau serveur, ou (`how`) le monde
+    /// endormi qu'on réveille, ou (v326) un nouveau serveur qui fait place à la limite.
+    fn host_online(&mut self, dir: PathBuf, fresh: bool, name: String, how: Open) {
         // (Rien d'ouvert : une copie faite pour cette ouverture ne sert à rien.)
         let drop_fresh = |root: &std::path::Path, dir: &std::path::Path| {
             if fresh && online_copies::is_copy(root, dir) {
@@ -2949,6 +3022,10 @@ impl Game {
             dir,
             fresh,
             upload: (sig, name.clone(), p.to_bytes()),
+            replaced: match &how {
+                Open::Replacing { world, .. } => Some(world.clone()),
+                _ => None,
+            },
         });
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
@@ -2963,19 +3040,26 @@ impl Game {
             b.set_origin(s.world.origin_blocks());
             s.build = Some(b);
         }
-        self.accounts.room(match wake {
-            Some((title, world)) => minelib_net::client::Cmd::WakeWorld {
+        self.accounts.room(match how {
+            Open::Wake { title, world } => minelib_net::client::Cmd::WakeWorld {
                 name: title,
                 map: name.clone(),
                 map_sig: sig,
                 world,
             },
-            None => minelib_net::client::Cmd::Host {
+            Open::New => minelib_net::client::Cmd::Host {
                 kind: 1,
                 name: format!("{name} ({pseudo})"),
                 map: name.clone(),
                 map_sig: sig,
                 max_players: 0,
+            },
+            Open::Replacing { world, code } => minelib_net::client::Cmd::HostReplacing {
+                name: format!("{name} ({pseudo})"),
+                map: name.clone(),
+                map_sig: sig,
+                replace: world,
+                code,
             },
         });
         // (v229) La météo du serveur, et le monde (pour ceux qui le rejoignent, pas pour la
@@ -3688,10 +3772,12 @@ impl Game {
         c.text_center("Supprimer ce monde ?", c.h * 0.2, s * 2.0, WHITE);
         let cx = c.w / 2.0;
         let mut y = c.h * 0.32;
+        // (v326) La copie en ligne de ceux qui y sont est effacée (v325) : dit ici.
         for line in [
             "Tous ses joueurs en sortent, et le relais oublie ses OP, ses bannis, sa liste blanche",
-            "et les positions de ses joueurs. C'est définitif. Les copies du monde enregistrées",
-            "sur les PC (la tienne aussi) ne sont pas touchées.",
+            "et les positions de ses joueurs. C'est définitif. La copie en ligne de ceux qui y sont",
+            "(la tienne aussi) est effacée ; ton monde solo d'origine n'est pas touché. Pour en",
+            "garder une copie dans tes mondes solo : « Télécharger la carte » (menu Échap), avant.",
         ] {
             c.text_center(line, y, ds, GREY);
             y += 7.0 * ds;
@@ -3727,6 +3813,83 @@ impl Game {
         } else if cancel || input.pressed(KeyCode::Escape) {
             self.delete_code.clear();
             self.screen = Screen::Playing;
+        }
+    }
+
+    /// (v326) Nouveau monde en ligne alors que le joueur en a déjà le nombre permis : il
+    /// confirme la suppression de son plus ancien monde endormi, avec la même protection que
+    /// `/deleteworld` (un code si son compte a la double authentification). Le relais vérifie.
+    fn world_limit_screen(&mut self, input: &Input, size: (u32, u32)) {
+        let Some(ask) = &mut self.limit_ask else {
+            self.screen = Screen::Servers(multiplayer::Kind::Build);
+            return;
+        };
+        let time = self.time;
+        if ask.totp {
+            menu::edit_text(&mut ask.code, input, 6);
+            ask.code.retain(|c| c.is_ascii_digit());
+        }
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        c.background();
+        let s = c.s;
+        let ds = (s / 2.0).floor().max(1.0);
+        let title = format!(
+            "Tu as déjà {} mondes en ligne",
+            minelib_net::proto::WORLDS_PER_CREATOR
+        );
+        c.text_center(&title, c.h * 0.2, s * 2.0, WHITE);
+        let cx = c.w / 2.0;
+        let mut y = c.h * 0.32;
+        let first = format!(
+            "Pour ouvrir celui-ci, ton plus ancien monde endormi, « {} », est supprimé :",
+            ask.name
+        );
+        for line in [
+            first.as_str(),
+            "le relais oublie ses OP, ses bannis, sa liste blanche et les positions de ses joueurs,",
+            "et sa copie en ligne sur ce PC est effacée. C'est définitif. Ton monde solo d'origine",
+            "n'est pas touché. (Pour garder ce monde-là, réveille-le plutôt, et ferme-en un autre.)",
+        ] {
+            c.text_center(line, y, ds, GREY);
+            y += 7.0 * ds;
+        }
+        y += 22.0 * s;
+        if ask.totp {
+            c.text_field(
+                "Code de double authentification",
+                &ask.code,
+                "6 chiffres",
+                cx,
+                y,
+                120.0,
+                true,
+                time,
+            );
+            if ask.wrong {
+                c.text_center("Code refusé : réessaie.", y + 14.0 * s, ds, RED);
+            }
+            y += 30.0 * s;
+        }
+        let ready = !ask.totp || ask.code.len() == 6;
+        let label = format!("Supprimer « {} » et ouvrir", ask.name);
+        let confirm = c.button(&label, cx, y, 260.0, ready);
+        y += 24.0 * s;
+        let cancel = c.button("Annuler", cx, y, 260.0, true);
+        if confirm {
+            let code = ask.code.parse::<u32>().ok().filter(|_| ask.totp);
+            ask.sent_code = code.is_some();
+            ask.code.clear();
+            let (dir, fresh, map, world) =
+                (ask.dir.clone(), ask.fresh, ask.map.clone(), ask.world.clone());
+            self.host_online(dir, fresh, map, Open::Replacing { world, code });
+        } else if cancel || input.pressed(KeyCode::Escape) {
+            if let Some(ask) = self.limit_ask.take() {
+                if ask.fresh && online_copies::is_copy(&self.paths.root, &ask.dir) {
+                    let _ = std::fs::remove_dir_all(&ask.dir);
+                }
+            }
+            self.screen = Screen::Servers(multiplayer::Kind::Build);
+            self.accounts.refresh_servers(multiplayer::Kind::Build as u8);
         }
     }
 
@@ -5218,6 +5381,7 @@ impl GameLoop for Game {
                 Screen::Servers(kind) => self.servers_screen(input, size, kind),
                 Screen::Account(page) => self.account_screen(input, size, page),
                 Screen::HostPick => self.host_pick_screen(input, size),
+                Screen::WorldLimit => self.world_limit_screen(input, size),
                 Screen::FpsHome => self.fps_home_screen(input, size),
                 Screen::SoloMaps => self.solo_maps_screen(input, size),
                 Screen::Playing | Screen::Paused => self.screen = Screen::Title,

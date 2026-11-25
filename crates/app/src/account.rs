@@ -218,7 +218,7 @@ fn reachable_relay(
                 );
             } else if found.is_none() {
                 log::info!(
-                    "relais « {} » du DHT injoignable (nœud {}) : écarté",
+                    "relais « {} » de la liste injoignable (nœud {}) : écarté",
                     ad.name,
                     crypto::hex(&ad.node[..8])
                 );
@@ -330,11 +330,11 @@ fn auto_relay(
     let (found, list) = match dht_rx.recv_timeout(left) {
         Ok((n, Ok(list))) => (n, list),
         Ok((n, Err(e))) => {
-            log::warn!("DHT : {e:#}");
+            log::warn!("liste des relais : {e:#}");
             (n, Vec::new())
         }
         Err(_) => {
-            log::warn!("DHT : pas de réponse à temps");
+            log::warn!("liste des relais : pas de réponse à temps");
             (None, Vec::new())
         }
     };
@@ -366,7 +366,7 @@ fn auto_relay(
         }
         if let Some((addr, ad)) = listed {
             log::info!(
-                "relais « {} » trouvé dans le DHT (nœud {}), en {:.1} s",
+                "relais « {} » trouvé dans la liste des relais (nœud {}), en {:.1} s",
                 ad.name,
                 crypto::hex(&ad.node[..8]),
                 t0.elapsed().as_secs_f32()
@@ -1319,6 +1319,7 @@ impl Accounts {
                 e @ (Event::Hosted(_)
                 | Event::World(_)
                 | Event::HostRefused(_)
+                | Event::WorldLimit { .. }
                 | Event::Reported(_)
                 | Event::Unreported(_)
                 | Event::BanDone(_)

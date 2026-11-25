@@ -21,8 +21,10 @@ use serde::{Deserialize, Serialize};
 /// Ouvertures de partie ou de monde acceptées d'un compte pendant `OPENS_WINDOW`.
 const OPENS: usize = 8;
 const OPENS_WINDOW: Duration = Duration::from_secs(600);
-/// Mondes endormis gardés pour un même créateur (les plus anciens sont oubliés au-delà).
-const PER_CREATOR: usize = 20;
+/// Mondes (ouverts ou endormis) d'un même créateur. (v326) Au-delà, un nouveau monde ne
+/// s'ouvre qu'en supprimant son plus ancien monde endormi, ce que le joueur confirme avec la
+/// même protection que `/deleteworld` (avant, le plus ancien était oublié sans rien dire).
+pub const PER_CREATOR: usize = minelib_net::proto::WORLDS_PER_CREATOR;
 /// Mondes endormis montrés dans la liste, au plus.
 pub const SLEEPING_SHOWN: usize = 100;
 
@@ -89,17 +91,54 @@ impl Store {
 
     /// Ce compte peut-il ouvrir une partie ou un monde maintenant ? Sinon : dans combien
     /// de secondes. (Chaque ouverture acceptée compte.)
+    #[cfg(test)]
     pub fn may_open(&mut self, pseudo: &str) -> Result<(), u64> {
+        if let Some(wait) = self.open_wait(pseudo) {
+            return Err(wait);
+        }
+        self.note_open(pseudo);
+        Ok(())
+    }
+
+    /// (v326) Secondes à attendre avant une nouvelle ouverture (`None` : tout de suite), sans
+    /// la compter : une ouverture qui demande d'abord une confirmation ne compte qu'une fois.
+    pub fn open_wait(&mut self, pseudo: &str) -> Option<u64> {
         let q = self.opens.entry(pseudo.to_ascii_lowercase()).or_default();
         while q.front().is_some_and(|t| t.elapsed() >= OPENS_WINDOW) {
             q.pop_front();
         }
-        if q.len() >= OPENS {
+        (q.len() >= OPENS).then(|| {
             let wait = OPENS_WINDOW.saturating_sub(q.front().map_or(OPENS_WINDOW, |t| t.elapsed()));
-            return Err(wait.as_secs().max(1));
-        }
-        q.push_back(Instant::now());
-        Ok(())
+            wait.as_secs().max(1)
+        })
+    }
+
+    /// (v326) Une ouverture faite (voir `open_wait`).
+    pub fn note_open(&mut self, pseudo: &str) {
+        self.opens
+            .entry(pseudo.to_ascii_lowercase())
+            .or_default()
+            .push_back(Instant::now());
+    }
+
+    /// (v326) `creator` a déjà `PER_CREATOR` mondes, ouverts ou endormis : un nouveau monde ne
+    /// s'ouvre qu'en en supprimant un.
+    pub fn full(&self, creator: &str) -> bool {
+        self.worlds
+            .values()
+            .filter(|w| w.creator.eq_ignore_ascii_case(creator))
+            .count()
+            >= PER_CREATOR
+    }
+
+    /// (v326) Le monde endormi de `creator` le moins récemment actif (clé, nom) : celui qui
+    /// fait place à un nouveau, si son créateur le confirme.
+    pub fn oldest_asleep(&self, creator: &str) -> Option<(String, String)> {
+        self.worlds
+            .values()
+            .filter(|w| w.asleep.is_some() && w.creator.eq_ignore_ascii_case(creator))
+            .min_by(|a, b| a.active.cmp(&b.active).then(a.key.cmp(&b.key)))
+            .map(|w| (w.key.clone(), w.name.clone()))
     }
 
     /// (v325) `pseudo` réveille le monde endormi `key` (son entrée dans la liste) : il en
@@ -151,18 +190,8 @@ impl Store {
         w.asleep = None;
         w.active = t;
         w.keeper = keeper.to_string();
-        // Pas plus de `PER_CREATOR` mondes endormis par créateur.
-        let mut mine: Vec<(u64, String)> = self
-            .worlds
-            .values()
-            .filter(|x| x.asleep.is_some() && x.creator.eq_ignore_ascii_case(creator))
-            .map(|x| (x.active, x.key.clone()))
-            .collect();
-        mine.sort();
-        let extra = mine.len().saturating_sub(PER_CREATOR);
-        for (_, k) in mine.into_iter().take(extra) {
-            self.worlds.remove(&k);
-        }
+        // (v326) Plus rien n'est oublié ici sans le dire : au-delà de `PER_CREATOR`, c'est
+        // le joueur qui confirme la suppression d'un monde (`full`, `oldest_asleep`).
         self.save();
     }
 
@@ -608,16 +637,165 @@ mod tests {
         assert!(st.worlds.get("anacode/coffre").is_none() && st.rooms.is_empty());
     }
 
-    /// Un créateur ne garde pas plus de vingt mondes endormis.
+    /// (v326) À vingt mondes, un nouveau monde ne s'ouvre qu'en supprimant le plus ancien
+    /// endormi, confirmé par le joueur, avec un code valable si son compte a la double
+    /// authentification : rien n'est supprimé avant. Vingt mondes ouverts : refusé.
     #[test]
-    fn a_creator_keeps_a_bounded_number_of_sleeping_worlds() {
+    fn at_the_limit_a_new_world_replaces_the_oldest_only_once_confirmed() {
+        use crate::{start, Config};
+        use minelib_net::client::{Client, Cmd, Event};
+        use minelib_net::totp;
+        let dir = std::env::temp_dir().join(format!("minelib-monde4-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir,
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let wait = |c: &Client, pred: &dyn Fn(&Event) -> bool| -> Event {
+            let t = Instant::now();
+            loop {
+                if let Some(e) = c.poll() {
+                    if pred(&e) {
+                        return e;
+                    }
+                }
+                assert!(t.elapsed() < Duration::from_secs(30), "délai dépassé");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let login = |pseudo: &str| {
+            let c = Client::spawn(h.addr.to_string(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, &|e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let fill = |creator: &str, asleep: bool| {
+            let mut st = h.state.lock().unwrap();
+            for i in 0..PER_CREATOR {
+                let key = format!("{}/m{i}", creator.to_ascii_lowercase());
+                st.worlds
+                    .opened(&key, &format!("Monde {i}"), &format!("m{i}"), creator, creator);
+                if asleep {
+                    st.worlds.asleep(&key, creator);
+                }
+                st.worlds.worlds.get_mut(&key).unwrap().active = 1_000 + i as u64;
+            }
+        };
+        let host = |c: &Client, replace: &str, code: Option<u32>| -> Event {
+            if replace.is_empty() {
+                c.send(Cmd::Host {
+                    kind: 1,
+                    name: "Neuf".into(),
+                    map: "neuf".into(),
+                    map_sig: [7; 32],
+                    max_players: 0,
+                });
+            } else {
+                c.send(Cmd::HostReplacing {
+                    name: "Neuf".into(),
+                    map: "neuf".into(),
+                    map_sig: [7; 32],
+                    replace: replace.into(),
+                    code,
+                });
+            }
+            wait(c, &|e| {
+                matches!(
+                    e,
+                    Event::WorldLimit { .. } | Event::Hosted(_) | Event::HostRefused(_)
+                )
+            })
+        };
+        let ana = login("AnaPlein");
+        ana.send(Cmd::TotpBegin);
+        let secret = match wait(&ana, &|e| matches!(e, Event::TotpSecret { .. })) {
+            Event::TotpSecret { secret, .. } => secret,
+            _ => unreachable!(),
+        };
+        let step = totp::now_step();
+        ana.send(Cmd::TotpConfirm(totp::code(&secret, step - 1)));
+        wait(&ana, &|e| matches!(e, Event::TotpOn));
+        fill("AnaPlein", true);
+        // Sans confirmation : le relais dit lequel ferait place, et qu'il faut un code.
+        match host(&ana, "", None) {
+            Event::WorldLimit { world, name, totp } => {
+                assert_eq!(
+                    (world.as_str(), name.as_str(), totp),
+                    ("anaplein/m0", "Monde 0", true)
+                );
+            }
+            e => panic!("{e:?}"),
+        }
+        // Confirmé sans code, avec un faux code, ou pour un autre monde : rien.
+        assert!(matches!(host(&ana, "anaplein/m0", None), Event::WorldLimit { .. }));
+        let wrong = (totp::code(&secret, step + 1) + 1) % 1_000_000;
+        let e = host(&ana, "anaplein/m0", Some(wrong));
+        assert!(matches!(e, Event::WorldLimit { .. }), "{e:?}");
+        let good = totp::code(&secret, step + 1);
+        assert!(matches!(host(&ana, "anaplein/m5", Some(good)), Event::WorldLimit { .. }));
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.worlds.sleeping().len(), PER_CREATOR);
+            assert!(st.rooms.is_empty() && st.worlds.get("anaplein/neuf").is_none());
+        }
+        // Confirmé, avec un code valable : le plus ancien est supprimé, le nouveau s'ouvre.
+        assert!(matches!(host(&ana, "anaplein/m0", Some(good)), Event::Hosted(_)));
+        {
+            let st = h.state.lock().unwrap();
+            assert!(st.worlds.get("anaplein/m0").is_none());
+            assert!(st.worlds.get("anaplein/m1").is_some());
+            assert!(st.worlds.get("anaplein/neuf").is_some() && st.worlds.full("AnaPlein"));
+        }
+        // Sans double authentification : la confirmation suffit. Vingt mondes ouverts : refusé.
+        let bob = login("BobPlein");
+        fill("BobPlein", false);
+        match host(&bob, "", None) {
+            Event::HostRefused(m) => assert!(m.contains("ouverts"), "{m}"),
+            e => panic!("{e:?}"),
+        }
+        h.state.lock().unwrap().worlds.asleep("bobplein/m3", "BobPlein");
+        match host(&bob, "", None) {
+            Event::WorldLimit { world, totp, .. } => {
+                assert_eq!((world.as_str(), totp), ("bobplein/m3", false));
+            }
+            e => panic!("{e:?}"),
+        }
+        assert!(matches!(host(&bob, "bobplein/m3", None), Event::Hosted(_)));
+        assert!(h.state.lock().unwrap().worlds.get("bobplein/m3").is_none());
+    }
+
+    /// (v326) Le registre n'oublie plus de monde sans le dire : à vingt mondes, il le dit
+    /// (`full`) et désigne le plus ancien endormi, celui qui ferait place ; une ouverture
+    /// qui attend une confirmation ne compte pas comme une ouverture.
+    #[test]
+    fn at_twenty_worlds_the_registry_names_the_oldest_and_forgets_nothing() {
         let mut s = store();
-        for i in 0..PER_CREATOR + 5 {
+        for i in 0..PER_CREATOR - 1 {
             let key = format!("ana/m{i}");
             s.opened(&key, "M", &format!("m{i}"), "Ana", "Ana");
             s.asleep(&key, "Ana");
+            s.worlds.get_mut(&key).unwrap().active = 1_000 + i as u64;
         }
-        s.opened("ana/dernier", "D", "dernier", "Ana", "Ana");
-        assert_eq!(s.sleeping().len(), PER_CREATOR);
+        assert!(!s.full("ana"));
+        s.opened("ana/ouvert", "O", "ouvert", "Ana", "Ana");
+        assert!(s.full("ANA") && !s.full("Bob"));
+        assert_eq!(s.oldest_asleep("ana"), Some(("ana/m0".into(), "M".into())));
+        for i in 0..5 {
+            let key = format!("ana/plus{i}");
+            s.opened(&key, "P", "plus", "Ana", "Ana");
+            s.asleep(&key, "Ana");
+        }
+        assert_eq!(s.sleeping().len(), PER_CREATOR + 4, "rien d'oublié sans le dire");
+        assert_eq!(s.oldest_asleep("Zoe"), None);
+        for _ in 0..OPENS {
+            assert!(s.open_wait("Spam").is_none());
+            s.note_open("Spam");
+        }
+        assert!(s.open_wait("spam").is_some() && s.open_wait("Autre").is_none());
     }
 }

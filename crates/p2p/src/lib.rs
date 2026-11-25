@@ -18,6 +18,7 @@ use std::time::Duration;
 
 pub mod passeur;
 pub mod portmap;
+pub mod rendezvous;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,15 @@ pub fn decode_ads(bytes: &[u8]) -> Vec<Ad> {
     v.retain(|a| a.seen + STALE_S > t);
     v.sort_by_key(|a| a.since);
     v
+}
+
+/// (v326) Liste mise à jour avec ce relais : les plus anciens d'abord, `MAX_ADS` au plus.
+pub fn updated(mut list: Vec<Ad>, me: Ad) -> Vec<Ad> {
+    list.retain(|a| a.node != me.node);
+    list.push(me);
+    list.sort_by_key(|a| a.since);
+    list.truncate(MAX_ADS);
+    list
 }
 
 /// Liste mise à jour avec ce relais.
@@ -147,20 +157,57 @@ fn dht() -> Result<mainline::Dht> {
     Ok(g.clone().expect("DHT"))
 }
 
-/// Lit la liste des relais dans le DHT (quelques secondes).
-#[allow(deprecated)]
+/// (v326) Le DHT de BitTorrent est-il permis à ce programme ? Seulement à une machine sans
+/// joueur (`minelib-relay`, relais ou passeur seul : `allow_dht`). Un jeu n'y parle jamais
+/// lui-même : les nœuds du DHT verraient l'adresse IP du joueur.
+static DHT_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// (v326) Permet le DHT de BitTorrent, en plus des relais pkarr : pour `minelib-relay`.
+pub fn allow_dht() {
+    DHT_ALLOWED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn dht_allowed() -> bool {
+    DHT_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lit la liste des relais (quelques secondes). (v326) Par les relais pkarr (HTTPS) : le DHT
+/// de BitTorrent n'est lu directement que par une machine sans joueur (`allow_dht`), quand
+/// ils ne répondent pas.
 pub fn find_relays() -> Result<Vec<Ad>> {
+    match rendezvous::fetch() {
+        Ok(list) => Ok(list),
+        Err(e) if dht_allowed() => {
+            log::info!("rendez-vous : {e:#} ; lu dans le DHT de BitTorrent");
+            find_relays_dht()
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// La liste des relais lue directement dans le DHT de BitTorrent (ancien format, toujours
+/// tenu par les machines sans joueur).
+#[allow(deprecated)]
+fn find_relays_dht() -> Result<Vec<Ad>> {
     let dht = dht()?;
     let key = shared_key();
     let item = dht.get_mutable_most_recent(key.verifying_key().as_bytes(), Some(SALT));
     Ok(item.map(|i| decode_ads(i.value())).unwrap_or_default())
 }
 
-/// Inscrit ce relais dans le DHT, puis toutes les 10 minutes (fil de fond).
+/// Inscrit ce relais dans la liste, puis toutes les 10 minutes (fil de fond). (v326) Chez
+/// les relais pkarr ; dans le DHT de BitTorrent aussi pour une machine sans joueur
+/// (`allow_dht`), jamais pour le relais d'un joueur.
 pub fn publish(me: Ad) {
     let _ = std::thread::Builder::new()
-        .name("rendez-vous DHT".into())
+        .name("rendez-vous".into())
         .spawn(move || {
+            let pkarr = |me: &Ad| -> Result<()> {
+                let list = rendezvous::fetch()?;
+                let mut ad = me.clone();
+                ad.seen = now();
+                rendezvous::put(&updated(list, ad))
+            };
             #[allow(deprecated)]
             let run = |me: &Ad| -> Result<()> {
                 let dht = dht()?;
@@ -176,9 +223,15 @@ pub fn publish(me: Ad) {
                 Ok(())
             };
             loop {
-                match run(&me) {
-                    Ok(()) => log::info!("relais inscrit dans le DHT"),
-                    Err(e) => log::warn!("inscription dans le DHT : {e:#}"),
+                match pkarr(&me) {
+                    Ok(()) => log::info!("relais inscrit chez les relais pkarr"),
+                    Err(e) => log::warn!("inscription chez les relais pkarr : {e:#}"),
+                }
+                if dht_allowed() {
+                    match run(&me) {
+                        Ok(()) => log::info!("relais inscrit dans le DHT"),
+                        Err(e) => log::warn!("inscription dans le DHT : {e:#}"),
+                    }
                 }
                 std::thread::sleep(REFRESH);
             }

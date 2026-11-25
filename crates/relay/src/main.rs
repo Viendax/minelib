@@ -62,6 +62,8 @@ fn main() -> Result<()> {
         minelib_net::crypto::hex(&h.public)
     );
     // Joignable sans port ouvert, et inscrit dans le DHT.
+    // (v326) Une machine sans joueur : le DHT de BitTorrent en plus des relais pkarr.
+    minelib_p2p::allow_dht();
     let _node = if dht {
         // (v279) Identité iroh gardée d'un lancement à l'autre (`noeud.key`, comme le jeu) :
         // les jeux retiennent le nœud des relais où ils ont joué et le joignent
@@ -148,6 +150,8 @@ fn main() -> Result<()> {
 fn passeur_main() -> Result<()> {
     use minelib_relay::passeur_seul::{Headless, Options};
     use std::time::{Duration, Instant};
+    // (v326) Une machine sans joueur : le DHT de BitTorrent en plus des relais pkarr.
+    minelib_p2p::allow_dht();
     let args: Vec<String> = std::env::args().collect();
     let mut dir = std::path::PathBuf::from("passeur_data");
     let mut ip: Option<std::net::Ipv4Addr> = None;
@@ -224,7 +228,7 @@ fn passeur_main() -> Result<()> {
             ads.extend(extra.iter().cloned());
             match minelib_p2p::find_relays() {
                 Ok(list) => ads.extend(list),
-                Err(e) => log::warn!("DHT : {e:#}"),
+                Err(e) => log::warn!("liste des relais : {e:#}"),
             }
             for ad in ads {
                 let (n, wait) = (ad.node, Duration::from_secs(10));

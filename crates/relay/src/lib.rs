@@ -6474,6 +6474,34 @@ fn try_apply_result(st: &mut State, room_id: u64) {
 
 /// Ouvre une partie hébergée par `id`.
 #[allow(clippy::too_many_arguments)]
+/// (v326) Le compte `pseudo` a la double authentification.
+fn has_totp(st: &State, pseudo: &str) -> bool {
+    st.accounts.load(pseudo).is_some_and(|r| r.totp.is_some())
+}
+
+/// (v326) Le code de double authentification `code` vaut pour le compte `pseudo` : valable,
+/// jamais déjà servi (il ne servira plus). Vrai aussi pour un compte sans double
+/// authentification.
+fn totp_passes(st: &mut State, pseudo: &str, code: Option<u32>) -> bool {
+    let Some(mut record) = st.accounts.load(pseudo) else {
+        return false;
+    };
+    let Some(sealed) = record.totp.clone() else {
+        return true;
+    };
+    let secret = crypto::open(&st.id.vault_key, &sealed).ok();
+    let step = code
+        .zip(secret)
+        .and_then(|(c, s)| totp::check(&s, c, totp::now_step()))
+        .filter(|s| *s > record.last_totp_step);
+    let Some(step) = step else {
+        return false;
+    };
+    record.last_totp_step = step;
+    let _ = st.accounts.save(&record);
+    true
+}
+
 /// (v325) Clé du monde de construction de la partie `rid` (vide en FPS).
 fn world_of(st: &State, rid: u64) -> String {
     st.rooms
@@ -7170,10 +7198,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             map_sig,
             max_players,
             wake,
+            replace,
+            code,
         } => {
             // (v311) Pas d'ouvertures en rafale (la liste des parties et des mondes ne se
-            // remplit pas à la chaîne).
-            if let Err(wait) = st.worlds.may_open(pseudo) {
+            // remplit pas à la chaîne). (v326) Comptée une fois ouverte seulement.
+            if let Some(wait) = st.worlds.open_wait(pseudo) {
                 return Some(err(
                     ErrorCode::Refused,
                     format!("Trop de parties ouvertes coup sur coup : réessaie dans {wait} s."),
@@ -7197,6 +7227,34 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             } else {
                 None
             };
+            // (v326) Un nouveau monde alors que son créateur en a déjà le nombre permis : il
+            // ne s'ouvre qu'en supprimant son plus ancien monde endormi, ce que le joueur
+            // confirme, avec la même protection que `/deleteworld` (code de double
+            // authentification si son compte en a une). Jamais sans le lui dire.
+            if kind == 1 && ident.is_none() && st.worlds.full(pseudo) {
+                let Some((old, old_name)) = st.worlds.oldest_asleep(pseudo) else {
+                    return Some(err(
+                        ErrorCode::Refused,
+                        format!(
+                            "Tu as déjà {} mondes ouverts en ligne : ferme-en un avant d'en \
+                             ouvrir un autre.",
+                            mondes::PER_CREATOR
+                        ),
+                    ));
+                };
+                let totp = has_totp(st, pseudo);
+                if replace != old || (totp && !totp_passes(st, pseudo, code)) {
+                    return Some(Response::WorldLimit {
+                        world: old,
+                        name: old_name,
+                        totp,
+                    });
+                }
+                st.worlds.delete(&old);
+                st.servers.forget(&old);
+                log::info!("monde endormi supprimé par son créateur pour en ouvrir un autre");
+            }
+            st.worlds.note_open(pseudo);
             let rid = open_room(st, id, pseudo, kind, name, map, map_sig, max_players, ident);
             Response::Hosted {
                 room: rid,
@@ -7225,19 +7283,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let key = r.server.clone();
             // Double authentification du compte, s'il en a une : un code valable, jamais
             // déjà servi.
-            if let Some(mut record) = st.accounts.load(pseudo) {
-                if let Some(sealed) = record.totp.clone() {
-                    let secret = crypto::open(&st.id.vault_key, &sealed).ok();
-                    let step = code
-                        .zip(secret)
-                        .and_then(|(c, s)| totp::check(&s, c, totp::now_step()))
-                        .filter(|s| *s > record.last_totp_step);
-                    let Some(step) = step else {
-                        return Some(err(ErrorCode::WrongTotp, ""));
-                    };
-                    record.last_totp_step = step;
-                    let _ = st.accounts.save(&record);
-                }
+            if has_totp(st, pseudo) && !totp_passes(st, pseudo, code) {
+                return Some(err(ErrorCode::WrongTotp, ""));
             }
             delete_world(st, rid, id, &key);
             log::info!("monde supprimé par son créateur");
@@ -15369,6 +15416,8 @@ mod tests {
                 map_sig: [6; 32],
                 max_players: 0,
                 wake: String::new(),
+                replace: String::new(),
+                code: None,
             },
         ) {
             Some(Response::Hosted { room, .. }) => room,
