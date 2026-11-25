@@ -166,6 +166,10 @@ pub struct Frame<'a> {
     /// solo, quand il l'a sur lui) : les éclairs des nuages sont plus fréquents au-dessus de
     /// lui, et le chargent.
     pub holder: Option<Vec3>,
+    /// (v324) Sur un serveur, un autre joueur qui la porte et qu'on voit (au milieu de son
+    /// chunk, comme le sien, `holder`) : les éclairs des nuages sont plus fréquents au-dessus de
+    /// lui chez nous aussi (les mêmes que chez lui) ; ils ne nous chargent rien.
+    pub other_holder: Option<Vec3>,
 }
 
 pub struct Storm {
@@ -280,7 +284,7 @@ impl Storm {
         // (v241) Les éclairs qui courent dans les nuages au-dessus des zones alentour : les
         // mêmes pour tous, plus fréquents au-dessus de celui qui porte la Foudre de Zeus.
         if f.active {
-            let due = self.weather.cloud_bolts(f.eye, f.holder);
+            let due = self.weather.cloud_bolts(f.eye, f.holder.or(f.other_holder));
             self.cloud_due.extend(due.into_iter().map(|s| (s.delay, s)));
         } else {
             self.cloud_due.clear();
@@ -900,6 +904,7 @@ mod tests {
             online: false,
             covered: false,
             holder: None,
+            other_holder: None,
         }
     }
 
@@ -911,7 +916,7 @@ mod tests {
     fn storms_charge_the_holder_every_ten_seconds_and_the_short_arc_goes_straight() {
         let world = flat(64);
         let feet = Vec3::new(8.5, 65.0, 8.5);
-        let run = |holder: Option<Vec3>, storm: bool| {
+        let run_with = |holder: Option<Vec3>, other: Option<Vec3>, storm: bool| {
             let mut s = Storm::new(11);
             if storm {
                 s.weather.fix(true);
@@ -922,18 +927,22 @@ mod tests {
             for _ in 0..4800 {
                 let mut f = frame(&world, feet);
                 f.holder = holder;
+                f.other_holder = other;
                 s.update(0.25, &f);
                 charged += s.charged as u32;
                 seen = seen.max(s.strikes.iter().filter(|k| k.kind == lightning::Kind::Cloud).count());
             }
             (charged, seen)
         };
+        let run = |holder: Option<Vec3>, storm: bool| run_with(holder, None, storm);
         let (none, seen) = run(None, true);
         assert!(none == 0 && seen > 0, "{none} {seen}");
         let (with, _) = run(Some(feet), true);
         // Une toutes les 10 s : 120 en vingt minutes d'orage.
         assert_eq!(with, 120, "{with} charges en vingt minutes d'orage");
         assert_eq!(run(Some(feet), false).0, 0, "pas d'orage, pas de charge");
+        // (v324) Un autre joueur la porte, tout près : rien ne nous charge.
+        assert_eq!(run_with(None, Some(feet), true).0, 0, "la sienne, pas la nôtre");
         // L'arc court.
         let mut s = Storm::new(5);
         let (tip, to) = (Vec3::new(8.0, 66.5, 8.0), Vec3::new(13.0, 65.9, 9.0));

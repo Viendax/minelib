@@ -132,7 +132,7 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 /// (v244) Tirés par `minelib_net::meteo`, le même code que le relais du monde : en ligne,
 /// c'est lui qui accorde les charges qu'ils donnent (chance par zone et par créneau, trois
 /// fois plus près de celui qui porte l'éclair : `meteo::CLOUD_P`, `CLOUD_BOOST`).
-pub use minelib_net::meteo::{CLOUD_SLOT_S, CLOUD_ZONE};
+pub use minelib_net::meteo::CLOUD_SLOT_S;
 /// On les tire jusqu'à cette distance de la caméra (blocs) : une dizaine de zones, soit
 /// cinq éclairs par minute environ (et autant des éclairs des nuages d'avant, tirés au
 /// hasard chez chacun : voir `Storm::update`).
@@ -172,6 +172,12 @@ pub struct Weather {
     /// (v229) Ce que le serveur vient d'imposer (`impose`), posé à la prochaine `update`
     /// (l'horloge y est celle du moment).
     imposed: Option<(Option<Kind>, Option<f64>, bool)>,
+    /// (v324) Origine de la partie (place absolue de son 0, en blocs, x et z :
+    /// `World::origin_blocks`). La foudre et les éclairs des nuages sont tirés par cases et par
+    /// zones **absolues** : les mêmes pour tous, quelle que soit l'origine de chacun (loin du
+    /// centre, deux voisins comptent souvent depuis deux origines), de part et d'autre de la
+    /// limite de la carte aussi. Avant, ils étaient tirés depuis le 0 de chaque partie.
+    pub origin: [i64; 2],
 }
 
 impl Weather {
@@ -190,6 +196,7 @@ impl Weather {
             last_slot: None,
             last_cloud_slot: None,
             imposed: None,
+            origin: [0, 0],
         }
     }
 
@@ -359,25 +366,33 @@ impl Weather {
             return out;
         }
         let p = STRIKES_PER_BLOCK_S * (CELL * CELL) as f64;
-        let cell = |v: f32| (v / CELL as f32).floor() as i32;
+        // (v324) En places absolues (double précision), comptées sans fin autour de nous : la
+        // case d'une place est celle de la carte bouclée (`CELL` divise exactement son tour),
+        // la place de l'éclair est rendue depuis notre origine.
+        let (ox, oz) = (self.origin[0] as f64, self.origin[1] as f64);
+        let (ax, az) = (centre.x as f64 + ox, centre.z as f64 + oz);
+        let reach = STRIKE_REACH as f64;
+        let size = CELL as f64;
+        let cell = |v: f64| (v / size).floor() as i64;
+        let cells = minelib_net::proto::LAP_BLOCKS / CELL as i64;
+        let wrap = |k: i64| ((k + cells / 2).rem_euclid(cells) - cells / 2) as i32;
         // (Au plus les trois dernières secondes : après une longue image, pas de rafale.)
         for s in (last + 1).max(slot - 2)..=slot {
-            for cz in cell(centre.z - STRIKE_REACH)..=cell(centre.z + STRIKE_REACH) {
-                for cx in cell(centre.x - STRIKE_REACH)..=cell(centre.x + STRIKE_REACH) {
+            for kz in cell(az - reach)..=cell(az + reach) {
+                for kx in cell(ax - reach)..=cell(ax + reach) {
+                    let (cx, cz) = (wrap(kx), wrap(kz));
                     let key = (cx as u32 as u64) << 32 | cz as u32 as u64;
                     if unit(self.seed ^ 0xb017, s as u64, key) >= p {
                         continue;
                     }
-                    let x = (cx * CELL) as f32
-                        + unit(self.seed ^ 1, s as u64, key) as f32 * CELL as f32;
-                    let z = (cz * CELL) as f32
-                        + unit(self.seed ^ 2, s as u64, key) as f32 * CELL as f32;
-                    if (x - centre.x).abs() > STRIKE_REACH || (z - centre.z).abs() > STRIKE_REACH {
+                    let x = kx as f64 * size + unit(self.seed ^ 1, s as u64, key) * size;
+                    let z = kz as f64 * size + unit(self.seed ^ 2, s as u64, key) * size;
+                    if (x - ax).abs() > reach || (z - az).abs() > reach {
                         continue;
                     }
                     out.push(Spot {
-                        x,
-                        z,
+                        x: (x - ox) as f32,
+                        z: (z - oz) as f32,
                         delay: unit(self.seed ^ 3, s as u64, key) as f32,
                         seed: mix64(self.seed ^ key ^ (s as u64) << 20) as u32,
                     });
@@ -440,14 +455,21 @@ impl Weather {
         if !self.thundering() || last.is_none_or(|l| slot <= l) {
             return out;
         }
-        let cell = |v: f32| (v / CLOUD_ZONE as f32).floor() as i32;
-        for cz in cell(centre.z - CLOUD_REACH)..=cell(centre.z + CLOUD_REACH) {
-            for cx in cell(centre.x - CLOUD_REACH)..=cell(centre.x + CLOUD_REACH) {
-                let near = holder.map(|h| (h.x, h.z));
+        // (v324) En places absolues, comme la foudre (`strikes`) : les zones de la carte
+        // bouclée autour de nous (`meteo::zones_across`), l'éclair rendu depuis notre origine.
+        use minelib_net::meteo::zones_across;
+        use minelib_net::proto::{place_gap, wrap_place};
+        let (ox, oz) = (self.origin[0] as f64, self.origin[1] as f64);
+        let (ax, az) = (wrap_place(centre.x as f64 + ox), wrap_place(centre.z as f64 + oz));
+        let near = holder.map(|h| (wrap_place(h.x as f64 + ox), wrap_place(h.z as f64 + oz)));
+        let reach = CLOUD_REACH as f64;
+        let xs = zones_across(ax, reach);
+        for cz in zones_across(az, reach) {
+            for &cx in &xs {
                 if let Some(s) = minelib_net::meteo::cloud_spot(self.seed, slot, cx, cz, near) {
                     out.push(Spot {
-                        x: s.x,
-                        z: s.z,
+                        x: place_gap(s.x, ox) as f32,
+                        z: place_gap(s.z, oz) as f32,
                         delay: s.delay,
                         seed: s.seed,
                     });
@@ -582,15 +604,66 @@ mod tests {
                 .filter(|s| (s.x - holder.x).hypot(s.z - holder.z) <= meteo::CHARGE_REACH)
                 .map(|s| (s.x, s.z, s.delay, s.seed))
                 .collect();
-            let theirs: Vec<_> = meteo::charging_spots(42, slot, holder.x, holder.z)
-                .iter()
-                .map(|s| (s.x, s.z, s.delay, s.seed))
-                .collect();
+            let theirs: Vec<_> =
+                meteo::charging_spots(42, slot, holder.x as f64, holder.z as f64)
+                    .iter()
+                    .map(|s| (s.x as f32, s.z as f32, s.delay, s.seed))
+                    .collect();
             assert_eq!(near.len(), theirs.len());
             assert!(near.iter().all(|s| theirs.contains(s)));
             seen += near.len();
         }
         assert!(seen > 20, "{seen}");
+    }
+
+    /// (v324) La foudre et les éclairs des nuages tombent aux mêmes places absolues pour tous,
+    /// quelle que soit l'origine de la partie de chacun : près du centre, à un milliard de blocs,
+    /// et de part et d'autre de la limite de la carte bouclée (deux parties qui comptent depuis
+    /// chacun de ses côtés). Avant, chacun les tirait depuis le 0 de sa partie.
+    #[test]
+    fn lightning_falls_at_the_same_places_whatever_the_origin() {
+        use minelib_net::proto::{place_gap, MAP_HALF};
+        // Place absolue regardée (x, z), et les origines (blocs) de deux parties qui la voient.
+        let cases: [(f64, f64, [i64; 2], [i64; 2]); 3] = [
+            (300.5, -200.5, [0, 0], [4096, -8192]),
+            (
+                1.0e9 + 37.5,
+                5.0e8 + 0.5,
+                [999_997_440, 499_998_720],
+                [1_000_001_536, 500_002_816],
+            ),
+            (MAP_HALF - 10.0, 3.5, [1_073_737_728, 0], [-1_073_741_696, 0]),
+        ];
+        for (x, z, oa, ob) in cases {
+            // Ce que voit la partie d'origine `o` en une demi-heure d'orage, en places absolues.
+            let run = |o: [i64; 2]| {
+                let mut w = Weather::new(42);
+                w.fix(true);
+                w.force(Kind::Storm);
+                w.origin = o;
+                let (ox, oz) = (o[0] as f64, o[1] as f64);
+                let centre = Vec3::new(place_gap(x, ox) as f32, 70.0, place_gap(z, oz) as f32);
+                let abs = |s: &Spot| (s.x as f64 + ox, s.z as f64 + oz, s.seed, s.delay);
+                let (mut strikes, mut clouds) = (Vec::new(), Vec::new());
+                for _ in 0..1800 {
+                    w.update(1.0, None);
+                    strikes.extend(w.strikes(centre).iter().map(abs));
+                    clouds.extend(w.cloud_bolts(centre, None).iter().map(abs));
+                }
+                (strikes, clouds)
+            };
+            let (a, b) = (run(oa), run(ob));
+            assert!(a.0.len() > 20 && a.1.len() > 10, "{x} : {} {}", a.0.len(), a.1.len());
+            for (what, a, b) in [("foudre", &a.0, &b.0), ("nuages", &a.1, &b.1)] {
+                assert_eq!(a.len(), b.len(), "{x} : {what}");
+                for (p, q) in a.iter().zip(b) {
+                    let same = place_gap(p.0, q.0).abs() < 0.01
+                        && place_gap(p.1, q.1).abs() < 0.01
+                        && (p.2, p.3) == (q.2, q.3);
+                    assert!(same, "{x} : {what} en {p:?} et en {q:?}");
+                }
+            }
+        }
     }
 
     /// (v241) Les éclairs des nuages d'une zone : tirés de la graine et de l'horloge (les

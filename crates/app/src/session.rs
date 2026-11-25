@@ -5997,6 +5997,38 @@ impl Session {
         // Pas de météo sur les cartes FPS, ni à l'heure « par défaut » (soleil immobile).
         let active = !fps && self.time_h >= 0.0;
         let eye = self.camera_pos();
+        // (v324) La foudre et les éclairs des nuages tirés en places absolues : les mêmes pour
+        // tous, quelle que soit l'origine de la partie de chacun.
+        let o = self.world.origin_blocks();
+        self.storm.weather.origin = [o[0] as i64, o[2] as i64];
+        let mine = self.legend_on() && self.inventory.has_zeus();
+        // (v324) Celui qui porte la Foudre de Zeus du serveur, si ce n'est pas nous et qu'on le
+        // voit : au milieu de son chunk (comme le sien chez lui) ; les éclairs des nuages sont
+        // plus fréquents au-dessus de lui chez nous aussi, les mêmes que chez lui. Avant, seul
+        // le porteur les voyait.
+        let other_holder = self
+            .build
+            .as_ref()
+            .filter(|_| !mine)
+            .and_then(|b| {
+                let who = self.zeus_online.holder.as_deref().filter(|h| !h.is_empty())?;
+                let key: String = who.chars().take(16).collect();
+                let p = b
+                    .others
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                    .map(|(_, o)| o.pos)?;
+                Some(Vec3::new(
+                    (p.x / 16.0).floor() * 16.0 + 8.0,
+                    p.y,
+                    (p.z / 16.0).floor() * 16.0 + 8.0,
+                ))
+            });
+        // (v324) Qui la porte ne se met pas en veille au fond d'une province : le relais du
+        // monde lui accorde les charges de l'orage, il doit l'entendre.
+        if let Some(b) = self.build.as_mut() {
+            b.set_keep_root(mine);
+        }
         let hurt = self.storm.update(
             dt,
             &crate::storm::Frame {
@@ -6009,7 +6041,7 @@ impl Session {
                 // (v241) Celui qui porte l'éclair légendaire : le joueur, s'il l'a sur lui.
                 // (v244) Sur un serveur : au milieu de son chunk, là où le relais du monde
                 // (qui accorde les charges) le sait.
-                holder: (self.legend_on() && self.inventory.has_zeus()).then(|| {
+                holder: mine.then(|| {
                     let p = self.player.pos;
                     if self.build.is_some() {
                         Vec3::new(
@@ -6021,6 +6053,7 @@ impl Session {
                         p
                     }
                 }),
+                other_holder,
             },
         );
         if hurt > 0 {

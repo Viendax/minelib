@@ -135,18 +135,36 @@ pub fn online_clock(unix: f64) -> f64 {
 }
 
 /// Un éclair des nuages : au-dessus de (`x`, `z`), `delay` secondes après le début de son
-/// créneau, et de quoi tirer sa forme.
+/// créneau, et de quoi tirer sa forme. (v324) Place absolue, en double précision : la même pour
+/// tous, quelle que soit l'origine de la partie de chacun, à un milliard de blocs aussi.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CloudSpot {
-    pub x: f32,
-    pub z: f32,
+    pub x: f64,
+    pub z: f64,
     pub delay: f32,
     pub seed: u32,
 }
 
-/// Zone (`CLOUD_ZONE` blocs de côté) qui contient la coordonnée `v`.
-pub fn cloud_zone(v: f32) -> i32 {
-    (v / CLOUD_ZONE as f32).floor() as i32
+/// Zone (`CLOUD_ZONE` blocs de côté) qui contient la coordonnée absolue `v`.
+pub fn cloud_zone(v: f64) -> i32 {
+    (v / CLOUD_ZONE as f64).floor() as i32
+}
+
+/// (v324) Les zones de la carte bouclée à moins de `reach` blocs (sur une coordonnée) de la
+/// place absolue `c` : comptées sur la carte, de -`MAP_HALF` à `MAP_HALF` (`CLOUD_ZONE` ne divise
+/// pas son tour : les deux zones de la limite y sont coupées). De part et d'autre de la limite,
+/// les mêmes zones pour tous, quelle que soit l'origine de la partie de chacun ; loin d'elle,
+/// celles de `cloud_zone(c - reach)` à `cloud_zone(c + reach)`, comme avant.
+pub fn zones_across(c: f64, reach: f64) -> Vec<i32> {
+    use crate::proto::{wrap_place, MAP_HALF};
+    let (lo, hi) = (wrap_place(c - reach), wrap_place(c + reach));
+    if lo <= hi {
+        (cloud_zone(lo)..=cloud_zone(hi)).collect()
+    } else {
+        (cloud_zone(lo)..=cloud_zone(MAP_HALF - 1e-3))
+            .chain(cloud_zone(-MAP_HALF)..=cloud_zone(hi))
+            .collect()
+    }
 }
 
 /// L'éclair des nuages de la zone (`cx`, `cz`) dans le créneau `slot` d'un monde de graine
@@ -158,13 +176,17 @@ pub fn cloud_spot(
     slot: i64,
     cx: i32,
     cz: i32,
-    holder: Option<(f32, f32)>,
+    holder: Option<(f64, f64)>,
 ) -> Option<CloudSpot> {
     let key = (cx as u32 as u64) << 32 | cz as u32 as u64;
     let s = slot as u64;
-    let x = (cx * CLOUD_ZONE) as f32 + unit(seed ^ 0xc1, s, key) as f32 * CLOUD_ZONE as f32;
-    let z = (cz * CLOUD_ZONE) as f32 + unit(seed ^ 0xc2, s, key) as f32 * CLOUD_ZONE as f32;
-    let near = holder.is_some_and(|(hx, hz)| (hx - x).hypot(hz - z) <= CHARGE_REACH);
+    let zone = CLOUD_ZONE as f64;
+    let x = cx as f64 * zone + unit(seed ^ 0xc1, s, key) * zone;
+    let z = cz as f64 * zone + unit(seed ^ 0xc2, s, key) * zone;
+    // (v324) Sur la carte bouclée.
+    let near = holder.is_some_and(|(hx, hz)| {
+        crate::proto::place_gap(hx, x).hypot(crate::proto::place_gap(hz, z)) <= CHARGE_REACH as f64
+    });
     let p = if near { CLOUD_P * CLOUD_BOOST } else { CLOUD_P };
     if unit(seed ^ 0xc10d, s, key) >= p {
         return None;
@@ -179,8 +201,8 @@ pub fn cloud_spot(
 
 /// Les éclairs des nuages du créneau `slot` qui passent à moins de `CHARGE_REACH` blocs du
 /// porteur en (`x`, `z`) (ceux qui le chargeaient avant la v282).
-pub fn charging_spots(seed: u64, slot: i64, x: f32, z: f32) -> Vec<CloudSpot> {
-    let reach = CHARGE_REACH;
+pub fn charging_spots(seed: u64, slot: i64, x: f64, z: f64) -> Vec<CloudSpot> {
+    let reach = CHARGE_REACH as f64;
     let mut out = Vec::new();
     for cz in cloud_zone(z - reach)..=cloud_zone(z + reach) {
         for cx in cloud_zone(x - reach)..=cloud_zone(x + reach) {
@@ -204,21 +226,22 @@ mod tests {
     #[test]
     fn cloud_spots_depend_on_the_seed_and_three_times_more_near_the_holder() {
         let (mut alone, mut near, mut charging) = (0, 0, 0);
-        let (hx, hz) = (300.0f32, -120.0f32);
+        let (hx, hz) = (300.0f64, -120.0f64);
+        let reach = CHARGE_REACH as f64;
         for slot in 0..4000i64 {
             let a = cloud_spot(7, slot, 1, -1, None);
             assert_eq!(a, cloud_spot(7, slot, 1, -1, None));
             let b = cloud_spot(7, slot, 1, -1, Some((hx, hz)));
             if let Some(a) = a {
                 assert_eq!(Some(a), b, "un porteur n'en change aucun");
-                alone += usize::from((a.x - hx).hypot(a.z - hz) <= CHARGE_REACH);
+                alone += usize::from((a.x - hx).hypot(a.z - hz) <= reach);
             }
             if let Some(b) = b {
                 assert!(b.delay >= 0.0 && b.delay < CLOUD_SLOT_S as f32);
-                near += usize::from((b.x - hx).hypot(b.z - hz) <= CHARGE_REACH);
+                near += usize::from((b.x - hx).hypot(b.z - hz) <= reach);
             }
             for s in charging_spots(7, slot, hx, hz) {
-                assert!((s.x - hx).hypot(s.z - hz) <= CHARGE_REACH);
+                assert!((s.x - hx).hypot(s.z - hz) <= reach);
                 charging += 1;
             }
         }

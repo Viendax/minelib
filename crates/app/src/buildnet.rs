@@ -398,6 +398,10 @@ pub struct BuildNet {
     /// (v323) Couleurs de piles de tapis posées, à envoyer après leur bloc (`send_carpet`), et
     /// depuis combien de temps elles attendent leur arbitre.
     carpet_queue: Vec<(BuildMsg, f32)>,
+    /// (v324) Le joueur porte la Foudre de Zeus du serveur : pas de veille au fond d'une
+    /// province (et réveillé s'il y était), le relais du monde lui accorde les charges de
+    /// l'orage (`set_keep_root`).
+    keep_root: bool,
     /// (v227) Foules d'essai menées par d'autres joueurs (OP) : paquets reçus, par pseudo de
     /// celui qui la mène (voir `crowd::RemoteCrowd`).
     crowd_inbox: Vec<(String, Vec<u8>)>,
@@ -791,6 +795,7 @@ impl BuildNet {
             thor_inbox: Vec::new(),
             light_queue: Vec::new(),
             carpet_queue: Vec::new(),
+            keep_root: false,
             crowd_inbox: Vec::new(),
             crowd_hits: Vec::new(),
             evide_inbox: Vec::new(),
@@ -1596,16 +1601,30 @@ impl BuildNet {
                 .pending
                 .keys()
                 .any(|p| self.best(proto::region_of(chunk_of(p[0], p[2]))).is_none());
-            let ok = deep && in_pays && cert_ok && !self.owner && !self.paused && !at_root;
+            let ok = deep
+                && in_pays
+                && cert_ok
+                && !self.owner
+                && !self.paused
+                && !at_root
+                && !self.keep_root;
             self.doze_t = if ok { self.doze_t + dt } else { 0.0 };
             return;
         }
         // (v318) Sur la carte bouclée.
         let root_needed = proto::regions_around(chunk, ROOT_VIEW).any(|r| self.best(r).is_none());
         self.wake_t = if deep { 0.0 } else { self.wake_t + dt };
-        if root_needed || !cert_ok || self.wake_t > WAKE_AFTER {
+        if root_needed || !cert_ok || self.wake_t > WAKE_AFTER || self.keep_root {
             self.wake_wanted.set(true);
         }
+    }
+
+    /// (v324) Le joueur porte (ou non) la Foudre de Zeus du serveur. Le relais du monde lui
+    /// accorde les charges de l'orage s'il est sur le serveur ; en veille au fond d'une province
+    /// (plus connecté à lui), il n'en recevait aucune jusqu'à son retour. Qui la porte ne se met
+    /// donc pas en veille, et s'y réveille.
+    pub fn set_keep_root(&mut self, on: bool) {
+        self.keep_root = on;
     }
 
     /// (v146) Son skin : déposé chez chaque province où l'on entre (les joueurs en veille l'y
@@ -6520,6 +6539,11 @@ mod tests {
                 if step == a + 80 {
                     walk_from = Some(step);
                 }
+                // (v324) Joueur2 porte la Foudre de Zeus du serveur : il revient au relais du
+                // monde (qui lui accorde les charges de l'orage) et ne se remet plus en veille.
+                if step == a + 100 {
+                    bots[2].net.as_mut().unwrap().set_keep_root(true);
+                }
                 // Le skin de Joueur1, demandé par Joueur4 en veille (à ses provinces).
                 if step == a + 40 {
                     bots[4].net.as_ref().unwrap().ask_skin("Joueur1");
@@ -6633,6 +6657,12 @@ mod tests {
         assert!(
             bots[3].woken > 0 && back_seen,
             "Joueur3 est revenu au relais du monde"
+        );
+        assert!(
+            bots[2].woken > 0
+                && !bots[2].net.as_ref().unwrap().is_dozing()
+                && h.players_here(room).iter().any(|p| p == "Joueur2"),
+            "(v324) qui porte la Foudre de Zeus revient au relais du monde et y reste"
         );
         for b in &bots {
             assert_eq!(
