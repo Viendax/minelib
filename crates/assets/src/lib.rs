@@ -169,6 +169,9 @@ pub struct Options {
     pub pseudo: String,
     /// Couleur préférée en FPS (0 à 4 : vert, jaune, orange, bleu, violet ; 255 : aucune).
     pub fps_color: u8,
+    /// (v340) Format choisi dans Multijoueur → FPS (« Équipe »), en joueurs par équipe : 1, 2,
+    /// 3, 4, 5 ou 10. `equipe_fps=5`.
+    pub fps_team: u8,
     /// Langue de l'interface (code : « fr », « en »…).
     pub language: String,
 }
@@ -187,6 +190,7 @@ impl Default for Options {
             sensitivity: DEFAULT_SENSITIVITY,
             sensitivity_fps: DEFAULT_SENSITIVITY,
             fps_color: 255,
+            fps_team: 5,
             language: "fr".into(),
             raytracing: true,
             point_torches: false,
@@ -338,6 +342,11 @@ impl Options {
             if let Some(v) = kv.get("fps_color").and_then(|v| v.parse::<u8>().ok()) {
                 o.fps_color = if v < 5 { v } else { 255 };
             }
+            if let Some(v) = kv.get("equipe_fps").and_then(|v| v.parse::<u8>().ok()) {
+                if [1, 2, 3, 4, 5, 10].contains(&v) {
+                    o.fps_team = v;
+                }
+            }
             if let Some(v) = kv.get("language") {
                 let v = v.trim();
                 if !v.is_empty() && v.len() <= 8 {
@@ -352,7 +361,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\njournal_reseau={}\nrecevoir_journaux={}\npasseur={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\njournal_reseau={}\nrecevoir_journaux={}\npasseur={}\nequipe_fps={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -389,7 +398,8 @@ impl Options {
                     Some(true) => "true",
                     Some(false) => "false",
                     None => "demander",
-                }
+                },
+                self.fps_team,
             ),
         )?;
         Ok(())

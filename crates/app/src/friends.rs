@@ -377,8 +377,9 @@ pub fn panel(
     out
 }
 
-/// Coupe un texte en lignes de cette largeur (par mots).
-fn wrap(text: &str, w: f32, scale: f32) -> Vec<String> {
+/// Coupe un texte en lignes de cette largeur (par mots). (v340) Aussi pour « Ajouter une
+/// carte » (`multiplayer`).
+pub(crate) fn wrap(text: &str, w: f32, scale: f32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut cur = String::new();
     for word in text.split_whitespace() {

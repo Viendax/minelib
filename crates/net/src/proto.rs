@@ -87,6 +87,7 @@ use serde::{Deserialize, Serialize};
 /// `Response::Hosted::terrain`, `Response::Joined::terrain`, `Response::SeedLock::seed`.
 /// (v331, toujours 75) `FastGuest::turn` et `FastWay::turn` (`FastTurn`).
 /// (v333, toujours 75) `Request::LinkTurn` et `Response::NearWay`.
+/// (v340, toujours 75) `Request::MapCertify`, `MapEntry::certified`.
 pub const PROTOCOL: u32 = 75;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
@@ -1037,6 +1038,14 @@ pub enum Request {
     LinkTurn {
         on: bool,
     },
+    /// (v340) Certifier une carte FPS (`on`), ou lui retirer sa certification : une carte
+    /// certifiée passe en tête de la liste des cartes de tous les joueurs, avant les plus
+    /// jouées. Seul le compte `CERTIFIER` le peut (`can_certify`), et seulement pour une carte
+    /// de la liste FPS du relais. Réponse : `Done`.
+    MapCertify {
+        sig: [u8; 32],
+        on: bool,
+    },
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -1260,6 +1269,19 @@ pub struct MapEntry {
     pub stored: bool,
     /// Joueurs d'une partie sur cette carte (10 : 5 contre 5, la seule classée).
     pub players: u8,
+    /// (v340) Certifiée par le compte `CERTIFIER` (`Request::MapCertify`) : en tête de la
+    /// liste.
+    pub certified: bool,
+}
+
+/// (v340) Le seul compte qui certifie les cartes FPS (`Request::MapCertify`) : celui de
+/// Viendax. La commande (`/fps certif true|false`) n'est montrée qu'à lui.
+pub const CERTIFIER: &str = "Fox";
+
+/// (v340) Ce compte peut-il certifier les cartes FPS ? Sans casse, comme les pseudos du
+/// registre.
+pub fn can_certify(pseudo: &str) -> bool {
+    pseudo.eq_ignore_ascii_case(CERTIFIER)
 }
 
 /// Ce qu'un jeu peut offrir comme garant de zones (construction).

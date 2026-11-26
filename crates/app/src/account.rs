@@ -1341,6 +1341,7 @@ impl Accounts {
                 | Event::BuildSpawn { .. }
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)
+                | Event::MapCertified { .. }
                 | Event::MapDownloaded { .. }
                 | Event::MapFailed(..)
                 | Event::Zones { .. }

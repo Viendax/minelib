@@ -59,7 +59,9 @@
 //!                               l'autre d'une machine à <n> FPS, sous un rendu lent)
 //!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
 //!   MINELIB_CAPTURES=<s>,<n>    une capture à chaque image, n de suite à partir de <s> s (tests)
-//!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
+//!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface) ;
+//!                               (v340) MINELIB_EQUIPE=<n> format choisi, MINELIB_EQUIPE_LISTE=1
+//!                               sa liste ouverte, MINELIB_AJOUT=1 « Ajouter une carte » ouvert
 //!   MINELIB_UI=lumieres         éditeur de lumières ouvert en entrant dans le monde (essais)
 //!   MINELIB_UI=settings|graphics paramètres, ou paramètres graphiques, au lancement (essais)
 //!   MINELIB_UI=reglages_lumieres paramètres graphiques → lumières, au lancement (essais)
@@ -338,6 +340,13 @@ struct Game {
     /// Lobby : l'hôte du lobby a trouvé cette partie, on la rejoint (après la carte).
     party_go: Option<u64>,
     map_rows: Vec<multiplayer::MapRow>,
+    /// (v340) Multijoueur → FPS → « Ajouter une carte » : ses mondes, et la carte en cours
+    /// d'envoi au relais (signature, nom).
+    add_rows: Vec<multiplayer::AddRow>,
+    map_adding: Option<([u8; 32], String)>,
+    /// (v340) `/fps certif` envoyé au relais (horloge) : sa réponse, même un refus, est dite
+    /// dans le tchat.
+    certif_asked: Option<f32>,
     sig_cache: fpsmap::SigCache,
     /// Recherche FPS en cours : carte (signature, nom, dossier s'il est là).
     searching: Option<([u8; 32], String, Option<PathBuf>)>,
@@ -585,6 +594,9 @@ impl Game {
             maps_rev_seen: 0,
             maps_asked: false,
             map_rows: Vec::new(),
+            add_rows: Vec::new(),
+            map_adding: None,
+            certif_asked: None,
             sig_cache: fpsmap::SigCache::default(),
             searching: None,
             pending_build: None,
@@ -738,7 +750,66 @@ impl Game {
                     configured: true,
                     players: 10,
                     stored: true,
+                    certified: false,
                 }];
+                // (v340) Une carte certifiée, et deux d'autres formats (« Équipe »).
+                for (k, (name, players, plays, certified)) in [
+                    ("Mirage de pierre", 10u8, 4u32, true),
+                    ("Petit duel", 2, 7, false),
+                    ("Arène 2v2", 4, 30, true),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    g.map_rows.push(multiplayer::MapRow {
+                        sig: [k as u8 + 2; 32],
+                        name: name.into(),
+                        author: "Fox".into(),
+                        local: None,
+                        waiting: 0,
+                        plays,
+                        configured: true,
+                        players,
+                        stored: true,
+                        certified,
+                    });
+                }
+                multiplayer::sort_rows(&mut g.map_rows);
+                // Lignes d'exemple gardées tant que le relais n'a pas donné sa liste.
+                g.fps_home_maps_seen = g.accounts.maps_rev;
+                if let Ok(n) = std::env::var("MINELIB_EQUIPE") {
+                    g.fps_home.team = n.parse().unwrap_or(5);
+                }
+                g.fps_home.team_open = std::env::var("MINELIB_EQUIPE_LISTE").is_ok();
+                if std::env::var("MINELIB_AJOUT").is_ok() {
+                    g.fps_home.adding = true;
+                    g.add_rows = vec![
+                        multiplayer::AddRow {
+                            dir: PathBuf::from("a"),
+                            sig: [9; 32],
+                            name: "Mon Dust".into(),
+                            players: 10,
+                            configured: true,
+                            listed: false,
+                        },
+                        multiplayer::AddRow {
+                            dir: PathBuf::from("b"),
+                            sig: [10; 32],
+                            name: "Arène 2v2".into(),
+                            players: 4,
+                            configured: true,
+                            listed: true,
+                        },
+                        multiplayer::AddRow {
+                            dir: PathBuf::from("c"),
+                            sig: [11; 32],
+                            name: "Nouveau monde 3".into(),
+                            players: 10,
+                            configured: false,
+                            listed: false,
+                        },
+                    ];
+                }
             }
             g
         })
@@ -1839,7 +1910,33 @@ impl Game {
                         self.fps_status = Some(format!("{what} de la carte : {:.0} %", f * 100.0));
                     }
                 }
-                Event::MapUploaded(_) => log::info!("carte envoyée au relais"),
+                Event::MapUploaded(sig) => {
+                    log::info!("carte envoyée au relais");
+                    // (v340) Carte ajoutée par « Ajouter une carte » : dans la liste de tous.
+                    if let Some((_, name)) = self.map_adding.take_if(|(s, _)| s == sig) {
+                        self.fps_status = Some(format!(
+                            "« {name} » est dans la liste des cartes FPS de tous les joueurs."
+                        ));
+                        self.accounts.room(Cmd::Maps);
+                    }
+                }
+                // (v340) Réponse du relais à `/fps certif`.
+                Event::MapCertified { on, .. } => {
+                    self.certif_asked = None;
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(
+                            if *on {
+                                "Carte certifiée : elle passe en tête de la liste FPS de tous \
+                                 les joueurs."
+                            } else {
+                                "Certification retirée : la carte reprend sa place parmi les \
+                                 plus jouées."
+                            },
+                            chat::LIGHT_PURPLE,
+                        );
+                    }
+                    self.accounts.room(Cmd::Maps);
+                }
                 Event::MapDownloaded { sig, bytes } => {
                     let name = self
                         .map_rows
@@ -1892,9 +1989,14 @@ impl Game {
                         Err(e) => self.fps_status = Some(format!("Carte illisible : {e:#}")),
                     }
                 }
-                Event::MapFailed(_, m) => {
+                Event::MapFailed(sig, m) => {
                     self.searching = None;
                     self.solo_map_pending = None;
+                    // (v340) Carte de « Ajouter une carte » refusée (trop grande…) : plus
+                    // attendue.
+                    if self.map_adding.as_ref().is_some_and(|(s, _)| s == sig) {
+                        self.map_adding = None;
+                    }
                     if self.pending_build.take().is_some() {
                         self.accounts.room(Cmd::Leave);
                     }
@@ -2137,11 +2239,18 @@ impl Game {
                         self.friends_suggest =
                             minelib_net::proto::suggested_player(&m).map(str::to_string);
                     }
+                    // (v340) Refus d'une certification (`/fps certif`) : dit aussi en solo.
+                    let certif = self
+                        .certif_asked
+                        .take()
+                        .is_some_and(|t| self.time - t < 10.0);
+                    // (v340) Envoi refusé d'une carte de « Ajouter une carte » : plus attendu.
+                    self.map_adding = None;
                     if let Some(s) = &mut self.session {
                         // Refus de la liste des OP demandée pour l'éditeur de lumières : son
                         // propre message à la place.
                         let editor = m.contains("Réservé aux OP") && s.light_op_answer(false);
-                        if !editor && (adding || s.net.is_some() || s.build.is_some()) {
+                        if !editor && (adding || certif || s.net.is_some() || s.build.is_some()) {
                             s.chat.say(m.clone(), chat::RED);
                         }
                     }
@@ -2154,6 +2263,11 @@ impl Game {
             }
         }
         if let Some(s) = &mut self.session {
+            // (v340) Compte connecté après l'ouverture du monde (connexion automatique plus
+            // lente que le monde) : la partie le connaît aussi (`/fps certif`…).
+            if s.pseudo.is_empty() && self.accounts.logged_in() {
+                s.pseudo = self.accounts.pseudo();
+            }
             if let Some(started) = s.room_started.take() {
                 self.accounts.room(Cmd::RoomStarted(started));
             }
@@ -2166,6 +2280,10 @@ impl Game {
                     .room(Cmd::MatchResult(minelib_net::game::encode(&summary)));
             }
             for cmd in std::mem::take(&mut s.relay_cmds) {
+                // (v340) `/fps certif` : sa réponse aussi est dite (tchat), même en solo.
+                if matches!(cmd, Cmd::MapCertify { .. }) {
+                    self.certif_asked = Some(self.time);
+                }
                 // (v271) `/ami <pseudo>` : sa réponse aussi est dite (tchat et panneau).
                 if let Cmd::Friend { pseudo, add: true } = &cmd {
                     if !pseudo.is_empty() {
@@ -2513,6 +2631,10 @@ impl Game {
         self.accounts.room(Cmd::Leaderboard {
             friends: !self.fps_home.world_tab,
         });
+        // (v340) Le format choisi la dernière fois (« Équipe »).
+        self.fps_home.team = multiplayer::team_or_default(self.options.fps_team);
+        self.fps_home.team_open = false;
+        self.fps_home.adding = false;
         self.rebuild_map_rows();
         self.screen = Screen::FpsHome;
     }
@@ -2538,6 +2660,7 @@ impl Game {
                 configured: fps.ct.is_some() && fps.t.is_some(),
                 players: fps.players(),
                 stored: true,
+                certified: false,
             });
         }
         for m in &self.accounts.maps {
@@ -2546,6 +2669,7 @@ impl Game {
                     r.waiting = m.waiting;
                     r.plays = m.plays;
                     r.author = m.author.clone();
+                    r.certified = m.certified;
                 }
                 // Une carte dont la recherche vient de commencer apparaît tout de suite,
                 // même si elle n'est pas encore arrivée entière au relais.
@@ -2559,18 +2683,95 @@ impl Game {
                     configured: true,
                     players: m.players,
                     stored: m.stored,
+                    certified: m.certified,
                 }),
             }
         }
         // Anciennes versions d'une carte jamais jouées jusqu'au bout en ligne : retirées.
         multiplayer::hide_old_versions(&mut rows);
-        rows.sort_by(|a, b| {
-            b.waiting
-                .cmp(&a.waiting)
-                .then(b.plays.cmp(&a.plays))
-                .then(a.name.cmp(&b.name))
-        });
+        // (v340) Les certifiées d'abord, puis les plus jouées.
+        multiplayer::sort_rows(&mut rows);
+        // La carte choisie reste choisie (les lignes ont pu changer de place).
+        let picked = self
+            .fps_home
+            .selected
+            .and_then(|i| self.map_rows.get(i))
+            .map(|m| m.sig);
+        self.fps_home.selected = picked.and_then(|s| rows.iter().position(|r| r.sig == s));
         self.map_rows = rows;
+        if self.fps_home.adding {
+            self.rebuild_add_rows();
+        }
+    }
+
+    /// (v340) Multijoueur → FPS → « Ajouter une carte » : ses mondes (pas les cartes
+    /// téléchargées), ceux qu'on peut ajouter d'abord (départs réglés, pas encore dans la
+    /// liste FPS du relais), puis ceux qui y sont déjà, puis les autres.
+    fn rebuild_add_rows(&mut self) {
+        let picked = self
+            .fps_home
+            .add_selected
+            .and_then(|i| self.add_rows.get(i))
+            .map(|a| a.sig);
+        let mut rows: Vec<multiplayer::AddRow> = Vec::new();
+        for w in save::list_worlds(&self.paths.saves) {
+            if w.minecraft {
+                continue;
+            }
+            let Some(sig) = self.sig_cache.signature(&w.dir) else {
+                continue;
+            };
+            let fps = fpsmap::load(&w.dir);
+            rows.push(multiplayer::AddRow {
+                listed: self.accounts.maps.iter().any(|m| m.sig == sig && m.stored),
+                configured: fps.ct.is_some() && fps.t.is_some(),
+                players: fps.players(),
+                dir: w.dir,
+                sig,
+                name: w.meta.name,
+            });
+        }
+        rows.sort_by(|a, b| {
+            let rank = |r: &multiplayer::AddRow| (!r.can_add(), !r.listed);
+            rank(a).cmp(&rank(b)).then(a.name.cmp(&b.name))
+        });
+        self.fps_home.add_selected = picked.and_then(|s| rows.iter().position(|r| r.sig == s));
+        self.add_rows = rows;
+    }
+
+    /// (v340) Ce monde (de « Ajouter une carte ») part au relais : une carte FPS proposée à
+    /// tous, comme une carte lancée une fois en ligne (et renvoyée par ce PC si le relais
+    /// la perd, `maps_upkeep`).
+    fn add_map(&mut self, i: usize) {
+        use minelib_net::client::Cmd;
+        let Some(a) = self.add_rows.get(i).cloned() else {
+            return;
+        };
+        if !self.accounts.logged_in() {
+            self.fps_status = Some("Connecte-toi pour ajouter une carte.".into());
+            return;
+        }
+        match fpsmap::package(&a.dir) {
+            Ok(p) if p.signature() == a.sig => {
+                self.mark_shared(a.sig);
+                self.map_adding = Some((a.sig, a.name.clone()));
+                self.fps_status = Some(format!("Envoi de « {} » au relais…", a.name));
+                self.accounts.room(Cmd::UploadMap {
+                    sig: a.sig,
+                    name: a.name,
+                    bytes: p.to_bytes(),
+                    fps: true,
+                });
+            }
+            Ok(_) => {
+                // Le monde a changé depuis la liste : on la refait.
+                self.sig_cache = fpsmap::SigCache::default();
+                self.rebuild_add_rows();
+                self.fps_status = Some(format!("« {} » a changé : choisis-le de nouveau.", a.name));
+                self.fps_home.adding = true;
+            }
+            Err(e) => self.fps_status = Some(format!("Carte illisible : {e:#}")),
+        }
     }
 
     fn fps_home_screen(&mut self, input: &Input, size: (u32, u32)) {
@@ -2598,6 +2799,7 @@ impl Game {
             &mut self.fps_home,
             self.accounts.leaderboard.as_ref(),
             &self.map_rows,
+            &self.add_rows,
             self.fps_status.as_deref(),
             busy,
             time,
@@ -2624,6 +2826,19 @@ impl Game {
                 self.options.fps_color = c;
                 let _ = self.options.save(&self.paths.options);
             }
+            // (v340) Format choisi : gardé pour la prochaine fois.
+            multiplayer::FpsAction::Team(n) => {
+                if self.options.fps_team != n {
+                    self.options.fps_team = n;
+                    let _ = self.options.save(&self.paths.options);
+                }
+            }
+            multiplayer::FpsAction::OpenAdd => {
+                self.fps_status = None;
+                self.rebuild_add_rows();
+                self.accounts.room(Cmd::Maps);
+            }
+            multiplayer::FpsAction::AddMap(i) => self.add_map(i),
             multiplayer::FpsAction::Party(action, pseudo) => {
                 use minelib_net::proto;
                 if action == proto::PARTY_ACCEPT || action == proto::PARTY_DECLINE {
@@ -2766,7 +2981,8 @@ impl Game {
     }
 
     /// Cartes FPS de ce PC que le relais n'a pas (relais changé, PC-relais éteint) : on
-    /// les lui renvoie, une ou deux à la fois. Seulement celles déjà jouées en ligne.
+    /// les lui renvoie, une ou deux à la fois. Seulement celles déjà jouées en ligne, et
+    /// (v340) celles ajoutées par « Ajouter une carte ».
     fn maps_upkeep(&mut self) {
         use minelib_net::client::Cmd;
         if !self.accounts.logged_in() {

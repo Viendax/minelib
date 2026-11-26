@@ -55,7 +55,7 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 
 ### Jouer en ligne
 
-Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
+Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**. En haut à gauche, **Équipe : 5v5** : la flèche ouvre la liste des formats (1v1, 2v2, 3v3, 4v4, 5v5, 10v10), et seules les cartes faites pour ce nombre de joueurs (`/fps set maxplayer`) sont montrées. Les cartes certifiées passent en tête, puis les plus jouées.
 
 - **Échelles** (en construction, les lianes se grimpent pareil) : posées contre le mur visé ; un saut te projette en arrière avec la force du saut ; contre l'échelle, on monte en avançant (on descend en regardant vers le bas), avec une demi-seconde pour prendre de la vitesse. À pleine vitesse, ses barreaux s'entendent, pour soi et pour les joueurs proches, dans tous les modes (en construction en ligne aussi) ; accroupi, on grimpe plus lentement et sans bruit. Le saut accroupi (s'accroupir en l'air replie les jambes : on monte à 1,5 bloc) marche aussi dans tous les modes.
 - **Couleurs des coéquipiers** : bleu vif, orange vif, vert vif, jaune vif, violet foncé, puis rouge vif, rose flamant rose, blanc, gris clair, marron foncé. À N contre N, seules les N premières servent (les 5 premières en 5 contre 5). Teintes vérifiées pour les daltoniens (protanopie, deutéranopie, tritanopie).
@@ -66,7 +66,7 @@ Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 - **Joue avec tes amis** : le panneau de droite liste tes amis (en ligne en vert) ; un clic invite dans ton **lobby** (jusqu'à 10 joueurs : il doit tenir dans une équipe de la carte, 5 pour un 5 contre 5, 10 pour un 10 contre 10). Celui qui invite en premier est l'hôte du lobby : il lance la partie pour tout le monde, et vous êtes **toujours dans la même équipe**. Clic droit sur un membre : *Exclure* ou *Promouvoir hôte*.
 
 - Chaque carte affiche clairement son format (**5 contre 5**, 2 contre 2, jusqu'à 10 contre 10). **Seules les cartes 5 contre 5 comptent au classement.** (v307) Et une carte ne compte qu'une fois jouée par assez de comptes différents (20 ; sur un relais qui connaît peu de joueurs, la moitié d'entre eux, jamais moins de 10) : un même salon qui la rejoue cent fois n'y suffit pas, les bots ne comptent pas. `/reportmap`, pendant une partie, signale la carte (une fois par compte, comptes de confiance seulement) : quand un quart de ceux qui y ont joué l'ont signalée, elle ne compte plus pour le classement.
-- **Les cartes de la communauté** : toute carte déjà lancée en partie FPS en ligne apparaît dans la liste de tout le monde et se télécharge toute seule. Elle reste disponible tant qu'un joueur qui y a joué l'a encore (son jeu la renvoie au relais si besoin). Tes autres mondes restent privés.
+- **Les cartes de la communauté** : toute carte déjà lancée en partie FPS en ligne apparaît dans la liste de tout le monde et se télécharge toute seule. **Ajouter une carte** y met un de tes mondes sans attendre une partie (ses départs réglés avec `/fps set spawn ct` et `/fps set spawn t`). Elle reste disponible tant qu'un joueur qui l'a ajoutée ou y a joué l'a encore (son jeu la renvoie au relais si besoin). Tes autres mondes restent privés.
 - Pendant l'échauffement, **les autres joueurs restent anonymes** (« Joueur 3 ») : on ne quitte pas la recherche parce qu'on a vu un nom. Les pseudos s'affichent quand la partie commence au complet.
 - **Matchmaking équitable** : d'abord un niveau Elo proche de l'équipe déjà formée (moyenne du lobby), puis les nouveaux avec les nouveaux, puis un facteur de confiance proche (le plus bas du lobby). Jamais avec quelqu'un que tu as signalé.
 - **Classement** : tes amis d'abord, le **Top mondial** à côté. (v315) Le Top mondial n'est plus coupé aux 50 premiers : il se lit jusqu'au dernier joueur classé, la suite se charge quand tu défiles (200 lignes à la fois). Elo calculé comme aux échecs sur les parties 5 contre 5 des 10 cartes les plus jouées, avec les statistiques habituelles (K/D, % de tirs à la tête, ADR, MVP).
@@ -123,7 +123,7 @@ Dans ton monde en créatif, sélectionne une zone avec la baguette (`//wand`), p
 |----------|-------|
 | `/fps set spawn ct` · `/fps set spawn t` | Zone de départ des CT / des T |
 | `/fps set site a` · `b` · `c` | Site de bombe |
-| `/fps set maxplayer <n>` | Nombre de joueurs, toujours pair (2 à 20 ; 10 = classé) |
+| `/fps set maxplayer <n>` | Nombre de joueurs : 2, 4, 6, 8, 10 ou 20 (1v1, 2v2, 3v3, 4v4, 5v5, 10v10 ; seul le 5v5 est classé) |
 | `/fps set door` | La porte visée, ou celles de la sélection de la baguette, s'ouvrent en partie (une sélection d'un seul bloc de porte prend toute la porte, les quatre blocs d'une double porte) ; `/fps clear door [all]` les retire |
 | `/fps set door on\|off` | Toutes les portes et trappes utilisables en partie (touche *Utiliser*, avec leur bruit), ou seulement celles posées avec `/fps set door` |
 | `/fps set doorsync on\|off` | Double porte : ouvrir un battant ouvre aussi l'autre |

@@ -30,7 +30,10 @@ pub const HELP: &[Help] = &[
             ),
             ("/fps set site a | site b | site c", "zone d'un site de bombe (sélection)"),
             ("/fps clear <zone>", "efface une zone (spawn ct, site b…)"),
-            ("/fps set maxplayer <2-20>", "joueurs de la carte (nombre pair ; seul 10 est classé)"),
+            (
+                "/fps set maxplayer <2|4|6|8|10|20>",
+                "joueurs de la carte : 1v1, 2v2, 3v3, 4v4, 5v5 (le seul classé) ou 10v10",
+            ),
             (
                 "/fps set door",
                 "la porte visée, ou celles de la sélection : elle s'ouvre en partie",
@@ -251,11 +254,20 @@ pub const FORM: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 pub const NOTE: [f32; 4] = [0.68, 0.7, 0.74, 1.0];
 pub const SAVED: [f32; 4] = [0.55, 0.9, 0.6, 1.0];
 
+/// (v340) Formes de /fps montrées seulement au compte qui certifie les cartes
+/// (`proto::CERTIFIER`) : pour les autres, elles n'existent pas.
+pub const CERTIFIER_FORMS: &[(&str, &str)] = &[(
+    "/fps certif true|false",
+    "certifie la carte de ce monde : en tête de la liste FPS de tous (ou plus)",
+)];
+
 /// Lignes de l'aide pour la saisie `input` (qui commence par « / »), au plus `max` ;
-/// `state` : ce qui est enregistré pour une commande (par son premier nom).
+/// `state` : ce qui est enregistré pour une commande (par son premier nom) ; (v340)
+/// `certifier` : le joueur est le compte qui certifie les cartes (`CERTIFIER_FORMS`).
 pub fn lines(
     input: &str,
     max: usize,
+    certifier: bool,
     mut state: impl FnMut(&str) -> Vec<String>,
 ) -> Vec<(String, [f32; 4])> {
     let Some(rest) = input.strip_prefix('/') else {
@@ -268,7 +280,10 @@ pub fn lines(
     let word = rest.split_whitespace().next().unwrap_or("");
     let found = matching(word);
     let low = word.to_lowercase();
-    let exact = found.first().copied().filter(|h| h.names.contains(&low.as_str()));
+    let exact = found
+        .first()
+        .copied()
+        .filter(|h| h.names.contains(&low.as_str()));
     let single = exact.or_else(|| (found.len() == 1).then(|| found[0]));
     let mut out = Vec::new();
     if found.is_empty() {
@@ -277,7 +292,12 @@ pub fn lines(
         }
     } else if let Some(h) = single {
         out.push((format!("/{} : {}", h.names[0], h.what), TITLE));
-        for (form, what) in h.forms {
+        let extra: &[(&str, &str)] = if certifier && h.names[0] == "fps" {
+            CERTIFIER_FORMS
+        } else {
+            &[]
+        };
+        for (form, what) in h.forms.iter().chain(extra) {
             if what.is_empty() {
                 out.push((format!("  {form}"), FORM));
             } else {
@@ -311,10 +331,10 @@ mod tests {
     #[test]
     fn typing_a_command_shows_its_forms_and_what_is_saved() {
         let none = |_: &str| Vec::new();
-        let l = lines("/t", 20, none);
+        let l = lines("/t", 20, false, none);
         assert!(l.iter().any(|(t, _)| t.starts_with("/tp")));
         assert!(l.iter().any(|(t, _)| t.starts_with("/timeset")));
-        let l = lines("/fps", 20, |name: &str| {
+        let l = lines("/fps", 20, false, |name: &str| {
             assert_eq!(name, "fps");
             vec!["joueurs : 10".to_string()]
         });
@@ -322,15 +342,29 @@ mod tests {
         assert!(l.iter().any(|(t, _)| t.contains("/fps set spawn ct")));
         assert!(l.iter().any(|(t, _)| t == "  joueurs : 10"));
         // Avec des arguments : toujours l'aide de la commande.
-        let l = lines("/fps set ", 20, none);
+        let l = lines("/fps set ", 20, false, none);
         assert_eq!(l[0].1, TITLE);
         // Un alias : la même aide.
-        assert!(lines("/meteo", 20, none)[0].0.starts_with("/weather"));
-        assert!(lines("/zzz", 20, none)[0].0.contains("Aucune commande"));
-        assert!(lines("//set", 20, none).is_empty());
-        assert!(lines("bonjour", 20, none).is_empty());
+        assert!(lines("/meteo", 20, false, none)[0]
+            .0
+            .starts_with("/weather"));
+        assert!(lines("/zzz", 20, false, none)[0]
+            .0
+            .contains("Aucune commande"));
+        assert!(lines("//set", 20, false, none).is_empty());
+        assert!(lines("bonjour", 20, false, none).is_empty());
+        // (v340) `/fps certif` : montré au seul compte qui certifie les cartes.
+        assert!(!lines("/fps", 40, false, none)
+            .iter()
+            .any(|(t, _)| t.contains("certif")));
+        assert!(lines("/fps", 40, true, none)
+            .iter()
+            .any(|(t, _)| t.contains("/fps certif true|false")));
+        assert!(!lines("/bot", 40, true, none)
+            .iter()
+            .any(|(t, _)| t.contains("certif")));
         // Trop de lignes : coupé, avec ce qu'il en reste.
-        let l = lines("/", 5, none);
+        let l = lines("/", 5, false, none);
         assert_eq!(l.len(), 5);
         assert!(l[4].0.contains("de plus"));
     }

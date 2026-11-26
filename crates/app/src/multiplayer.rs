@@ -2,7 +2,10 @@
 //!
 //! - FPS : pas de liste de serveurs. En haut le classement (50 meilleurs du monde, ou ses
 //!   amis), en bas le choix de la carte (chaque carte une seule fois, par sa signature) ;
-//!   « Rechercher » rejoint une partie en attente sur cette carte, ou en ouvre une.
+//!   « Rechercher » rejoint une partie en attente sur cette carte, ou en ouvre une. (v340)
+//!   En haut à gauche, le format (« Équipe : 5v5 ») : seules les cartes de ce format sont
+//!   montrées, les certifiées d'abord, puis les plus jouées ; « Ajouter une carte » met un de
+//!   ses mondes dans la liste de tous.
 //! - Construction : liste des mondes ouverts par les joueurs.
 
 use minelib_render::Ui;
@@ -429,6 +432,76 @@ pub struct MapRow {
     pub players: u8,
     /// Le relais l'a entière (sinon : en cours d'envoi, pas encore téléchargeable).
     pub stored: bool,
+    /// (v340) Certifiée (`/fps certif`, compte `proto::CERTIFIER`) : en tête de la liste.
+    pub certified: bool,
+}
+
+/// (v340) Formats proposés par « Équipe » (joueurs par équipe) : une carte y apparaît quand
+/// son nombre de joueurs (`/fps set maxplayer`) est le double. Seul le 5v5 est classé.
+pub const TEAM_SIZES: [u8; 6] = [1, 2, 3, 4, 5, 10];
+
+/// (v340) Format choisi par défaut, et le seul classé.
+pub const RANKED_TEAM: u8 = 5;
+
+/// (v340) « 5v5 ».
+pub fn team_label(n: u8) -> String {
+    format!("{n}v{n}")
+}
+
+/// (v340) Format valide (sinon le 5v5).
+pub fn team_or_default(n: u8) -> u8 {
+    if TEAM_SIZES.contains(&n) {
+        n
+    } else {
+        RANKED_TEAM
+    }
+}
+
+/// (v340) Les cartes montrées (indices dans `maps`) : celles du format `team` (joueurs par
+/// équipe : `players` = 2 × `team`), dont le nom ou l'auteur contient `query`.
+pub fn maps_for(maps: &[MapRow], team: u8, query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    (0..maps.len())
+        .filter(|&i| maps[i].players.max(2) == 2 * team)
+        .filter(|&i| {
+            query.is_empty()
+                || maps[i].name.to_lowercase().contains(&query)
+                || maps[i].author.to_lowercase().contains(&query)
+        })
+        .collect()
+}
+
+/// (v340) Ordre de la liste des cartes : les certifiées d'abord, puis les plus jouées (à
+/// parties égales, celles où l'on attend une partie, puis par nom).
+pub fn sort_rows(rows: &mut [MapRow]) {
+    rows.sort_by(|a, b| {
+        b.certified
+            .cmp(&a.certified)
+            .then(b.plays.cmp(&a.plays))
+            .then(b.waiting.cmp(&a.waiting))
+            .then(a.name.cmp(&b.name))
+    });
+}
+
+/// (v340) Un de ses mondes, proposé par « Ajouter une carte » : il part au relais et entre
+/// dans la liste FPS de tous les joueurs.
+#[derive(Clone, Debug)]
+pub struct AddRow {
+    pub dir: std::path::PathBuf,
+    pub sig: [u8; 32],
+    pub name: String,
+    /// Joueurs d'une partie (format).
+    pub players: u8,
+    /// Départs CT et T réglés (`/fps set spawn`) : sinon, pas encore une carte FPS.
+    pub configured: bool,
+    /// Déjà dans la liste FPS du relais.
+    pub listed: bool,
+}
+
+impl AddRow {
+    pub fn can_add(&self) -> bool {
+        self.configured && !self.listed
+    }
 }
 
 /// Nom d'une carte sans sa version : (famille, version). « Overpass CS2 v.0.3.2 Quality »
@@ -467,7 +540,8 @@ pub fn map_family(name: &str) -> (String, Vec<u32>) {
 /// Anciennes versions d'une carte (même auteur, même nom à la version près) qui n'ont
 /// jamais fini une partie en ligne : retirées de la liste. On garde de chaque carte sa
 /// version la plus récente (à version égale : celle de ce PC, puis la plus jouée), toute
-/// version qui a fini au moins une partie, et celles où des joueurs attendent une partie.
+/// version qui a fini au moins une partie, celles où des joueurs attendent une partie, et
+/// (v340) celles qui sont certifiées.
 pub fn hide_old_versions(rows: &mut Vec<MapRow>) {
     let keys: Vec<(String, String, Vec<u32>)> = rows
         .iter()
@@ -499,6 +573,7 @@ pub fn hide_old_versions(rows: &mut Vec<MapRow>) {
             best.get(&(keys[i].0.as_str(), keys[i].1.as_str())) == Some(&i)
                 || rows[i].plays > 0
                 || rows[i].waiting > 0
+                || rows[i].certified
         })
         .collect();
     let mut it = keep.into_iter();
@@ -519,6 +594,12 @@ pub enum FpsAction {
     Party(u8, String),
     /// Couleur préférée (255 : aucune).
     Color(u8),
+    /// (v340) Format choisi (« Équipe »), en joueurs par équipe.
+    Team(u8),
+    /// (v340) « Ajouter une carte » : la liste de ses mondes est à refaire.
+    OpenAdd,
+    /// (v340) Ce monde (indice dans la liste de « Ajouter une carte ») part au relais.
+    AddMap(usize),
 }
 
 /// Ce que le panneau du lobby affiche.
@@ -548,7 +629,8 @@ pub struct FpsHome {
     pub scroll: usize,
     pub map_scroll: usize,
     pub members_scroll: usize,
-    /// Barre de défilement tenue : 1 classement, 2 cartes, 3 amis, 4 lobby.
+    /// Barre de défilement tenue : 1 classement, 2 cartes, 3 amis, 4 lobby, (v340) 5 ses
+    /// mondes (« Ajouter une carte »).
     pub drag: u8,
     pub selected: Option<usize>,
     /// Recherche dans les cartes (à droite de « Carte »).
@@ -558,9 +640,26 @@ pub struct FpsHome {
     pub map_click: Option<(usize, f32)>,
     /// Dernière mise à jour automatique de la liste des cartes (horloge de l'écran).
     pub polled: f32,
+    /// (v340) Format choisi (joueurs par équipe, `TEAM_SIZES` ; 0 : le 5v5), et sa liste
+    /// ouverte.
+    pub team: u8,
+    pub team_open: bool,
+    /// (v340) « Ajouter une carte » ouvert : monde choisi, défilement.
+    pub adding: bool,
+    pub add_selected: Option<usize>,
+    pub add_scroll: usize,
 }
 
-/// Écran FPS : classement au-dessus, choix de la carte en dessous.
+impl FpsHome {
+    /// (v340) Format choisi (le 5v5 tant que rien d'autre ne l'est).
+    pub fn team(&self) -> u8 {
+        team_or_default(self.team)
+    }
+}
+
+/// Écran FPS : classement au-dessus, choix de la carte en dessous. (v340) En haut à gauche,
+/// « Équipe : 5v5 » et sa liste (`TEAM_SIZES`) : seules les cartes de ce format sont
+/// montrées ; « Ajouter une carte » met un de ses mondes (`adds`) dans la liste de tous.
 #[allow(clippy::too_many_arguments)]
 pub fn fps_screen(
     c: &mut Ctx,
@@ -572,14 +671,30 @@ pub fn fps_screen(
         Option<minelib_net::proto::RankEntry>,
     )>,
     maps: &[MapRow],
+    adds: &[AddRow],
     status: Option<&str>,
     busy: bool,
     time: f32,
     lobby: LobbyView,
 ) -> FpsAction {
     c.background();
+    if st.adding {
+        return add_screen(c, input, st, adds, status, busy, time);
+    }
     let s = c.s;
     let ds = (s / 2.0).floor().max(1.0);
+    // (v340) « Équipe : 5v5 », tout en haut à gauche. Sa liste ouverte passe par-dessus le
+    // classement : ce qui est dessous ne voit ni la souris ni ses clics (rendus plus bas,
+    // quand la liste est dessinée).
+    let team = st.team();
+    let drop = TeamDrop::at(s);
+    let over_drop = c.hovered(drop.x, drop.y, drop.w, drop.h)
+        || (st.team_open && c.hovered(drop.x, drop.y + drop.h, drop.w, drop.list_h()));
+    let mouse = (c.cursor, c.click);
+    if over_drop {
+        c.cursor = None;
+        c.click = false;
+    }
     // Panneau du lobby à droite, le reste à gauche.
     let panel_w = (c.w * 0.26).clamp(120.0 * s, 170.0 * s);
     let avail = c.w - panel_w - 12.0 * s;
@@ -592,19 +707,29 @@ pub fn fps_screen(
     let panel_action = lobby_panel(c, input, st, &lobby, avail + 6.0 * s, panel_w, time, colors);
     let title = "FPS - compétitif";
     let tw = Ui::text_width(title, s * 1.5);
-    c.ui.text((avail - tw) / 2.0, 8.0 * s, s * 1.5, WHITE, title);
+    // (v340) Jamais sur « Équipe : 5v5 » (en haut à gauche) : décalé à sa droite s'il le faut.
+    let title_x = ((avail - tw) / 2.0).max(drop.x + drop.w + 8.0 * s);
+    c.ui.text(title_x, 8.0 * s, s * 1.5, WHITE, title);
     let w = (avail - 16.0 * s).min(440.0 * s);
     let x = (avail - w) / 2.0;
     // Onglets du classement : les amis d'abord, le top mondial à droite.
     let tab_y = 24.0 * s;
     let tab_w = 110.0;
-    let friends = c.button("Amis", x + tab_w * s / 2.0, tab_y, tab_w, st.world_tab);
+    // (v340) Pas de classement hors du 5v5 (pour le moment) : onglets éteints.
+    let ranked = team == RANKED_TEAM;
+    let friends = c.button(
+        "Amis",
+        x + tab_w * s / 2.0,
+        tab_y,
+        tab_w,
+        ranked && st.world_tab,
+    );
     let world = c.button(
         "Top mondial",
         x + tab_w * s * 1.5 + 4.0 * s,
         tab_y,
         tab_w,
-        !st.world_tab,
+        ranked && !st.world_tab,
     );
     let mut action = panel_action;
     if world {
@@ -639,7 +764,7 @@ pub fn fps_screen(
         cols.get(k + 1)
             .map_or(w - bar - 6.0 * s, |(_, f)| w * f - 3.0 * s)
     };
-    for (label, f) in cols {
+    for (label, f) in cols.into_iter().filter(|_| ranked) {
         c.ui.text(x + w * f, list_y + 5.0 * s, ds, GREY, label);
     }
     let row = 11.0 * s;
@@ -673,6 +798,30 @@ pub fn fps_screen(
         }
     };
     match board.filter(|b| b.0 != st.world_tab) {
+        _ if !ranked => {
+            let lines = [
+                (
+                    format!("Pas de classement en {} pour le moment.", team_label(team)),
+                    s,
+                ),
+                (
+                    format!("Seul le {} est classé.", team_label(RANKED_TEAM)),
+                    ds,
+                ),
+            ];
+            let mut ly = top + 16.0 * s;
+            for (t, scale) in lines {
+                let t = crate::menu::fit(&t, w - 8.0 * s, scale);
+                c.ui.text(
+                    x + (w - Ui::text_width(&t, scale)) / 2.0,
+                    ly,
+                    scale,
+                    GREY,
+                    t,
+                );
+                ly += 12.0 * s;
+            }
+        }
         None => {
             let t = "Chargement du classement…";
             c.ui.text(
@@ -766,14 +915,16 @@ pub fn fps_screen(
     if st.map_search_focus {
         crate::menu::edit_text(&mut st.map_search, input, 24);
     }
-    let query = st.map_search.trim().to_lowercase();
-    let shown: Vec<usize> = (0..maps.len())
-        .filter(|&i| {
-            query.is_empty()
-                || maps[i].name.to_lowercase().contains(&query)
-                || maps[i].author.to_lowercase().contains(&query)
-        })
-        .collect();
+    // (v340) Les cartes du format choisi (« Équipe »), dans l'ordre donné par le jeu (les
+    // certifiées d'abord, puis les plus jouées : `sort_rows`).
+    let fits_team = |m: &MapRow| m.players.max(2) == 2 * team;
+    let shown = maps_for(maps, team, &st.map_search);
+    if st
+        .selected
+        .is_some_and(|i| maps.get(i).is_none_or(|m| !fits_team(m)))
+    {
+        st.selected = None;
+    }
     let maps_y = my + 24.0 * s;
     let maps_h = (c.h - maps_y - 56.0 * s).max(40.0 * s);
     c.frame(x, maps_y, w, maps_h);
@@ -805,18 +956,32 @@ pub fn fps_screen(
         0.0
     };
     if shown.is_empty() {
-        let t = if maps.is_empty() {
-            "Aucune carte : crée un monde, règle les départs avec /fps set, et reviens."
+        let lines = if maps.is_empty() {
+            vec![
+                "Aucune carte : crée un monde, règle les départs avec /fps set, et reviens."
+                    .to_string(),
+            ]
+        } else if !maps.iter().any(fits_team) {
+            vec![
+                format!("Aucune carte en {}.", team_label(team)),
+                format!(
+                    "/fps set maxplayer {} dans un de tes mondes en fait une.",
+                    2 * team
+                ),
+            ]
         } else {
-            "Aucune carte ne correspond à la recherche."
+            vec!["Aucune carte ne correspond à la recherche.".to_string()]
         };
-        c.ui.text(
-            x + (w - Ui::text_width(t, ds)) / 2.0,
-            maps_y + 14.0 * s,
-            ds,
-            GREY,
-            t,
-        );
+        for (k, t) in lines.iter().enumerate() {
+            let t = crate::menu::fit(t, w - 8.0 * s, ds);
+            c.ui.text(
+                x + (w - Ui::text_width(&t, ds)) / 2.0,
+                maps_y + 14.0 * s + k as f32 * 11.0 * ds,
+                ds,
+                GREY,
+                t,
+            );
+        }
     }
     let mut double = None;
     for (k, &i) in shown.iter().enumerate().skip(st.map_scroll).take(vis) {
@@ -868,25 +1033,36 @@ pub fn fps_screen(
             col,
             t,
         );
+        // Sous le format : (v340) « certifiée » en or, et « hors classement » hors du 5v5.
+        let mut right_x = x + w - 8.0 * s - right;
         if n != 10 {
             let r = "hors classement";
-            c.ui.text(
-                x + w - Ui::text_width(r, ds) - 8.0 * s - right,
-                y + 16.0 * s,
-                ds,
-                GREY,
-                r,
-            );
+            right_x -= Ui::text_width(r, ds);
+            c.ui.text(right_x, y + 16.0 * s, ds, GREY, r);
+            right_x -= 4.0 * ds;
         }
-    }
-    if st.selected.is_some_and(|i| i >= maps.len()) {
-        st.selected = None;
+        if m.certified {
+            let r = "certifiée";
+            right_x -= Ui::text_width(r, ds);
+            c.ui.text(right_x, y + 16.0 * s, ds, GOLD, r);
+        }
     }
     if let Some(t) = status {
         let t = crate::menu::fit(t, avail - 8.0 * s, s);
         let tw = Ui::text_width(&t, s);
         c.ui.text((avail - tw) / 2.0, c.h - 60.0 * s, s, GOLD, t);
     }
+    // (v340) La liste des formats, par-dessus le reste : la souris lui revient.
+    (c.cursor, c.click) = mouse;
+    let esc = input.pressed(minelib_platform::KeyCode::Escape);
+    // Échap ferme la liste ouverte (sans quitter l'écran).
+    let was_open = st.team_open;
+    if let Some(n) = team_drop(c, st, &drop, esc) {
+        st.team = n;
+        st.map_scroll = 0;
+        action = FpsAction::Team(n);
+    }
+    let esc = esc && !was_open;
     let by = c.h - 48.0 * s;
     let cx = avail / 2.0;
     let half = (150.0 / 2.0 + 3.0) * s;
@@ -918,10 +1094,19 @@ pub fn fps_screen(
         150.0,
         st.selected.is_some() && !busy && leader && fits,
     );
-    let refresh = c.button("Actualiser", cx + half, by, 150.0, true);
-    let back = c.button("Retour", cx, by + 24.0 * s, 150.0, true);
-    if back || input.pressed(minelib_platform::KeyCode::Escape) {
+    // (v340) « Ajouter une carte » : un de ses mondes dans la liste FPS de tous.
+    let add = c.button("Ajouter une carte", cx + half, by, 150.0, !busy);
+    let refresh = c.button("Actualiser", cx - half, by + 24.0 * s, 150.0, true);
+    let back = c.button("Retour", cx + half, by + 24.0 * s, 150.0, true);
+    if back || esc {
         return FpsAction::Back;
+    }
+    if add {
+        st.adding = true;
+        st.add_selected = None;
+        st.add_scroll = 0;
+        st.team_open = false;
+        return FpsAction::OpenAdd;
     }
     if let (true, Some(i)) = (search, st.selected) {
         return FpsAction::Search(i);
@@ -938,6 +1123,244 @@ pub fn fps_screen(
         return FpsAction::Poll;
     }
     action
+}
+
+/// (v340) Où est « Équipe : 5v5 » (tout en haut à gauche de l'écran FPS), et sa liste.
+struct TeamDrop {
+    s: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    row: f32,
+}
+
+impl TeamDrop {
+    fn at(s: f32) -> Self {
+        // Assez large pour le plus long (« Équipe : 10v10 ») et la flèche.
+        let w = TEAM_SIZES
+            .iter()
+            .map(|&n| Ui::text_width(&team_text(n), s))
+            .fold(0.0, f32::max)
+            + 22.0 * s;
+        Self {
+            s,
+            x: 6.0 * s,
+            y: 5.0 * s,
+            w,
+            h: 14.0 * s,
+            row: 12.0 * s,
+        }
+    }
+
+    fn list_h(&self) -> f32 {
+        TEAM_SIZES.len() as f32 * self.row + 4.0 * self.s
+    }
+}
+
+/// (v340) « Équipe : 5v5 ».
+fn team_text(n: u8) -> String {
+    format!("Équipe : {}", team_label(n))
+}
+
+/// (v340) Petite flèche vers le bas (7 × 4 pixels de texture).
+fn down_arrow(c: &mut Ctx, x: f32, y: f32, s: f32, color: [f32; 4]) {
+    for k in 0..4 {
+        let k = k as f32;
+        c.ui.rect(x + k * s, y + k * s, (7.0 - 2.0 * k) * s, s, color);
+    }
+}
+
+/// (v340) Dessine « Équipe : 5v5 » et, ouverte, la liste des formats ; un clic sur le cadre
+/// l'ouvre ou la ferme, un clic ailleurs (ou Échap) la ferme. Rend le format choisi.
+fn team_drop(c: &mut Ctx, st: &mut FpsHome, d: &TeamDrop, esc: bool) -> Option<u8> {
+    let s = d.s;
+    let team = st.team();
+    let hover = c.hovered(d.x, d.y, d.w, d.h);
+    let lit = hover || st.team_open;
+    c.frame(d.x, d.y, d.w, d.h);
+    if lit {
+        c.ui.rect(
+            d.x + s,
+            d.y + s,
+            d.w - 2.0 * s,
+            d.h - 2.0 * s,
+            [1.0, 1.0, 1.0, 0.08],
+        );
+    }
+    let ty = d.y + (d.h - 8.0 * s) / 2.0;
+    c.ui.text(d.x + 5.0 * s, ty, s, WHITE, team_text(team));
+    down_arrow(
+        c,
+        d.x + d.w - 11.0 * s,
+        d.y + (d.h - 4.0 * s) / 2.0,
+        s,
+        if lit { GOLD } else { WHITE },
+    );
+    let mut picked = None;
+    if st.team_open {
+        let ly = d.y + d.h;
+        // Fond plein : rien de ce qui est dessous ne se voit à travers.
+        c.ui.rect(d.x, ly, d.w, d.list_h(), [0.11, 0.12, 0.15, 1.0]);
+        c.frame(d.x, ly, d.w, d.list_h());
+        for (k, &n) in TEAM_SIZES.iter().enumerate() {
+            let ry = ly + 2.0 * s + k as f32 * d.row;
+            let over = c.hovered(d.x, ry, d.w, d.row);
+            if n == team || over {
+                let a = if n == team { 0.12 } else { 0.07 };
+                c.ui.rect(d.x + s, ry, d.w - 2.0 * s, d.row, [1.0, 1.0, 1.0, a]);
+            }
+            let col = if n == team { GOLD } else { WHITE };
+            let mut label = team_label(n);
+            if n == RANKED_TEAM {
+                label += " (classé)";
+            }
+            c.ui.text(d.x + 6.0 * s, ry + (d.row - 8.0 * s) / 2.0, s, col, label);
+            if over && c.click {
+                picked = Some(n);
+            }
+        }
+    }
+    if c.click {
+        // Le cadre ouvre ou ferme ; un format choisi, ou un clic ailleurs, ferme.
+        st.team_open = hover && !st.team_open;
+    } else if esc {
+        st.team_open = false;
+    }
+    picked
+}
+
+/// (v340) « Ajouter une carte » : ses mondes (`adds`, rangés par le jeu) ; celui choisi part
+/// au relais et entre dans la liste FPS de tous les joueurs, comme une carte lancée une fois
+/// en ligne. Il faut que ses départs soient réglés, et qu'il n'y soit pas déjà.
+fn add_screen(
+    c: &mut Ctx,
+    input: &minelib_platform::Input,
+    st: &mut FpsHome,
+    adds: &[AddRow],
+    status: Option<&str>,
+    busy: bool,
+    time: f32,
+) -> FpsAction {
+    let s = c.s;
+    let ds = (s / 2.0).floor().max(1.0);
+    c.text_center("Ajouter une carte", 10.0 * s, s * 1.5, WHITE);
+    let w = (c.w - 40.0 * s).min(400.0 * s);
+    let x = (c.w - w) / 2.0;
+    // Ce qu'on fait ici, sur autant de lignes qu'il faut.
+    let note = "Choisis un de tes mondes dont les départs sont réglés (/fps set spawn ct et \
+                /fps set spawn t) : il part au relais, et tous les joueurs le voient dans la \
+                liste des cartes FPS.";
+    let lines = crate::friends::wrap(note, w, ds);
+    for (k, l) in lines.iter().enumerate() {
+        let lw = Ui::text_width(l, ds);
+        c.ui.text(
+            (c.w - lw) / 2.0,
+            28.0 * s + k as f32 * 10.0 * ds,
+            ds,
+            GREY,
+            l.as_str(),
+        );
+    }
+    let list_y = 32.0 * s + lines.len() as f32 * 10.0 * ds;
+    let list_h = (c.h - list_y - 64.0 * s).max(40.0 * s);
+    c.frame(x, list_y, w, list_h);
+    let row_h = 26.0 * s;
+    let vis = ((list_h - 4.0 * s) / row_h).floor().max(1.0) as usize;
+    let over = c.hovered(x, list_y, w, list_h);
+    Ctx::wheel(input, over, adds.len(), vis, &mut st.add_scroll);
+    let bar = c.bar_w();
+    let mut drag = st.drag == 5;
+    c.scrollbar(
+        x + w - bar - 3.0 * s,
+        list_y + 2.0 * s,
+        vis as f32 * row_h - s,
+        adds.len(),
+        vis,
+        &mut st.add_scroll,
+        &mut drag,
+    );
+    st.drag = if drag {
+        5
+    } else if st.drag == 5 {
+        0
+    } else {
+        st.drag
+    };
+    let right = if adds.len() > vis { bar + 4.0 * s } else { 0.0 };
+    if adds.is_empty() {
+        let t = "Aucun monde : crée-en un, règle ses départs avec /fps set spawn, et reviens.";
+        let t = crate::menu::fit(t, w - 8.0 * s, ds);
+        c.ui.text(
+            x + (w - Ui::text_width(&t, ds)) / 2.0,
+            list_y + 14.0 * s,
+            ds,
+            GREY,
+            t,
+        );
+    }
+    if st.add_selected.is_some_and(|i| i >= adds.len()) {
+        st.add_selected = None;
+    }
+    let mut double = None;
+    for (k, a) in adds.iter().enumerate().skip(st.add_scroll).take(vis) {
+        let y = list_y + 2.0 * s + (k - st.add_scroll) as f32 * row_h;
+        let n = a.players.max(2) / 2;
+        let state = if a.listed {
+            "déjà dans la liste FPS"
+        } else if !a.configured {
+            "départs non réglés (/fps set spawn)"
+        } else {
+            "prête à ajouter"
+        };
+        let detail = format!("{} - {state}", team_label(n));
+        if c.list_row(
+            x + 2.0 * s,
+            y,
+            w - 4.0 * s - right,
+            row_h - s,
+            &a.name,
+            &detail,
+            st.add_selected == Some(k),
+        ) {
+            if st.add_selected == Some(k)
+                && st.map_click.is_some_and(|(j, t)| j == k && time - t < 0.4)
+            {
+                double = Some(k);
+                st.map_click = None;
+            } else {
+                st.map_click = Some((k, time));
+            }
+            st.add_selected = Some(k);
+        }
+    }
+    if let Some(t) = status {
+        let t = crate::menu::fit(t, c.w - 16.0 * s, s);
+        let tw = Ui::text_width(&t, s);
+        c.ui.text((c.w - tw) / 2.0, c.h - 60.0 * s, s, GOLD, t);
+    }
+    let by = c.h - 48.0 * s;
+    let half = (150.0 / 2.0 + 3.0) * s;
+    let pick = st
+        .add_selected
+        .filter(|&i| adds.get(i).is_some_and(AddRow::can_add) && !busy);
+    let add = c.button("Ajouter", c.w / 2.0 - half, by, 150.0, pick.is_some());
+    let cancel = c.button("Annuler", c.w / 2.0 + half, by, 150.0, true);
+    let chosen = if add {
+        pick
+    } else {
+        double.filter(|_| pick == double)
+    };
+    if let Some(i) = chosen {
+        st.adding = false;
+        st.map_click = None;
+        return FpsAction::AddMap(i);
+    }
+    if cancel || input.pressed(minelib_platform::KeyCode::Escape) {
+        st.adding = false;
+        st.map_click = None;
+    }
+    FpsAction::None
 }
 
 /// Couleurs des joueurs d'une équipe (lobby, bandeau des têtes, triangles, carte), dans
@@ -1264,6 +1687,7 @@ mod tests {
             configured: true,
             players: 10,
             stored: true,
+            certified: false,
         }
     }
 
@@ -1284,9 +1708,15 @@ mod tests {
             keeper: String::new(),
             can_wake: false,
         };
-        assert_eq!(detail(&sv, 10_030), "ile - Relais - record 9 - actif à l'instant");
+        assert_eq!(
+            detail(&sv, 10_030),
+            "ile - Relais - record 9 - actif à l'instant"
+        );
         sv.players = 9;
-        assert_eq!(detail(&sv, 10_000 + 600), "ile - Relais - actif il y a 10 min");
+        assert_eq!(
+            detail(&sv, 10_000 + 600),
+            "ile - Relais - actif il y a 10 min"
+        );
         sv.asleep = true;
         sv.keeper = "Bob".into();
         assert_eq!(
@@ -1350,6 +1780,11 @@ mod tests {
         let mut waited = row("Overpass v.0.0.9", "viendax", false, 0);
         waited.waiting = 2;
         rows.push(waited);
+        // (v340) Ancienne version certifiée : gardée.
+        let mut certified = row("Overpass v.0.0.5", "viendax", false, 0);
+        certified.sig = [98; 32];
+        certified.certified = true;
+        rows.push(certified);
         hide_old_versions(&mut rows);
         let names: Vec<(String, String, bool)> = rows
             .iter()
@@ -1378,6 +1813,51 @@ mod tests {
         );
         assert!(has("Overpass v.0.1", "Fox", false), "{names:?}");
         assert!(has("Nouveau monde 1", "viendax", true) && has("Nouveau monde 2", "viendax", true));
-        assert_eq!(rows.len(), 7, "{names:?}");
+        assert!(
+            has("Overpass v.0.0.5", "viendax", false),
+            "certifiée : {names:?}"
+        );
+        assert_eq!(rows.len(), 8, "{names:?}");
+    }
+
+    /// (v340) « Équipe : 2v2 » : les cartes pour 4 joueurs seulement ; la recherche filtre
+    /// en plus. Les certifiées d'abord, puis les plus jouées.
+    #[test]
+    fn the_team_format_picks_the_maps_and_certified_ones_come_first() {
+        let mut rows = vec![
+            row("Dust", "a", false, 50),
+            row("Petite", "b", false, 3),
+            row("Mirage", "c", false, 80),
+            row("Duel", "d", false, 9),
+            row("Grande", "e", false, 1),
+            row("Inferno", "f", false, 2),
+        ];
+        rows[1].players = 4;
+        rows[3].players = 2;
+        rows[4].players = 20;
+        rows[5].certified = true;
+        rows[0].waiting = 4;
+        sort_rows(&mut rows);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Inferno", "Mirage", "Dust", "Duel", "Petite", "Grande"]
+        );
+        let pick = |team: u8, q: &str| -> Vec<&str> {
+            maps_for(&rows, team, q)
+                .into_iter()
+                .map(|i| rows[i].name.as_str())
+                .collect()
+        };
+        assert_eq!(pick(5, ""), ["Inferno", "Mirage", "Dust"]);
+        assert_eq!(pick(2, ""), ["Petite"]);
+        assert_eq!(pick(1, ""), ["Duel"]);
+        assert_eq!(pick(10, ""), ["Grande"]);
+        assert!(pick(3, "").is_empty());
+        assert_eq!(pick(5, "mir"), ["Mirage"]);
+        // Un format inconnu : le 5v5.
+        assert_eq!(team_or_default(7), RANKED_TEAM);
+        assert_eq!(team_or_default(10), 10);
+        assert_eq!(team_label(10), "10v10");
     }
 }

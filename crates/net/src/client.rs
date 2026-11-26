@@ -298,6 +298,12 @@ pub enum Cmd {
         fps: bool,
     },
     DownloadMap([u8; 32]),
+    /// (v340) Certifie une carte FPS (ou lui retire sa certification) : compte
+    /// `proto::CERTIFIER` seulement. Réponse : `Event::MapCertified`, ou `Event::Error`.
+    MapCertify {
+        sig: [u8; 32],
+        on: bool,
+    },
     Caps(crate::proto::GarantCaps),
     /// (v244) Foudre de Zeus légendaire du serveur de construction (`Request::Zeus`) : ce
     /// qu'en dit le relais arrive par `Event::Zeus`.
@@ -532,6 +538,11 @@ pub enum Event {
     /// Transfert de carte : (signature, fraction faite, envoi ou réception).
     MapProgress([u8; 32], f32, bool),
     MapUploaded([u8; 32]),
+    /// (v340) Le relais a pris la certification demandée (`Cmd::MapCertify`).
+    MapCertified {
+        sig: [u8; 32],
+        on: bool,
+    },
     MapDownloaded {
         sig: [u8; 32],
         bytes: Vec<u8>,
@@ -2679,6 +2690,13 @@ impl Worker {
             Cmd::Maps => match self.request(&Request::Maps)? {
                 Response::Maps { list } => {
                     self.emit(Event::Maps(list));
+                    Ok(())
+                }
+                r => self.unexpected(r),
+            },
+            Cmd::MapCertify { sig, on } => match self.request(&Request::MapCertify { sig, on })? {
+                Response::Done => {
+                    self.emit(Event::MapCertified { sig, on });
                     Ok(())
                 }
                 r => self.unexpected(r),

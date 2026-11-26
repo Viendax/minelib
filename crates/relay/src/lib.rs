@@ -8282,17 +8282,43 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         waiting: if r.started { 0 } else { n },
                         stored: false,
                         players: r.max_players as u8,
+                        certified: st.maps.is_certified(&r.map_sig),
                     }),
                 }
             }
+            // (v340) Les cartes certifiées d'abord (et celles où l'on attend une partie,
+            // pour ne jamais les couper de la liste), puis les plus jouées.
             list.sort_by(|a, b| {
-                b.waiting
-                    .cmp(&a.waiting)
+                b.certified
+                    .cmp(&a.certified)
+                    .then(b.waiting.cmp(&a.waiting))
                     .then(b.plays.cmp(&a.plays))
                     .then(a.name.cmp(&b.name))
             });
             list.truncate(200);
             Response::Maps { list }
+        }
+        // (v340) Certification d'une carte FPS : le seul compte `proto::CERTIFIER`, et une
+        // carte de la liste FPS (proposée à tous, entière sur ce relais).
+        Request::MapCertify { sig, on } => {
+            if !proto::can_certify(pseudo) {
+                return Some(err(ErrorCode::Refused, "Commande réservée."));
+            }
+            if !st.maps.listed(&sig) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Cette carte n'est pas dans la liste FPS du relais : ajoute-la depuis \
+                     Multijoueur → FPS (« Ajouter une carte »), ou lance-la une fois en ligne.",
+                ));
+            }
+            if st.maps.certify(sig, on) {
+                log::info!(
+                    "carte {} {}",
+                    minelib_net::crypto::hex(&sig[..6]),
+                    if on { "certifiée" } else { "plus certifiée" }
+                );
+            }
+            Response::Done
         }
         Request::MapPut {
             sig,
@@ -9607,6 +9633,7 @@ fn handle_locked(
             | Request::Maps
             | Request::MapPut { .. }
             | Request::MapGet { .. }
+            | Request::MapCertify { .. }
             | Request::Caps { .. }
             | Request::Position { .. }
             | Request::ToZone { .. }
@@ -11981,6 +12008,101 @@ mod tests {
             _ => unreachable!(),
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v340) `/fps certif` : seul le compte Fox certifie, et seulement une carte de la
+    /// liste FPS ; une carte certifiée passe en tête de la liste, avant les plus jouées.
+    #[test]
+    fn only_fox_certifies_maps_and_they_lead_the_list() {
+        let dir = std::env::temp_dir().join(format!("minelib-certif-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let register = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let mapper = register("Mapper");
+        let fox = register("Fox");
+        let package = |seed: u32| {
+            game::MapPackage {
+                seed,
+                generator: "flat".into(),
+                ..Default::default()
+            }
+            .to_bytes()
+        };
+        let mut sigs = Vec::new();
+        for (seed, name, fps) in [(1, "Alpha", true), (2, "Bravo", true), (3, "Maison", false)] {
+            let bytes = package(seed);
+            let sig = game::signature(&bytes);
+            sigs.push(sig);
+            mapper.send(Cmd::UploadMap {
+                sig,
+                name: name.into(),
+                bytes,
+                fps,
+            });
+            wait(&mapper, |e| matches!(e, Event::MapUploaded(_)));
+        }
+        let names = |c: &Client| -> Vec<(String, bool)> {
+            c.send(Cmd::Maps);
+            match wait(c, |e| matches!(e, Event::Maps(_))) {
+                Event::Maps(l) => l.into_iter().map(|m| (m.name, m.certified)).collect(),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(
+            names(&mapper),
+            [("Alpha".to_string(), false), ("Bravo".to_string(), false)]
+        );
+        // Un autre compte : refusé.
+        mapper.send(Cmd::MapCertify {
+            sig: sigs[1],
+            on: true,
+        });
+        assert!(wait_error(&mapper).contains("réservée"));
+        // Un monde de construction n'est pas dans la liste FPS : refusé, même pour Fox.
+        fox.send(Cmd::MapCertify {
+            sig: sigs[2],
+            on: true,
+        });
+        assert!(wait_error(&fox).contains("pas dans la liste FPS"));
+        fox.send(Cmd::MapCertify {
+            sig: sigs[1],
+            on: true,
+        });
+        match wait(&fox, |e| matches!(e, Event::MapCertified { .. })) {
+            Event::MapCertified { sig, on } => assert!(sig == sigs[1] && on),
+            _ => unreachable!(),
+        }
+        // Pour tout le monde : Bravo en tête.
+        assert_eq!(
+            names(&mapper),
+            [("Bravo".to_string(), true), ("Alpha".to_string(), false)]
+        );
+        fox.send(Cmd::MapCertify {
+            sig: sigs[1],
+            on: false,
+        });
+        wait(&fox, |e| matches!(e, Event::MapCertified { on: false, .. }));
+        assert_eq!(
+            names(&fox),
+            [("Alpha".to_string(), false), ("Bravo".to_string(), false)]
+        );
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

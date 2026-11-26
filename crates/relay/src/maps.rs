@@ -73,6 +73,9 @@ pub struct Store {
     fps: std::collections::HashSet<[u8; 32]>,
     /// (v307) Voir `Note`.
     notes: HashMap<[u8; 32], Note>,
+    /// (v340) Cartes certifiées par le compte `proto::CERTIFIER` : en tête de la liste
+    /// (fichier `certifiees.bin`).
+    certified: std::collections::HashSet<[u8; 32]>,
 }
 
 pub enum Put {
@@ -123,13 +126,46 @@ impl Store {
                 })
                 .collect(),
         };
+        let certified = std::fs::read(dir.join(CERTIFIED_FILE))
+            .ok()
+            .and_then(|b| postcard::from_bytes::<Vec<[u8; 32]>>(&b).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         Ok(Self {
             dir,
             index,
             uploads: HashMap::new(),
             fps,
             notes,
+            certified,
         })
+    }
+
+    /// (v340) Cette carte est-elle dans la liste FPS (proposée à tous, entière sur le relais) ?
+    pub fn listed(&self, sig: &[u8; 32]) -> bool {
+        self.fps.contains(sig) && self.index.contains_key(sig)
+    }
+
+    /// (v340) Carte certifiée (`proto::CERTIFIER`) : en tête de la liste.
+    pub fn is_certified(&self, sig: &[u8; 32]) -> bool {
+        self.certified.contains(sig)
+    }
+
+    /// (v340) Certifie une carte, ou lui retire sa certification. Vrai si cela change.
+    pub fn certify(&mut self, sig: [u8; 32], on: bool) -> bool {
+        let changed = if on {
+            self.certified.insert(sig)
+        } else {
+            self.certified.remove(&sig)
+        };
+        if changed {
+            let v: Vec<[u8; 32]> = self.certified.iter().copied().collect();
+            if let Ok(b) = postcard::to_allocvec(&v) {
+                let _ = crate::accounts::write_atomic(&self.dir.join(CERTIFIED_FILE), &b);
+            }
+        }
+        changed
     }
 
     fn save_notes(&self) {
@@ -329,6 +365,7 @@ impl Store {
                 waiting: 0,
                 stored: true,
                 players: m.players,
+                certified: self.certified.contains(&m.sig),
             })
             .collect()
     }
@@ -342,6 +379,9 @@ impl Store {
 fn file(sig: &[u8; 32]) -> String {
     format!("{}.map", crypto::hex(sig))
 }
+
+/// (v340) Fichier des cartes certifiées.
+const CERTIFIED_FILE: &str = "certifiees.bin";
 
 #[cfg(test)]
 mod tests {
@@ -402,7 +442,10 @@ mod tests {
         // Signalements : un par compte ; au quart des joueurs, la carte ne compte plus.
         for p in names(0, 4) {
             assert!(s.report(&[1; 32], &p));
-            assert!(!s.report(&[1; 32], &p.to_uppercase()), "une fois par compte");
+            assert!(
+                !s.report(&[1; 32], &p.to_uppercase()),
+                "une fois par compte"
+            );
         }
         assert!(s.rankable(&[1; 32]), "4 sur 20");
         assert!(s.report(&[1; 32], "Joueur4"));
@@ -429,5 +472,21 @@ mod tests {
         s.save_index();
         let again = Store::open(dir).unwrap();
         assert!(again.rankable(&[1; 32]) && !again.rankable(&[2; 32]));
+    }
+
+    /// (v340) Une certification reste après un redémarrage du relais, et se retire.
+    #[test]
+    fn a_certification_is_kept_on_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("minelib-certifiees-{}", rand::random::<u32>()));
+        let mut s = Store::open(dir.clone()).unwrap();
+        assert!(!s.is_certified(&[7; 32]));
+        assert!(s.certify([7; 32], true));
+        assert!(!s.certify([7; 32], true), "déjà certifiée");
+        let mut again = Store::open(dir.clone()).unwrap();
+        assert!(again.is_certified(&[7; 32]));
+        assert!(again.certify([7; 32], false));
+        assert!(!Store::open(dir.clone()).unwrap().is_certified(&[7; 32]));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

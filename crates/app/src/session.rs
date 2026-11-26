@@ -2223,7 +2223,11 @@ impl Session {
             };
             if typed != self.hint_for {
                 // (v262) Toutes ses lignes (« … et 17 lignes de plus » avant) : elles défilent.
-                let hint = crate::cmdhelp::lines(&typed, usize::MAX, |name| self.command_state(name));
+                // (v340) `/fps certif` dans l'aide de /fps : pour le compte qui certifie seulement.
+                let certifier = self.certifier();
+                let hint = crate::cmdhelp::lines(&typed, usize::MAX, certifier, |name| {
+                    self.command_state(name)
+                });
                 self.chat.set_hint(hint);
                 self.hint_for = typed;
             }
@@ -10262,13 +10266,19 @@ impl Session {
 
     /// `/fps set ct|t spawn`, `/fps set a|b|c site` (zone sélectionnée à la baguette),
     /// `/fps clear …`, `/fps info`.
+    /// (v340) Ce joueur est-il le compte qui certifie les cartes FPS (`proto::CERTIFIER`) ?
+    /// Lui seul voit et peut taper `/fps certif` (le relais le vérifie aussi).
+    pub fn certifier(&self) -> bool {
+        minelib_net::proto::can_certify(&self.pseudo)
+    }
+
     fn fps_command(&mut self, args: &[&str]) {
         use minelib_net::game::Zone;
         // (v322) Partout, loin du centre du monde aussi (v309 : refusé au-delà de 32 768
         // blocs) : `fps.txt` garde les zones en places absolues (`save_fps_map`), la partie
         // les compte depuis son origine (`fps_map`).
         const USAGE: &str = "Usage : /fps set spawn ct | spawn t | site a | site b | site c \
-                             (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door on|off, /fps set doorsync on|off, /fps clear …, \
+                             (sélection à la baguette), /fps set maxplayer 2|4|6|8|10|20, /fps set door on|off, /fps set doorsync on|off, /fps clear …, \
                              /fps showelements on|off, /fps info";
         // (v255) « Un /fps showelements true/false pour voir les portes, sites et spawns à
         // travers les murs (comme une sélection de la baguette) en build » : un affichage,
@@ -10304,6 +10314,37 @@ impl Session {
                 self.fps_elements = None;
                 self.chat
                     .say("Éléments de la carte FPS masqués.", chat::LIGHT_PURPLE);
+            }
+            return;
+        }
+        // (v340) `/fps certif true|false` : le compte `proto::CERTIFIER` seulement (pour les
+        // autres, la commande n'existe pas). La carte de ce monde, telle qu'elle est
+        // enregistrée (sa signature), passe en tête de la liste FPS de tous les joueurs ; aussi
+        // pendant une partie sur elle.
+        if self.certifier()
+            && matches!(
+                args.first().map(|a| a.to_lowercase()).as_deref(),
+                Some("certif" | "certify" | "certifier")
+            )
+        {
+            let Some(on) = args.get(1).and_then(|w| chat::switch(w)) else {
+                self.chat.say(
+                    "Usage : /fps certif true|false (la carte de ce monde en tête de la liste \
+                     FPS, ou plus).",
+                    chat::GREY,
+                );
+                return;
+            };
+            match crate::fpsmap::package(&self.dir) {
+                Ok(p) => {
+                    self.relay_cmds.push(minelib_net::client::Cmd::MapCertify {
+                        sig: p.signature(),
+                        on,
+                    });
+                }
+                Err(e) => self
+                    .chat
+                    .say(format!("Carte de ce monde illisible : {e:#}"), chat::RED),
             }
             return;
         }
@@ -10354,9 +10395,19 @@ impl Session {
                 Some("maxplayer" | "maxplayers" | "joueurs")
             )
         {
-            let n = lower.get(2).and_then(|n| n.parse::<u8>().ok());
+            // (v340) Les formats de « Équipe » (Multijoueur → FPS) seulement : 2, 4, 6, 8, 10
+            // ou 20 joueurs (aussi écrits « 2v2 »…). Une carte d'un autre nombre n'y serait
+            // dans aucun.
+            let n = lower.get(2).and_then(|n| match n.split_once('v') {
+                Some((a, b)) if a == b => a.parse::<u8>().ok().map(|t| t.saturating_mul(2)),
+                _ => n.parse::<u8>().ok(),
+            });
             match n {
-                Some(n) if (2..=proto_max()).contains(&n) && n % 2 == 0 => {
+                Some(n)
+                    if n <= proto_max()
+                        && n % 2 == 0
+                        && crate::multiplayer::TEAM_SIZES.contains(&(n / 2)) =>
+                {
                     map.set_players(n);
                     match self.save_fps_map(&map) {
                         Ok(()) => self.chat.say(
@@ -10378,8 +10429,17 @@ impl Session {
                 }
                 _ => self.chat.say(
                     format!(
-                        "Usage : /fps set maxplayer <nombre pair de 2 à {}> (deux équipes égales).",
-                        proto_max()
+                        "Usage : /fps set maxplayer {} (joueurs de la carte : {}).",
+                        crate::multiplayer::TEAM_SIZES
+                            .iter()
+                            .map(|t| (2 * t).to_string())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                        crate::multiplayer::TEAM_SIZES
+                            .iter()
+                            .map(|&t| crate::multiplayer::team_label(t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                     chat::GREY,
                 ),
