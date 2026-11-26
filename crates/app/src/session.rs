@@ -358,6 +358,17 @@ const BREAK_S: f32 = 0.5;
 /// `nothing_is_entered_before_everything_is_loaded` échouent si cela change.
 const LOAD_MIN_S: f32 = 0.5;
 
+/// (v343) Chunks de part et d'autre d'une arrivée (téléporté, réapparu) qui doivent déjà être
+/// affichés pour continuer à jouer sans écran de chargement (le reste de la distance de rendu
+/// arrive pendant qu'on joue).
+const ARRIVE_READY: i32 = 4;
+
+/// (v343) L'arrivée demande-t-elle l'écran de chargement ? (Chunks affichés autour d'elle,
+/// et combien il en faut.)
+fn arrival_needs_loading(shown: (usize, usize)) -> bool {
+    shown.0 < shown.1
+}
+
 /// (v220) Monde en cours de chargement (voir `Session::loading`).
 struct Loading {
     since: std::time::Instant,
@@ -7779,14 +7790,18 @@ impl Session {
 
     /// (v283) Arrivé ailleurs (téléporté, réapparu loin) : si le monde n'y est pas tout chargé,
     /// l'écran de chargement revient jusqu'à ce qu'il le soit (`loading_done`). Pas en partie
-    /// FPS (les départs sont dans la carte, déjà chargée).
+    /// FPS (les départs sont dans la carte, déjà chargée). (v343) Seulement si ce qui est
+    /// autour de l'arrivée (`ARRIVE_READY` chunks) n'est pas déjà affiché : avant, toute la
+    /// distance de rendu comptait, et un `/tp` à deux blocs ou une mort près du point
+    /// d'apparition faisaient revenir l'écran de chargement (les chunks du bord de la vue,
+    /// qui arrivent du relais en ligne, n'étaient pas encore là), et pendant ce temps les
+    /// autres joueurs ne nous voyaient plus.
     fn arrive_elsewhere(&mut self) {
         if self.net.is_some() || self.loading.is_some() {
             return;
         }
         let p = self.player.pos;
-        let (shown, all) = self.streamer.shown_within(p.x, p.z, self.streamer.radius);
-        if shown < all {
+        if arrival_needs_loading(self.streamer.shown_within(p.x, p.z, ARRIVE_READY)) {
             self.loading = Some(Loading::new());
         }
     }
@@ -9880,6 +9895,35 @@ impl Session {
         Ok(out)
     }
 
+    /// Champ de vision de l'image (degrés) : en mode FPS, celui de la lunette quand on vise
+    /// ((v209) en spectateur, celle du joueur regardé).
+    fn frame_fov(&self) -> f32 {
+        let fps_mode = self.game.mode == GameMode::Fps;
+        if fps_mode && self.spectating.is_some() {
+            self.spec_fps.scope_fov().unwrap_or(self.fov)
+        } else if fps_mode {
+            self.fps.scope_fov().unwrap_or(self.fov)
+        } else {
+            self.fov
+        }
+    }
+
+    /// (v343) Projection et place de la caméra de l'image (`render`) pour ce qui se dessine
+    /// par-dessus le monde (pseudos, noms des zones) : là où l'image montre les joueurs, en
+    /// F5, avec la caméra libre de l'éditeur de lumières et à la lunette aussi. Avant, la vue
+    /// des yeux et le champ de vision de base : en F5, les pseudos flottaient à côté des
+    /// personnages.
+    fn label_camera(&self, size: (f32, f32)) -> (Mat4, Vec3) {
+        let (cam, view, _) = self.view_camera();
+        let proj = Mat4::perspective_rh(
+            self.frame_fov().to_radians(),
+            size.0 / size.1.max(1.0),
+            0.05,
+            1000.0,
+        );
+        (proj * view, cam)
+    }
+
     /// Vue du joueur avec le recul du mode FPS (la vue remonte pendant une rafale).
     fn view_with_punch(&self) -> Mat4 {
         if self.game.mode != GameMode::Fps {
@@ -11389,13 +11433,8 @@ impl Session {
         let hud = n.hud();
         let my_team = hud.team;
         let eye = self.player.eye();
-        let proj = Mat4::perspective_rh(
-            self.fov.to_radians(),
-            size.0 / size.1.max(1.0),
-            0.05,
-            1000.0,
-        );
-        let vp = proj * self.view_with_punch();
+        // (v343) La caméra de l'image (lunette comprise).
+        let (vp, _) = self.label_camera(size);
         let to_screen = |p: Vec3| -> Option<(f32, f32)> {
             let c = vp * p.extend(1.0);
             (c.w > 0.0).then(|| {
@@ -12296,13 +12335,8 @@ impl Session {
         if self.game.mode == GameMode::Fps {
             return;
         }
-        let proj = Mat4::perspective_rh(
-            self.fov.to_radians(),
-            size.0 / size.1.max(1.0),
-            0.05,
-            1000.0,
-        );
-        let vp = proj * self.view_with_punch();
+        // (v343) La caméra de l'image (F5, caméra libre).
+        let (vp, _) = self.label_camera(size);
         for (zone, name, color) in element_zones(&e.map) {
             let top = Vec3::new(
                 (zone.min[0] + zone.max[0] + 1) as f32 * 0.5,
@@ -12357,14 +12391,9 @@ impl Session {
         if near.is_empty() {
             return;
         }
-        let proj = Mat4::perspective_rh(
-            self.fov.to_radians(),
-            size.0 / size.1.max(1.0),
-            0.05,
-            1000.0,
-        );
-        let vp = proj * self.view_with_punch();
-        let cam = self.camera_pos();
+        // (v343) La caméra de l'image : en F5, derrière le joueur (avant : ses yeux, et les
+        // pseudos flottaient à côté des personnages).
+        let (vp, cam) = self.label_camera(size);
         // (v189) Les plus loin d'abord : les pseudos proches passent devant.
         let mut labels: Vec<(f32, &str, Vec3)> = near
             .into_iter()
@@ -12863,14 +12892,7 @@ impl Session {
     ) -> FrameStats {
         let fog_end = self.fog_end();
         let fps_mode = self.game.mode == GameMode::Fps;
-        let fov = if fps_mode && self.spectating.is_some() {
-            // (v209) Spectateur : la lunette du joueur regardé.
-            self.spec_fps.scope_fov().unwrap_or(self.fov)
-        } else if fps_mode {
-            self.fps.scope_fov().unwrap_or(self.fov)
-        } else {
-            self.fov
-        };
+        let fov = self.frame_fov();
         // Vue F5 : caméra à 4 blocs derrière (ou devant) les yeux, comme dans Minecraft,
         // rapprochée si un bloc est sur le chemin. Pas en mode FPS. Caméra libre de
         // l'éditeur de lumières : le joueur reste où il est, et se voit.
@@ -15560,6 +15582,33 @@ mod loading_tests {
         let gate = &src[src.find("fn loading_done(").unwrap()..];
         let gate = &gate[..gate.find("\n}\n").unwrap()];
         assert!(!gate.contains("||"), "une autre façon d'entrer : {gate}");
+    }
+
+    /// (v343) « Quand je suis mort le monde a rechargé ; quand je me tp alors que haumax est à
+    /// deux blocs de moi aussi. » L'écran de chargement ne revient à une arrivée (téléporté,
+    /// réapparu) que si ce qui l'entoure n'est pas déjà affiché : un `/tp` à deux blocs, au
+    /// milieu de ce qui est affiché, ne le fait pas revenir, même quand le bord de la vue
+    /// n'est pas encore là ; une arrivée loin, si.
+    #[test]
+    fn a_short_teleport_does_not_bring_the_loading_screen_back() {
+        let mut st = crate::streaming::Streamer::new(16);
+        // Tout est affiché autour de (100, 100), sauf le bord de la distance de rendu.
+        st.mark_shown(100.0, 100.0, 15);
+        let at = |x: f32, z: f32| arrival_needs_loading(st.shown_within(x, z, ARRIVE_READY));
+        assert!(!at(102.0, 100.0), "à deux blocs");
+        assert!(
+            !at(100.0, 160.0),
+            "à quelques chunks, dans ce qui est affiché"
+        );
+        assert!(at(5_000.0, 100.0), "loin : rien d'affiché là-bas");
+        // Toute la distance de rendu, elle, n'est pas là : avant la v343, l'écran revenait.
+        let (shown, all) = st.shown_within(102.0, 100.0, 16);
+        assert!(shown < all);
+        // L'arrivée passe par ce rayon-là, pas par toute la distance de rendu.
+        let src = include_str!("session.rs");
+        let f = &src[src.find("fn arrive_elsewhere(").unwrap()..];
+        let f = &f[..f.find("\n    }\n").unwrap()];
+        assert!(f.contains("ARRIVE_READY") && !f.contains("self.streamer.radius"));
     }
 
     /// (v295) « La barre de chargement quand on rejoint un monde : le temps ne correspond pas

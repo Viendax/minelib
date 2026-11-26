@@ -109,6 +109,13 @@ impl Streamer {
         }
     }
 
+    /// Essais : les chunks à moins de `radius` chunks de (`px`, `pz`) comptent comme
+    /// affichés.
+    #[cfg(test)]
+    pub fn mark_shown(&mut self, px: f32, pz: f32, radius: i32) {
+        self.meshed.extend(select(px, pz, radius));
+    }
+
     /// Têtes des chunks maillés depuis le dernier appel (voir `HeadsOfChunk`).
     pub fn take_heads(&mut self) -> Vec<HeadsOfChunk> {
         self.heads
