@@ -75,6 +75,12 @@ pub const MAGIC: u8 = 0xA7;
 /// Premier octet d'une sonde du relais (suivi d'un numéro sur 8 octets) : le passeur qui la
 /// reçoit le dit au relais par son canal habituel, ce qui prouve que son port est joignable.
 pub const MAGIC_PROBE: u8 = 0xA8;
+/// (v339) Premier octet d'un paquet de la voie rapide par TURN, au format court : aucun
+/// passeur ne le lit, donc pas de sceau de passeur, et la route et le numéro n'y gardent que
+/// leurs 32 bits du bas (l'autre bout les complète, voir `turn_received`). La charge est
+/// scellée exactement comme au format long (même nonce, même en-tête entier en données
+/// associées) : 16 octets de moins par paquet, rien de moins vérifié.
+pub const MAGIC_TURN: u8 = 0xA9;
 /// Sens d'un paquet : de l'invité vers l'hôte, de l'hôte vers l'invité.
 pub const TO_HOST: u8 = 0;
 pub const TO_GUEST: u8 = 1;
@@ -84,6 +90,9 @@ pub const MAX_MSG: usize = 1150;
 pub const VIAS: usize = 2;
 
 const HEAD: usize = 18;
+/// (v339) En-tête court par TURN : `MAGIC_TURN`, route (32 bits du bas), sens, numéro
+/// (32 bits du bas).
+const HEAD_TURN: usize = 10;
 const SEAL: usize = 8;
 const TAG: usize = 16;
 /// Paquet d'entretien (aucun message : il garde le chemin ouvert et dit ce qu'on reçoit).
@@ -451,6 +460,21 @@ static TURN_ENDS: Mutex<TurnEnds> = Mutex::new(Vec::new());
 /// s'il était pour la voie rapide (il y est remis) ; sinon, à l'appelant de voir (les
 /// tunnels iroh ont les mêmes en-têtes, mais d'autres numéros de route).
 pub fn turn_received(from: SocketAddr, p: &[u8]) -> bool {
+    // (v339) Format court : la route n'y est que par ses 32 bits du bas. Les bouts qui ont
+    // une route ainsi (presque toujours un seul) l'essaient : seul le bon l'ouvre.
+    if let Some((lo, dir, seq, sealed)) = parse_turn(p) {
+        let ends: Vec<(u64, Arc<EndInner>)> = {
+            let ends = TURN_ENDS.lock().unwrap();
+            ends.iter()
+                .filter(|((r, d), _)| *r as u32 == lo && *d == dir)
+                .filter_map(|((r, _), w)| Some((*r, w.upgrade()?)))
+                .collect()
+        };
+        for (route, e) in &ends {
+            e.on_sealed(*route, dir, SeqIn::Low(seq), sealed, from, true);
+        }
+        return !ends.is_empty();
+    }
     let Some(x) = parse(p) else {
         return false;
     };
@@ -625,6 +649,44 @@ fn pack(
     p
 }
 
+/// (v339) Le même paquet, au format court, pour le chemin par TURN : scellé sur l'en-tête
+/// entier (`head`), envoyé avec l'en-tête court.
+fn pack_turn(c: &ChaCha20Poly1305, route: u64, dir: u8, seq: u64, body: &[u8]) -> Vec<u8> {
+    let h = head(route, dir, seq);
+    let sealed = c
+        .encrypt(&nonce(dir, seq), Payload { msg: body, aad: &h })
+        .expect("scellement");
+    let mut p = Vec::with_capacity(HEAD_TURN + sealed.len());
+    p.push(MAGIC_TURN);
+    p.extend_from_slice(&(route as u32).to_le_bytes());
+    p.push(dir);
+    p.extend_from_slice(&(seq as u32).to_le_bytes());
+    p.extend_from_slice(&sealed);
+    p
+}
+
+/// (v339) Paquet court lu : (route, sens, numéro — 32 bits du bas des deux — et la charge
+/// scellée).
+fn parse_turn(p: &[u8]) -> Option<(u32, u8, u32, &[u8])> {
+    if p.len() < HEAD_TURN + TAG + 1 || p[0] != MAGIC_TURN || p[5] > TO_GUEST {
+        return None;
+    }
+    Some((
+        u32::from_le_bytes(p[1..5].try_into().ok()?),
+        p[5],
+        u32::from_le_bytes(p[6..10].try_into().ok()?),
+        &p[HEAD_TURN..],
+    ))
+}
+
+/// Numéro d'un paquet reçu : entier (format long), ou (v339) ses 32 bits du bas (format
+/// court par TURN).
+#[derive(Clone, Copy, Debug)]
+enum SeqIn {
+    Full(u64),
+    Low(u32),
+}
+
 /// Numéros déjà reçus sur une route : un paquet arrivé par deux passeurs, ou rejoué par
 /// quelqu'un qui l'a copié en chemin, ne compte qu'une fois. Les 128 derniers numéros sont
 /// retenus ; plus ancien, un paquet est refusé.
@@ -637,6 +699,22 @@ pub struct Window {
 }
 
 impl Window {
+    /// (v339) Le numéro entier dont `lo` sont les 32 bits du bas : le plus proche du plus
+    /// grand déjà reçu (les numéros d'une route partent de 0 et ne font que croître ; un
+    /// paquet à plus de 2^31 numéros d'écart ne s'ouvrirait pas).
+    pub fn extend(&self, lo: u32) -> u64 {
+        const SPAN: u64 = 1 << 32;
+        let near = self.top.saturating_sub(1);
+        let cand = (near & !(SPAN - 1)) | u64::from(lo);
+        if cand > near && cand - near > SPAN / 2 && cand >= SPAN {
+            cand - SPAN
+        } else if cand < near && near - cand > SPAN / 2 {
+            cand + SPAN
+        } else {
+            cand
+        }
+    }
+
     /// Vrai la première fois qu'un numéro arrive.
     pub fn accept(&mut self, seq: u64) -> bool {
         if seq >= self.top {
@@ -1209,6 +1287,10 @@ impl Live {
         body.extend_from_slice(msg);
         self.vias[i].tx_at = Some(now);
         self.stats.sent += 1;
+        // (v339) Par TURN, le format court.
+        if self.vias[i].turn.is_some() {
+            return pack_turn(&self.cipher, self.route, dir, seq, &body);
+        }
         pack(
             &self.cipher,
             self.route,
@@ -1526,14 +1608,28 @@ impl EndInner {
     /// par un client TURN de ce programme (`from` : l'adresse relayée de l'autre bout).
     fn on_packet(&self, p: &[u8], from: SocketAddr, turn: bool) {
         let Some(x) = parse(p) else { return };
+        self.on_sealed(x.route, x.dir, SeqIn::Full(x.seq), x.sealed, from, turn);
+    }
+
+    /// (v339) Un paquet lu, au format long ou court : la charge scellée sur l'en-tête entier
+    /// (`head`), que le format court ne porte qu'en partie.
+    fn on_sealed(
+        &self,
+        route: u64,
+        dir: u8,
+        seq: SeqIn,
+        sealed: &[u8],
+        from: SocketAddr,
+        turn: bool,
+    ) {
         // Seuls les paquets de l'autre sens nous sont destinés.
-        if x.dir == self.dir {
+        if dir == self.dir {
             return;
         }
         let now = Instant::now();
         let (peer, msg) = {
             let mut st = self.st.lock().unwrap();
-            let Some(&peer) = st.by_route.get(&x.route) else {
+            let Some(&peer) = st.by_route.get(&route) else {
                 return;
             };
             let Some(l) = st.ways.get_mut(&peer) else {
@@ -1547,17 +1643,21 @@ impl EndInner {
             else {
                 return;
             };
+            let seq = match seq {
+                SeqIn::Full(n) => n,
+                SeqIn::Low(lo) => l.win.extend(lo),
+            };
             let Ok(body) = l.cipher.decrypt(
-                &nonce(x.dir, x.seq),
+                &nonce(dir, seq),
                 Payload {
-                    msg: x.sealed,
-                    aad: x.head,
+                    msg: sealed,
+                    aad: &head(route, dir, seq),
                 },
             ) else {
                 return;
             };
             l.vias[i].rx_at = Some(now);
-            if !l.win.accept(x.seq) {
+            if !l.win.accept(seq) {
                 l.stats.dup += 1;
                 return;
             }
@@ -2313,6 +2413,20 @@ mod tests {
         lose: AtomicBool,
         delay_ms: AtomicU64,
         carried: AtomicU64,
+        /// (v339) Les paquets portés (les 64 derniers).
+        seen: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    }
+
+    impl FakeTurn {
+        /// (v339) Le dernier paquet porté de cette longueur.
+        fn last_of(&self, len: usize) -> Vec<u8> {
+            let seen = self.seen.lock().unwrap();
+            seen.iter()
+                .rev()
+                .find(|p| p.len() == len)
+                .cloned()
+                .unwrap_or_default()
+        }
     }
 
     impl TurnLink for FakeTurn {
@@ -2321,6 +2435,13 @@ mod tests {
                 return;
             }
             self.carried.fetch_add(1, Ordering::Relaxed);
+            {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push_back(packet.to_vec());
+                if seen.len() > 64 {
+                    seen.pop_front();
+                }
+            }
             let at = Instant::now() + Duration::from_millis(self.delay_ms.load(Ordering::Relaxed));
             let _ = self
                 .tx
@@ -2360,6 +2481,7 @@ mod tests {
             lose: AtomicBool::new(false),
             delay_ms: AtomicU64::new(0),
             carried: AtomicU64::new(0),
+            seen: Mutex::new(std::collections::VecDeque::new()),
         });
         FAKES.lock().unwrap().push(f.clone());
         f
@@ -2471,6 +2593,92 @@ mod tests {
             "fermée côté hôte (ses paquets ne passent plus)"
         );
         assert!(!host.send_one(7, b"x"), "au relais de reprendre");
+    }
+
+    /// (v339) Le numéro entier refait à partir de ses 32 bits du bas : au départ (rien de
+    /// reçu), puis de part et d'autre d'un passage de 2^32, en avant comme en arrière.
+    #[test]
+    fn the_whole_number_comes_back_from_its_low_half() {
+        let mut w = Window::default();
+        assert_eq!(w.extend(0), 0);
+        assert_eq!(w.extend(5), 5);
+        assert!(w.accept(5));
+        assert_eq!(w.extend(3), 3, "un peu en arrière");
+        assert_eq!(w.extend(70_000), 70_000);
+        let big = (7u64 << 32) + 10;
+        assert!(w.accept(big - 20));
+        assert!(w.accept(big));
+        assert_eq!(w.extend(12), big + 2);
+        assert_eq!(
+            w.extend(0xFFFF_FFF0),
+            (7u64 << 32) - 16,
+            "juste avant le passage"
+        );
+        let edge = (9u64 << 32) - 3;
+        let mut w = Window::default();
+        assert!(w.accept(edge));
+        assert_eq!(w.extend(1), (9u64 << 32) + 1, "juste après le passage");
+        assert_eq!(w.extend(0xFFFF_FFFA), edge - 3);
+    }
+
+    /// (v339) Par TURN, les paquets partent au format court : 16 octets de moins (ni sceau
+    /// de passeur, ni les 32 bits du haut de la route et du numéro), la même charge scellée.
+    /// Rien de ce qu'on y change ne passe : un octet de la charge, le numéro, la route, le
+    /// sens ; le même paquet rejoué ne compte qu'une fois ; venu d'ailleurs que de
+    /// l'adresse relayée de l'autre bout, il est ignoré. Un paquet au format long passe
+    /// toujours par TURN.
+    #[test]
+    fn through_turn_packets_are_shorter_and_just_as_sealed() {
+        let (guest, grx, host, _hrx, _tg, th) = link_turn(&[]);
+        assert!(guest.send_all(0, b"premier"));
+        assert!(wait(|| host.open(7) && guest.open(0)));
+        drain(&grx);
+        assert!(host.send_one(7, &[0x5Au8; 100]));
+        assert_eq!(drain(&grx), 1);
+        // Message, octet de tête, en-tête court, étiquette : 16 de moins qu'au format long.
+        let p = th.last_of(100 + 1 + HEAD_TURN + TAG);
+        assert_eq!(p.first(), Some(&MAGIC_TURN), "parti au format court");
+        assert_eq!(HEAD + SEAL - HEAD_TURN, 16);
+        let from = SocketAddr::V4(th.mine);
+        let got = |p: &[u8]| {
+            turn_received(from, p);
+            drain(&grx)
+        };
+        assert_eq!(got(&p), 0, "rejoué : déjà reçu");
+        for (at, what) in [
+            (HEAD_TURN + 3, "charge"),
+            (7, "numéro"),
+            (2, "route"),
+            (5, "sens"),
+        ] {
+            let mut bad = p.clone();
+            bad[at] ^= 1;
+            assert_eq!(got(&bad), 0, "{what} changé");
+        }
+        // D'une autre adresse que celle de l'autre bout : ignoré, même neuf.
+        assert!(host.send_one(7, b"ailleurs"));
+        assert_eq!(drain(&grx), 1);
+        let fresh = th.last_of(8 + 1 + HEAD_TURN + TAG);
+        assert!(!fresh.is_empty());
+        let mut other = th.mine;
+        other.set_port(other.port() + 1);
+        turn_received(SocketAddr::V4(other), &fresh);
+        assert_eq!(drain(&grx), 0);
+        // Le format long par TURN : toujours ouvert (même clé, numéro plus loin).
+        let route = {
+            let st = guest.inner.st.lock().unwrap();
+            st.ways[&0].route
+        };
+        let mut body = vec![0u8];
+        body.extend_from_slice(b"long");
+        let long = pack(&cipher(&key(2)), route, TO_GUEST, 10_000, &[0; 32], &body);
+        assert_eq!(long.len(), body.len() + HEAD + SEAL + TAG);
+        turn_received(from, &long);
+        let mut msgs = Vec::new();
+        while let Ok((_, m)) = grx.recv_timeout(Duration::from_millis(300)) {
+            msgs.push(m);
+        }
+        assert_eq!(msgs, vec![b"long".to_vec()]);
     }
 
     /// (v331) Quand un passeur porte la route, TURN ne sert pas (seulement ses mesures,

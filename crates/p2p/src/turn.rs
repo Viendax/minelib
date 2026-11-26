@@ -547,10 +547,29 @@ impl State {
 /// l'une, 34 à 38 ms par l'autre. Chaque adresse reçoit `PROBES` demandes d'allocation sans
 /// identifiants, à laquelle tout serveur TURN répond tout de suite (401, sans rien créer) ;
 /// la meilleure des réponses compte. Celles qui ne répondent pas dans `PROBE_WAIT` (UDP
-/// bloqué, serveur éteint) restent dans l'ordre du DNS, après les autres.
-async fn by_speed(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+/// bloqué, serveur éteint) restent dans l'ordre du DNS, après les autres. (v339) Par TCP
+/// (`tcp` : le réseau ne laisse pas sortir l'UDP, ou le serveur n'est donné qu'en TCP), le
+/// temps d'ouverture d'une connexion à chacune, toutes en même temps.
+async fn by_speed(addrs: Vec<SocketAddr>, tcp: bool) -> Vec<SocketAddr> {
     if addrs.len() < 2 {
         return addrs;
+    }
+    let mut best: Vec<Option<Duration>> = vec![None; addrs.len()];
+    if tcp {
+        let tries: Vec<_> = addrs
+            .iter()
+            .map(|&a| {
+                tokio::spawn(async move {
+                    let t = Instant::now();
+                    let c = tokio::time::timeout(PROBE_WAIT, tokio::net::TcpStream::connect(a));
+                    matches!(c.await, Ok(Ok(_))).then(|| t.elapsed())
+                })
+            })
+            .collect();
+        for (i, t) in tries.into_iter().enumerate() {
+            best[i] = t.await.ok().flatten();
+        }
+        return ranked(&addrs, &best);
     }
     let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
         return addrs;
@@ -558,7 +577,6 @@ async fn by_speed(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     let start = Instant::now();
     // (adresse, transaction, envoyée à)
     let mut asked: Vec<(usize, [u8; 12], Instant)> = Vec::new();
-    let mut best: Vec<Option<Duration>> = vec![None; addrs.len()];
     let mut buf = [0u8; 1500];
     let mut next = start;
     let mut round = 0;
@@ -598,6 +616,12 @@ async fn by_speed(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
             best[i] = Some(best[i].map_or(rtt, |b| b.min(rtt)));
         }
     }
+    ranked(&addrs, &best)
+}
+
+/// Les adresses de la plus rapide à la plus lente ; celles sans réponse à la fin, dans
+/// l'ordre donné.
+fn ranked(addrs: &[SocketAddr], best: &[Option<Duration>]) -> Vec<SocketAddr> {
     let mut order: Vec<usize> = (0..addrs.len()).collect();
     order.sort_by_key(|&i| best[i].unwrap_or(Duration::MAX));
     log::info!(
@@ -1052,8 +1076,9 @@ impl TurnClient {
         }
         let mut tries: Vec<(SocketAddr, bool, usize)> = Vec::new();
         // (v338) Toutes les adresses d'un nom (une seconde en secours de la première), la
-        // plus rapide d'abord (`by_speed`) ; sans sonde quand l'UDP ne passe pas.
-        let udp = !self.via_tcp.load(std::sync::atomic::Ordering::Relaxed);
+        // plus rapide d'abord (`by_speed`). (v339) Sondées par TCP quand c'est par là que la
+        // dernière allocation s'est faite (l'UDP ne passe pas).
+        let tcp = self.via_tcp.load(std::sync::atomic::Ordering::Relaxed);
         for (g, c) in groups.iter().enumerate() {
             for (s, tcp_only) in &c.servers {
                 if let Ok(addrs) = tokio::net::lookup_host(s.as_str()).await {
@@ -1063,9 +1088,7 @@ impl TurnClient {
                             all.push(a);
                         }
                     }
-                    if udp && !*tcp_only {
-                        all = by_speed(all).await;
-                    }
+                    all = by_speed(all, tcp || *tcp_only).await;
                     for a in all {
                         if !tries.iter().any(|t| t.0 == a && t.2 == g) {
                             tries.push((a, *tcp_only, g));
@@ -1820,20 +1843,38 @@ mod tests {
         let (slow, quick) = (answering(60), answering(0));
         let ((_s1, mute1), (_s2, mute2)) = (silent(), silent());
         let t = Instant::now();
-        assert_eq!(rt.block_on(by_speed(vec![slow, quick])), vec![quick, slow]);
+        assert_eq!(
+            rt.block_on(by_speed(vec![slow, quick], false)),
+            vec![quick, slow]
+        );
         assert!(
             t.elapsed() < PROBE_WAIT,
             "pas d'attente quand tout a répondu"
         );
         assert_eq!(
-            rt.block_on(by_speed(vec![mute1, slow, quick])),
+            rt.block_on(by_speed(vec![mute1, slow, quick], false)),
             vec![quick, slow, mute1]
         );
         assert_eq!(
-            rt.block_on(by_speed(vec![mute2, mute1])),
+            rt.block_on(by_speed(vec![mute2, mute1], false)),
             vec![mute2, mute1]
         );
-        assert_eq!(rt.block_on(by_speed(vec![slow])), vec![slow]);
+        assert_eq!(rt.block_on(by_speed(vec![slow], false)), vec![slow]);
+        // (v339) Par TCP : une adresse qui accepte la connexion avant une qui la refuse.
+        let listening = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listening.local_addr().unwrap();
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let t = Instant::now();
+        assert_eq!(
+            rt.block_on(by_speed(vec![closed, open], true)),
+            vec![open, closed]
+        );
+        // (Windows met du temps à refuser une connexion locale : la sonde s'arrête au bout de
+        // `PROBE_WAIT`.)
+        assert!(t.elapsed() < PROBE_WAIT + Duration::from_millis(300));
     }
 
     /// (v334) Plusieurs sources : un serveur muet, puis des identifiants refusés, puis un

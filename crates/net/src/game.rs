@@ -2037,7 +2037,8 @@ mod tests {
     /// d'un aller-retour et des entrées qui portent la confirmation). Même partie à 10, à 128
     /// mises à jour par seconde (TURN : un état complet sur 4), base vieille de 8 pas (31 ms)
     /// ou 16 (62 ms) : chaque message refait est exact, et ce que reçoit chaque joueur par
-    /// TURN, en-têtes de la voie rapide et IP/UDP compris (71 octets par paquet).
+    /// TURN, en-têtes de la voie rapide et IP/UDP compris ((v339) 55 octets par paquet au
+    /// format court par TURN, 71 avant).
     #[test]
     fn fast_differences_from_a_confirmed_base_are_exact_and_small() {
         let wire = |m: &ToPeer| decode::<ToPeer>(&encode(m)).unwrap();
@@ -2072,7 +2073,7 @@ mod tests {
             }
             let avg = |t: [usize; 2]| [t[0] as f32 / n[0] as f32, t[1] as f32 / n[1] as f32];
             // Par seconde : 96 positions et 32 états complets.
-            let rate = |a: [f32; 2]| (96.0 * (a[0] + 71.0) + 32.0 * (a[1] + 71.0)) / 1024.0;
+            let rate = |a: [f32; 2]| (96.0 * (a[0] + 55.0) + 32.0 * (a[1] + 55.0)) / 1024.0;
             let (f, d) = (avg(full), avg(diff));
             eprintln!(
                 "VOIE RAPIDE, base vieille de {age} pas : positions {:.0} octets au lieu de {:.0}, \
@@ -2142,9 +2143,9 @@ mod tests {
             let (w, p) = (whole as f32 / n as f32, packed as f32 / n as f32);
             eprintln!(
                 "ENTRÉES PAR TURN, regard {name} : {p:.0} octets au lieu de {w:.0} ; \
-                 {:.1} Ko/s au lieu de {:.1} (71 octets d'en-têtes par paquet)",
-                128.0 * (p + 71.0) / 1024.0,
-                128.0 * (w + 71.0) / 1024.0
+                 {:.1} Ko/s au lieu de {:.1} (55 octets d'en-têtes par paquet)",
+                128.0 * (p + 55.0) / 1024.0,
+                128.0 * (w + 55.0) / 1024.0
             );
             assert!(p < w * 0.75, "{p} pour {w}");
         }
