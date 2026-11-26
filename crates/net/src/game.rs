@@ -617,6 +617,16 @@ pub enum ToHost {
         data: Vec<u8>,
         weapon: u8,
     },
+    /// (v338) Les mêmes que `InputsFast`, serrées, avec le pas des derniers positions et
+    /// état complet que le joueur a (`moves`, `snap`) : par la voie rapide, qui perd des
+    /// paquets, l'hôte n'écrit ses différences qu'à partir de messages ainsi confirmés.
+    InputsFastPacked {
+        first_seq: u32,
+        data: Vec<u8>,
+        weapon: u8,
+        moves: u32,
+        snap: u32,
+    },
 }
 
 /// Messages d'un monde de construction en ligne (passent par les zones du relais).
@@ -1149,6 +1159,27 @@ pub enum ToPeer {
         base: u32,
         data: Vec<u8>,
     },
+    /// (v338) Par la voie rapide (des paquets peuvent s'y perdre) : de même, mais la base
+    /// est le dernier message du même genre que le joueur a confirmé
+    /// (`ToHost::InputsFastPacked`). Sans elle, rien à redemander : sa confirmation
+    /// suivante en donne une autre.
+    FastMovesDelta {
+        base: u32,
+        data: Vec<u8>,
+    },
+    FastSnapDelta {
+        base: u32,
+        data: Vec<u8>,
+    },
+}
+
+/// (v338) La différence `d` (de `delta`), pour la voie rapide.
+pub fn fast_delta(d: ToPeer) -> ToPeer {
+    match d {
+        ToPeer::MovesDelta { base, data } => ToPeer::FastMovesDelta { base, data },
+        ToPeer::SnapDelta { base, data } => ToPeer::FastSnapDelta { base, data },
+        other => other,
+    }
 }
 
 pub fn encode<T: Serialize>(m: &T) -> Vec<u8> {
@@ -1619,7 +1650,7 @@ pub fn undelta(base: &ToPeer, d: &ToPeer) -> Option<ToPeer> {
                 you: by,
                 players: bp,
             },
-            ToPeer::MovesDelta { data, .. },
+            ToPeer::MovesDelta { data, .. } | ToPeer::FastMovesDelta { data, .. },
         ) => {
             let mut inp = &data[..];
             let tick = bt.wrapping_add(u32::try_from(get_var(&mut inp)?).ok()?);
@@ -1663,7 +1694,7 @@ pub fn undelta(base: &ToPeer, d: &ToPeer) -> Option<ToPeer> {
                 players: bp,
                 hud: bhud,
             },
-            ToPeer::SnapDelta { data, .. },
+            ToPeer::SnapDelta { data, .. } | ToPeer::FastSnapDelta { data, .. },
         ) => {
             let mut inp = &data[..];
             let tick = bt.wrapping_add(u32::try_from(get_var(&mut inp)?).ok()?);
@@ -1796,55 +1827,67 @@ mod tests {
         assert!(sn <= 345, "état complet : {sn} octets");
     }
 
-    /// (v337) Différences sur le chemin du relais : sur une partie simulée à 10 où tout le
-    /// monde court et tourne sans arrêt (le pire cas), au palier de 64 mises à jour par
-    /// seconde (un état complet tous les 16 pas, des positions tous les 4), chaque message
-    /// refait à partir de la différence est exactement celui qui serait parti entier, même
-    /// quand des joueurs disparaissent de la vue et reviennent, changent de pseudo, d'arme ou
-    /// meurent. Et ce que ça pèse, par joueur et par seconde, en-têtes du relais compris.
-    #[test]
-    fn differences_rebuild_the_exact_message_and_are_small() {
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let mut rnd = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x >> 11) as f32 / (1u64 << 53) as f32
-        };
-        // 10 joueurs (0 : celui qui reçoit), loin du centre du monde.
-        let mut pos: Vec<[f32; 3]> = (0..10)
-            .map(|i| [1234.5 + i as f32 * 4.0, 70.0, -987.25 - i as f32 * 3.0])
-            .collect();
-        let mut dir: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        let mut yaw: Vec<f32> = (0..10).map(|i| i as f32 * 0.6).collect();
-        let mut pitch = [0.05f32; 10];
-        let mut hp = [100u8; 10];
-        let mut kills = [0u16; 10];
-        let dt = 1.0 / 256.0;
-        let (mut full, mut sent) = (0usize, 0usize);
-        let (mut msgs, mut moves_n, mut snaps_n) = (0usize, 0usize, 0usize);
-        let mut bases: [Option<(u32, ToPeer)>; 2] = [None, None];
-        let wire = |m: &ToPeer| decode::<ToPeer>(&encode(m)).unwrap();
-        for tick in 0u32..256 * 8 {
-            // Tout le monde court (6,5 blocs par seconde), change de direction, tourne la tête
-            // (jusqu'à un demi-tour par seconde, et des coups de souris), saute parfois.
+    /// Essais : une partie simulée à 10 où tout le monde court et tourne sans arrêt (le pire
+    /// cas) ; le joueur 0 est celui qui reçoit.
+    struct Run10 {
+        x: u64,
+        pos: Vec<[f32; 3]>,
+        dir: Vec<f32>,
+        yaw: Vec<f32>,
+        pitch: [f32; 10],
+        hp: [u8; 10],
+        kills: [u16; 10],
+    }
+
+    impl Run10 {
+        const DT: f32 = 1.0 / 256.0;
+
+        fn new() -> Run10 {
+            Run10 {
+                x: 0x9E37_79B9_7F4A_7C15,
+                // Loin du centre du monde.
+                pos: (0..10)
+                    .map(|i| [1234.5 + i as f32 * 4.0, 70.0, -987.25 - i as f32 * 3.0])
+                    .collect(),
+                dir: (0..10).map(|i| i as f32).collect(),
+                yaw: (0..10).map(|i| i as f32 * 0.6).collect(),
+                pitch: [0.05; 10],
+                hp: [100; 10],
+                kills: [0; 10],
+            }
+        }
+
+        fn rnd(&mut self) -> f32 {
+            self.x ^= self.x << 13;
+            self.x ^= self.x >> 7;
+            self.x ^= self.x << 17;
+            (self.x >> 11) as f32 / (1u64 << 53) as f32
+        }
+
+        /// Un pas : tout le monde court (6,5 blocs par seconde), change de direction, tourne
+        /// la tête (jusqu'à un demi-tour par seconde, et des coups de souris), saute parfois.
+        fn step(&mut self, tick: u32) {
+            let dt = Self::DT;
             for i in 0..10 {
-                dir[i] += (rnd() - 0.5) * 0.2;
-                pos[i][0] += dir[i].cos() * 6.5 * dt;
-                pos[i][2] += dir[i].sin() * 6.5 * dt;
-                pos[i][1] = 70.0 + ((tick as f32 + i as f32 * 37.0) * dt * 3.0).sin().max(0.0);
-                yaw[i] += (rnd() - 0.5) * 0.05 + if rnd() < 0.002 { 1.5 } else { 0.0 };
-                pitch[i] = (pitch[i] + (rnd() - 0.5) * 0.01).clamp(-1.5, 1.5);
-                if rnd() < 0.001 {
-                    hp[i] = hp[i].saturating_sub(27);
+                self.dir[i] += (self.rnd() - 0.5) * 0.2;
+                self.pos[i][0] += self.dir[i].cos() * 6.5 * dt;
+                self.pos[i][2] += self.dir[i].sin() * 6.5 * dt;
+                self.pos[i][1] = 70.0 + ((tick as f32 + i as f32 * 37.0) * dt * 3.0).sin().max(0.0);
+                let flick = if self.rnd() < 0.002 { 1.5 } else { 0.0 };
+                self.yaw[i] += (self.rnd() - 0.5) * 0.05 + flick;
+                self.pitch[i] = (self.pitch[i] + (self.rnd() - 0.5) * 0.01).clamp(-1.5, 1.5);
+                if self.rnd() < 0.001 {
+                    self.hp[i] = self.hp[i].saturating_sub(27);
                 }
-                if rnd() < 0.0005 {
-                    kills[i] += 1;
+                if self.rnd() < 0.0005 {
+                    self.kills[i] += 1;
                 }
             }
-            if tick % 4 != 0 {
-                continue;
-            }
+        }
+
+        /// Ce que le joueur 0 reçoit à ce pas : un état complet ou des positions.
+        fn msg(&self, tick: u32, snap: bool) -> ToPeer {
+            let (pos, dir, hp) = (&self.pos, &self.dir, &self.hp);
             let you = SimState {
                 pos: pos[0],
                 vel: [dir[0].cos() * 6.5, 0.0, dir[0].sin() * 6.5],
@@ -1868,8 +1911,8 @@ mod tests {
                     String::new()
                 },
                 pos: pos[i],
-                yaw: yaw[i],
-                pitch: pitch[i],
+                yaw: self.yaw[i],
+                pitch: self.pitch[i],
                 crouch: if (tick / 128 + i as u32).is_multiple_of(5) {
                     1.0
                 } else {
@@ -1883,12 +1926,12 @@ mod tests {
                 } else {
                     7
                 },
-                kills: kills[i],
+                kills: self.kills[i],
                 deaths: 0,
                 team: (i % 2) as u8,
                 flags: 0,
             };
-            let msg = if tick % 16 == 0 {
+            if snap {
                 ToPeer::Snapshot {
                     tick: 100_000 + tick,
                     ack: 99_000 + tick / 2,
@@ -1898,7 +1941,7 @@ mod tests {
                     players: seen.iter().map(|&i| player(i)).collect(),
                     hud: MatchHud {
                         money: 4200 + tick / 64,
-                        time: 115.0 - tick as f32 * dt,
+                        time: 115.0 - tick as f32 * Self::DT,
                         round: 7,
                         ..Default::default()
                     },
@@ -1913,7 +1956,29 @@ mod tests {
                         .map(|&i| Pose::of(&player(i), you.pos))
                         .collect(),
                 }
-            };
+            }
+        }
+    }
+
+    /// (v337) Différences sur le chemin du relais : sur une partie simulée à 10 où tout le
+    /// monde court et tourne sans arrêt (le pire cas), au palier de 64 mises à jour par
+    /// seconde (un état complet tous les 16 pas, des positions tous les 4), chaque message
+    /// refait à partir de la différence est exactement celui qui serait parti entier, même
+    /// quand des joueurs disparaissent de la vue et reviennent, changent de pseudo, d'arme ou
+    /// meurent. Et ce que ça pèse, par joueur et par seconde, en-têtes du relais compris.
+    #[test]
+    fn differences_rebuild_the_exact_message_and_are_small() {
+        let mut run = Run10::new();
+        let (mut full, mut sent) = (0usize, 0usize);
+        let (mut msgs, mut moves_n, mut snaps_n) = (0usize, 0usize, 0usize);
+        let mut bases: [Option<(u32, ToPeer)>; 2] = [None, None];
+        let wire = |m: &ToPeer| decode::<ToPeer>(&encode(m)).unwrap();
+        for tick in 0u32..256 * 8 {
+            run.step(tick);
+            if tick % 4 != 0 {
+                continue;
+            }
+            let msg = run.msg(tick, tick % 16 == 0);
             let k = usize::from(matches!(msg, ToPeer::Snapshot { .. }));
             let whole = encode(&msg).len();
             let back = match &bases[k] {
@@ -1965,6 +2030,124 @@ mod tests {
             rate * 9.0
         );
         assert!(avg_sent < avg_full * 0.55, "{avg_sent} pour {avg_full}");
+    }
+
+    /// (v338) Par la voie rapide, des paquets se perdent : chaque différence part du dernier
+    /// message du même genre que le joueur a confirmé, plus vieux que celui d'avant (le temps
+    /// d'un aller-retour et des entrées qui portent la confirmation). Même partie à 10, à 128
+    /// mises à jour par seconde (TURN : un état complet sur 4), base vieille de 8 pas (31 ms)
+    /// ou 16 (62 ms) : chaque message refait est exact, et ce que reçoit chaque joueur par
+    /// TURN, en-têtes de la voie rapide et IP/UDP compris (71 octets par paquet).
+    #[test]
+    fn fast_differences_from_a_confirmed_base_are_exact_and_small() {
+        let wire = |m: &ToPeer| decode::<ToPeer>(&encode(m)).unwrap();
+        let mut rates = Vec::new();
+        for age in [8u32, 16] {
+            let mut run = Run10::new();
+            let mut sent: [Vec<(u32, ToPeer)>; 2] = Default::default();
+            let (mut full, mut diff, mut n) = ([0usize; 2], [0usize; 2], [0usize; 2]);
+            for tick in 0u32..256 * 8 {
+                run.step(tick);
+                if tick % 2 != 0 {
+                    continue;
+                }
+                let snap = tick % 8 == 0;
+                let k = usize::from(snap);
+                let msg = run.msg(tick, snap);
+                let base = sent[k].iter().rev().find(|(t, _)| tick - t >= age);
+                if let Some((bt, b)) = base {
+                    let d = fast_delta(delta(100_000 + bt, b, &msg).expect("même genre"));
+                    assert!(matches!(
+                        d,
+                        ToPeer::FastMovesDelta { .. } | ToPeer::FastSnapDelta { .. }
+                    ));
+                    let wire_d = encode(&d);
+                    let got = undelta(b, &decode::<ToPeer>(&wire_d).unwrap()).expect("refait");
+                    assert_eq!(encode(&got), encode(&msg), "pas {tick}");
+                    full[k] += encode(&msg).len();
+                    diff[k] += wire_d.len();
+                    n[k] += 1;
+                }
+                sent[k].push((tick, wire(&msg)));
+            }
+            let avg = |t: [usize; 2]| [t[0] as f32 / n[0] as f32, t[1] as f32 / n[1] as f32];
+            // Par seconde : 96 positions et 32 états complets.
+            let rate = |a: [f32; 2]| (96.0 * (a[0] + 71.0) + 32.0 * (a[1] + 71.0)) / 1024.0;
+            let (f, d) = (avg(full), avg(diff));
+            eprintln!(
+                "VOIE RAPIDE, base vieille de {age} pas : positions {:.0} octets au lieu de {:.0}, \
+                 états {:.0} au lieu de {:.0} ; par TURN, {:.1} Ko/s par joueur ({:.1} entiers)",
+                d[0],
+                f[0],
+                d[1],
+                f[1],
+                rate(d),
+                rate(f)
+            );
+            assert!(rate(d) < rate(f) * 0.75, "{} pour {}", rate(d), rate(f));
+            rates.push(rate(d));
+        }
+        assert!(rates[0] <= rates[1], "une base plus récente coûte moins");
+    }
+
+    /// (v338) Les entrées par TURN : 128 paquets par seconde, chacun redit les 4 derniers
+    /// pas ; entiers (`InputsFast`) ou serrés avec la confirmation des derniers messages
+    /// reçus (`InputsFastPacked`). Regard qui change à chaque pas (le pire cas) ou à chaque
+    /// image (128 images par seconde : tous les deux pas).
+    #[test]
+    fn fast_inputs_through_turn_are_shorter_packed() {
+        let mut yaw = 2.5f32;
+        let all: Vec<NetInput> = (0..64)
+            .map(|k| {
+                yaw += 0.0093 * (k as f32 * 0.21).sin();
+                NetInput {
+                    forward: 1,
+                    strafe: if (k / 24) % 2 == 0 { -1 } else { 1 },
+                    jump: k == 40,
+                    jump_pressed: k == 40,
+                    walk: false,
+                    duck: false,
+                    yaw,
+                    pitch: -0.08 + k as f32 * 0.0003,
+                    carry: 230,
+                }
+            })
+            .collect();
+        let per_frame: Vec<NetInput> = all
+            .iter()
+            .enumerate()
+            .map(|(k, i)| all[k - k % 2].clone_with(i))
+            .collect();
+        for (name, inputs) in [("à chaque pas", &all), ("à chaque image", &per_frame)] {
+            let (mut whole, mut packed, mut n) = (0usize, 0usize, 0usize);
+            for k in (4..inputs.len()).step_by(2) {
+                let four = inputs[k - 4..k].to_vec();
+                let seq = 1_000_000 + k as u32;
+                whole += encode(&ToHost::InputsFast {
+                    first_seq: seq,
+                    inputs: four.clone(),
+                    weapon: 3,
+                })
+                .len();
+                packed += encode(&ToHost::InputsFastPacked {
+                    first_seq: seq,
+                    data: pack_inputs(&four),
+                    weapon: 3,
+                    moves: 1_000_000 + 2 * k as u32,
+                    snap: 1_000_000 + 8 * (k as u32 / 4),
+                })
+                .len();
+                n += 1;
+            }
+            let (w, p) = (whole as f32 / n as f32, packed as f32 / n as f32);
+            eprintln!(
+                "ENTRÉES PAR TURN, regard {name} : {p:.0} octets au lieu de {w:.0} ; \
+                 {:.1} Ko/s au lieu de {:.1} (71 octets d'en-têtes par paquet)",
+                128.0 * (p + 71.0) / 1024.0,
+                128.0 * (w + 71.0) / 1024.0
+            );
+            assert!(p < w * 0.75, "{p} pour {w}");
+        }
     }
 
     impl NetInput {

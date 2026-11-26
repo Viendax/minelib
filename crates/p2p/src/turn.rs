@@ -463,6 +463,11 @@ const PEERS_MAX: usize = 512;
 const RTO: [u64; 4] = [500, 1000, 2000, 4000];
 /// (v334) Un serveur qui a échoué passe après les autres pendant ce temps.
 const BAD_FOR: Duration = Duration::from_secs(600);
+/// (v338) Sondes des adresses d'un même nom : combien par adresse, à quel intervalle, et
+/// combien de temps attendre les réponses.
+const PROBES: usize = 3;
+const PROBE_GAP: Duration = Duration::from_millis(15);
+const PROBE_WAIT: Duration = Duration::from_millis(400);
 /// Nouvel essai d'allocation après un échec : de 15 s à 10 min.
 const RETRY_MIN: Duration = Duration::from_secs(15);
 const RETRY_MAX: Duration = Duration::from_secs(600);
@@ -534,6 +539,80 @@ impl State {
             p.asked = None;
         }
     }
+}
+
+/// (v338) Les adresses d'un même nom de serveur, rangées par temps de réponse : la plus
+/// rapide d'abord. `free.expressturn.com` en a deux, et le DNS rend l'une ou l'autre en
+/// premier : mesuré depuis un PC en France, 11 à 13 ms d'aller-retour de bout en bout par
+/// l'une, 34 à 38 ms par l'autre. Chaque adresse reçoit `PROBES` demandes d'allocation sans
+/// identifiants, à laquelle tout serveur TURN répond tout de suite (401, sans rien créer) ;
+/// la meilleure des réponses compte. Celles qui ne répondent pas dans `PROBE_WAIT` (UDP
+/// bloqué, serveur éteint) restent dans l'ordre du DNS, après les autres.
+async fn by_speed(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    if addrs.len() < 2 {
+        return addrs;
+    }
+    let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
+        return addrs;
+    };
+    let start = Instant::now();
+    // (adresse, transaction, envoyée à)
+    let mut asked: Vec<(usize, [u8; 12], Instant)> = Vec::new();
+    let mut best: Vec<Option<Duration>> = vec![None; addrs.len()];
+    let mut buf = [0u8; 1500];
+    let mut next = start;
+    let mut round = 0;
+    loop {
+        if round < PROBES && Instant::now() >= next {
+            for (i, a) in addrs.iter().enumerate() {
+                let tid: [u8; 12] = rand::random();
+                let p = Out::new(ALLOCATE, REQUEST, &tid)
+                    .attr(A_TRANSPORT, &[17, 0, 0, 0])
+                    .finish();
+                if sock.send_to(&p, a).await.is_ok() {
+                    asked.push((i, tid, Instant::now()));
+                }
+            }
+            round += 1;
+            next += PROBE_GAP;
+        }
+        let all = round >= PROBES && best.iter().all(Option::is_some);
+        let left = (start + PROBE_WAIT).saturating_duration_since(Instant::now());
+        if all || left.is_zero() {
+            break;
+        }
+        let wait = if round < PROBES {
+            left.min(next.saturating_duration_since(Instant::now()))
+        } else {
+            left
+        };
+        let Ok(Ok((n, from))) = tokio::time::timeout(wait, sock.recv_from(&mut buf)).await else {
+            continue;
+        };
+        let Some(m) = parse(&buf[..n]) else { continue };
+        if let Some(&(i, _, at)) = asked
+            .iter()
+            .find(|(i, t, _)| *t == m.tid && addrs[*i] == from)
+        {
+            let rtt = at.elapsed();
+            best[i] = Some(best[i].map_or(rtt, |b| b.min(rtt)));
+        }
+    }
+    let mut order: Vec<usize> = (0..addrs.len()).collect();
+    order.sort_by_key(|&i| best[i].unwrap_or(Duration::MAX));
+    log::info!(
+        "TURN : {} adresses pour un même serveur, rangées par temps de réponse : {}",
+        addrs.len(),
+        order
+            .iter()
+            .map(|&i| match best[i] {
+                Some(t) => format!("{} ({} ms)", addrs[i], t.as_millis()),
+                None => format!("{} (pas de réponse)", addrs[i]),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    order.into_iter().map(|i| addrs[i]).collect()
 }
 
 /// Client TURN d'un transport : une allocation, chez le premier serveur qui en donne une.
@@ -972,10 +1051,22 @@ impl TurnClient {
             groups.extend(got);
         }
         let mut tries: Vec<(SocketAddr, bool, usize)> = Vec::new();
+        // (v338) Toutes les adresses d'un nom (une seconde en secours de la première), la
+        // plus rapide d'abord (`by_speed`) ; sans sonde quand l'UDP ne passe pas.
+        let udp = !self.via_tcp.load(std::sync::atomic::Ordering::Relaxed);
         for (g, c) in groups.iter().enumerate() {
             for (s, tcp_only) in &c.servers {
                 if let Ok(addrs) = tokio::net::lookup_host(s.as_str()).await {
-                    for a in addrs.filter(|a| a.is_ipv4()).take(1) {
+                    let mut all: Vec<SocketAddr> = Vec::new();
+                    for a in addrs.filter(|a| a.is_ipv4()) {
+                        if !all.contains(&a) {
+                            all.push(a);
+                        }
+                    }
+                    if udp && !*tcp_only {
+                        all = by_speed(all).await;
+                    }
+                    for a in all {
                         if !tries.iter().any(|t| t.0 == a && t.2 == g) {
                             tries.push((a, *tcp_only, g));
                         }
@@ -1686,6 +1777,63 @@ mod tests {
         );
         let (sent, received) = a.counts();
         assert!(sent >= 300 && received >= 1, "{sent} {received}");
+    }
+
+    /// (v338) Plusieurs adresses pour un même serveur : la plus rapide à répondre passe
+    /// en premier, une adresse muette après celles qui répondent, et sans réponse du tout,
+    /// l'ordre reste celui du DNS.
+    #[test]
+    fn the_quickest_address_of_a_turn_server_comes_first() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // Un serveur qui répond 401 à tout, après `ms` millisecondes.
+        let answering = |ms: u64| {
+            let _g = rt.enter();
+            let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            std_sock.set_nonblocking(true).unwrap();
+            let addr = std_sock.local_addr().unwrap();
+            let sock = Arc::new(tokio::net::UdpSocket::from_std(std_sock).unwrap());
+            rt.spawn(async move {
+                let mut buf = [0u8; 1500];
+                while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                    let Some(m) = parse(&buf[..n]) else { continue };
+                    let sock = sock.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        let p = Out::new(m.method, FAILURE, &m.tid)
+                            .attr(A_ERROR, &[0, 0, 4, 1])
+                            .finish();
+                        let _ = sock.send_to(&p, from).await;
+                    });
+                }
+            });
+            addr
+        };
+        let silent = || {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let a = s.local_addr().unwrap();
+            (s, a)
+        };
+        let (slow, quick) = (answering(60), answering(0));
+        let ((_s1, mute1), (_s2, mute2)) = (silent(), silent());
+        let t = Instant::now();
+        assert_eq!(rt.block_on(by_speed(vec![slow, quick])), vec![quick, slow]);
+        assert!(
+            t.elapsed() < PROBE_WAIT,
+            "pas d'attente quand tout a répondu"
+        );
+        assert_eq!(
+            rt.block_on(by_speed(vec![mute1, slow, quick])),
+            vec![quick, slow, mute1]
+        );
+        assert_eq!(
+            rt.block_on(by_speed(vec![mute2, mute1])),
+            vec![mute2, mute1]
+        );
+        assert_eq!(rt.block_on(by_speed(vec![slow])), vec![slow]);
     }
 
     /// (v334) Plusieurs sources : un serveur muet, puis des identifiants refusés, puis un

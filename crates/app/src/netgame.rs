@@ -33,6 +33,10 @@ use crate::weapons::WEAPONS;
 #[cfg(test)]
 pub(crate) static TURN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// (v338) Essais : différences et entrées serrées par la voie rapide (mesure avant/après).
+#[cfg(test)]
+static FAST_PACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// Un état envoyé aux invités tous les 4 pas (64 fois par seconde).
 const SNAPSHOT_EVERY: u32 = 4;
 /// Entre deux états complets, les positions partent à chaque pas (256 par seconde).
@@ -91,7 +95,9 @@ const DELTA_MISS_GAP: f32 = 0.5;
 /// (v337) Messages entiers gardés par l'invité pour défaire les différences (de chaque
 /// genre), et âge (pas) au-delà duquel l'hôte ne s'appuie plus sur une base : elle a pu
 /// sortir de ce que l'invité garde (la voie rapide en apporte jusqu'à 256 par seconde).
-const DELTA_KEEP: usize = 64;
+/// (v338) 128 : une demi-seconde de positions à 256 par seconde, assez pour qu'une base
+/// confirmée par la voie rapide (un aller-retour plus tôt) y soit encore.
+const DELTA_KEEP: usize = 128;
 const DELTA_BASE_AGE: u32 = 32;
 /// (v334) Par TURN, l'hôte envoie au plus 128 mises à jour par seconde (une tous les deux
 /// pas) et l'invité 128 paquets d'entrées : chaque octet par TURN passe deux fois par le
@@ -1611,6 +1617,10 @@ pub struct Host {
     /// (v337) Par joueur, les derniers positions et état complet partis par le relais (tels
     /// que le joueur les a décodés) : base des différences suivantes.
     relay_base: std::sync::Mutex<HashMap<u64, RelayBase>>,
+    /// (v338) Par joueur, les derniers positions et états complets bâtis pour lui (tels
+    /// qu'il les décode), et les derniers qu'il a confirmés : bases des différences par la
+    /// voie rapide.
+    fast_sent: std::sync::Mutex<HashMap<u64, SentLog>>,
     low_rate: HashMap<u64, u8>,
 }
 
@@ -1728,6 +1738,11 @@ pub struct Guest {
     miss_at: Option<f32>,
     /// (v337) Différences refaites, et celles sans base (journal, essais).
     deltas: (u32, u32),
+    /// (v338) De même pour celles venues par la voie rapide.
+    fast_deltas: (u32, u32),
+    /// Essais : pas des positions et états complets reçus (entiers ou refaits).
+    #[cfg(test)]
+    got_ticks: Vec<u32>,
 }
 
 /// (v334) Palier suivant (une mise à jour tous les 1, 2 ou 4 pas) : tout d'un coup quand la
@@ -1810,6 +1825,18 @@ struct RelayBase {
     /// Différences parties depuis le dernier message entier.
     since: u32,
 }
+
+/// (v338) Ce que l'hôte a bâti pour un joueur (`Host::fast_sent`) : (pas, message entier),
+/// et les pas des derniers positions et état complet que le joueur dit avoir.
+#[derive(Default)]
+struct SentLog {
+    moves: VecDeque<(u32, ToPeer)>,
+    snaps: VecDeque<(u32, ToPeer)>,
+    acked: (Option<u32>, Option<u32>),
+}
+
+/// (v338) Messages bâtis gardés par l'hôte pour chaque joueur, de chaque genre.
+const FAST_SENT_KEEP: usize = 128;
 
 pub enum NetGame {
     Host(Box<Host>),
@@ -2035,6 +2062,7 @@ impl NetGame {
             fast_marks: HashMap::new(),
             named: Default::default(),
             relay_base: Default::default(),
+            fast_sent: Default::default(),
             low_rate: HashMap::new(),
         };
         h.events(ev, &mut out);
@@ -2504,6 +2532,9 @@ impl NetGame {
             recent: VecDeque::new(),
             miss_at: None,
             deltas: (0, 0),
+            fast_deltas: (0, 0),
+            #[cfg(test)]
+            got_ticks: Vec::new(),
             predicted: VecDeque::new(),
             fast: None,
             fast_votes: 0,
@@ -2720,6 +2751,7 @@ impl NetGame {
         if let NetGame::Host(h) = self {
             let player = Player::new(h.spawn);
             h.relay_base.lock().unwrap().remove(&peer);
+            h.fast_sent.lock().unwrap().remove(&peer);
             h.peers.insert(
                 peer,
                 Remote {
@@ -2741,6 +2773,7 @@ impl NetGame {
     pub fn peer_left(&mut self, peer: u64) {
         if let NetGame::Host(h) = self {
             h.relay_base.lock().unwrap().remove(&peer);
+            h.fast_sent.lock().unwrap().remove(&peer);
             if let Some(r) = h.peers.remove(&peer) {
                 h.record(peer, Move::Rule(Rule::Leave));
                 h.burns.remove(&peer);
@@ -3278,6 +3311,7 @@ impl NetGame {
             fast_marks: HashMap::new(),
             named: Default::default(),
             relay_base: Default::default(),
+            fast_sent: Default::default(),
             low_rate: HashMap::new(),
         }));
         if let NetGame::Host(h) = self {
@@ -3303,6 +3337,9 @@ impl NetGame {
             g.loadout = (255, 255);
             g.backup = None;
             g.audit.reset();
+            // (v338) Les bases des différences étaient celles de l'ancien hôte.
+            g.recent.clear();
+            g.miss_at = None;
             // Un garant en attente n'est pas un joueur : il ne se présente pas ; (v220) un
             // invité pas encore chargé non plus (il le fera en fin de chargement).
             if !g.auditor && !g.loading {
@@ -3707,6 +3744,34 @@ impl Host {
             d
         };
         self.send_to(peer, out.as_ref().unwrap_or(msg));
+    }
+
+    /// (v338) Ce qui part par la voie rapide pour ces positions ou cet état complet : la
+    /// différence avec le dernier du même genre que le joueur a confirmé
+    /// (`ToHost::InputsFastPacked`), s'il est encore gardé ; sinon le message entier. Un
+    /// paquet perdu ne casse rien : chaque différence part d'un message que le joueur a.
+    /// Le message est gardé (tel que le joueur le décodera) pour les suivants.
+    fn fast_bytes(&self, peer: u64, tick: u32, msg: &ToPeer) -> Vec<u8> {
+        #[cfg(test)]
+        if !FAST_PACKED.load(std::sync::atomic::Ordering::Relaxed) {
+            return game::encode(msg);
+        }
+        let snap = matches!(msg, ToPeer::Snapshot { .. });
+        let mut logs = self.fast_sent.lock().unwrap();
+        let log = logs.entry(peer).or_default();
+        let acked = if snap { log.acked.1 } else { log.acked.0 };
+        let list = if snap { &mut log.snaps } else { &mut log.moves };
+        let d = acked
+            .and_then(|a| list.iter().rev().find(|(t, _)| *t == a))
+            .and_then(|(bt, b)| game::delta(*bt, b, msg))
+            .map(game::fast_delta);
+        if let Some(w) = game::decode::<ToPeer>(&game::encode(msg)) {
+            list.push_back((tick, w));
+            while list.len() > FAST_SENT_KEEP {
+                list.pop_front();
+            }
+        }
+        game::encode(d.as_ref().unwrap_or(msg))
     }
 
     /// Bruits de pas : qui court (au-dessus de la vitesse de marche, au sol, vivant) fait
@@ -4328,7 +4393,8 @@ impl Host {
         if !self.peers.contains_key(&peer) {
             return out;
         }
-        // (v337) Entrées serrées : défaites, puis comme les autres.
+        // (v337) Entrées serrées : défaites, puis comme les autres. (v338) Celles de la voie
+        // rapide disent aussi ce que le joueur a reçu : bases des prochaines différences.
         let msg = match msg {
             ToHost::InputsPacked {
                 first_seq,
@@ -4342,6 +4408,37 @@ impl Host {
                 },
                 None => return out,
             },
+            ToHost::InputsFastPacked {
+                first_seq,
+                data,
+                weapon,
+                moves,
+                snap,
+            } => {
+                {
+                    let mut logs = self.fast_sent.lock().unwrap();
+                    let log = logs.entry(peer).or_default();
+                    // (Les pas ne font que croître : une confirmation plus vieille, arrivée
+                    // en retard, ne remplace pas une plus récente.)
+                    let newer = |old: Option<u32>, new: u32| {
+                        old.is_none_or(|o| new.wrapping_sub(o) < u32::MAX / 2)
+                    };
+                    if moves != 0 && newer(log.acked.0, moves) {
+                        log.acked.0 = Some(moves);
+                    }
+                    if snap != 0 && newer(log.acked.1, snap) {
+                        log.acked.1 = Some(snap);
+                    }
+                }
+                match game::unpack_inputs(&data) {
+                    Some(inputs) => ToHost::InputsFast {
+                        first_seq,
+                        inputs,
+                        weapon,
+                    },
+                    None => return out,
+                }
+            }
             m => m,
         };
         // Tout ce qui change la partie passe au journal (le vérificateur le rejoue).
@@ -4527,8 +4624,8 @@ impl Host {
             ToHost::DeltaMiss => {
                 self.relay_base.lock().unwrap().remove(&peer);
             }
-            // (v337) Défaites plus haut.
-            ToHost::InputsPacked { .. } => {}
+            // (v337, v338) Défaites plus haut.
+            ToHost::InputsPacked { .. } | ToHost::InputsFastPacked { .. } => {}
             ToHost::Rate { every } => {
                 // (v336) 2, 4, 8 ou 16 ; autre chose : tout.
                 if matches!(every, 2 | 4 | 8 | 16) {
@@ -4904,10 +5001,11 @@ impl Host {
                     };
                     // Par un passeur si la voie rapide vers ce joueur est ouverte (un paquet
                     // perdu est remplacé par le suivant, 4 ms après), sinon par le relais.
+                    // (v338) Par différence avec une base confirmée par le joueur.
                     let fast = self
                         .fast
                         .as_ref()
-                        .is_some_and(|f| f.send_one(id, &game::encode(&moves)));
+                        .is_some_and(|f| f.send_one(id, &self.fast_bytes(id, self.tick, &moves)));
                     if !fast {
                         self.send_state(id, self.tick, &moves);
                     }
@@ -4944,7 +5042,7 @@ impl Host {
             let fast = self
                 .fast
                 .as_ref()
-                .is_some_and(|f| f.send_one(id, &game::encode(&state)));
+                .is_some_and(|f| f.send_one(id, &self.fast_bytes(id, self.tick, &state)));
             // (v331) Parti par la voie rapide (elle est ouverte, et pas plus lente que le
             // relais) : par le relais, seulement un sur quatre. (v333) Un sur seize quand
             // elle passe par TURN.
@@ -5103,10 +5201,32 @@ impl Guest {
             return;
         }
         let from = self.pending.len() - k;
-        let msg = ToHost::InputsFast {
+        // (v338) Serrées, avec le pas des derniers positions et état complet reçus.
+        let inputs: Vec<NetInput> = self.pending.iter().skip(from).map(|p| p.1).collect();
+        let last = |snap: bool| {
+            self.recent
+                .iter()
+                .filter(|(_, m)| matches!(m, ToPeer::Snapshot { .. }) == snap)
+                .map(|(t, _)| *t)
+                .max()
+                .unwrap_or(0)
+        };
+        let msg = ToHost::InputsFastPacked {
             first_seq: self.pending[from].0,
-            inputs: self.pending.iter().skip(from).map(|p| p.1).collect(),
+            data: game::pack_inputs(&inputs),
             weapon,
+            moves: last(false),
+            snap: last(true),
+        };
+        #[cfg(test)]
+        let msg = if FAST_PACKED.load(std::sync::atomic::Ordering::Relaxed) {
+            msg
+        } else {
+            ToHost::InputsFast {
+                first_seq: self.pending[from].0,
+                inputs,
+                weapon,
+            }
         };
         f.send_all(0, &game::encode(&msg));
     }
@@ -5359,8 +5479,18 @@ impl Guest {
 
     fn receive(&mut self, msg: ToPeer) -> Vec<Local> {
         // (v337) Une différence : refaite sur le message de son pas `base`, si on l'a.
-        if let ToPeer::MovesDelta { base, .. } | ToPeer::SnapDelta { base, .. } = &msg {
-            let snap = matches!(msg, ToPeer::SnapDelta { .. });
+        // (v338) Venue par la voie rapide, sa base est un message qu'on a confirmé ; s'il
+        // n'est plus là, rien à redemander (la confirmation suivante en donne une autre).
+        if let ToPeer::MovesDelta { base, .. }
+        | ToPeer::SnapDelta { base, .. }
+        | ToPeer::FastMovesDelta { base, .. }
+        | ToPeer::FastSnapDelta { base, .. } = &msg
+        {
+            let snap = matches!(msg, ToPeer::SnapDelta { .. } | ToPeer::FastSnapDelta { .. });
+            let fast = matches!(
+                msg,
+                ToPeer::FastMovesDelta { .. } | ToPeer::FastSnapDelta { .. }
+            );
             let full = self
                 .recent
                 .iter()
@@ -5369,8 +5499,16 @@ impl Guest {
                 .and_then(|(_, b)| game::undelta(b, &msg));
             return match full {
                 Some(m) => {
-                    self.deltas.0 += 1;
+                    if fast {
+                        self.fast_deltas.0 += 1;
+                    } else {
+                        self.deltas.0 += 1;
+                    }
                     self.receive(m)
+                }
+                None if fast => {
+                    self.fast_deltas.1 += 1;
+                    Vec::new()
                 }
                 None => {
                     self.deltas.1 += 1;
@@ -5389,8 +5527,15 @@ impl Guest {
         if let ToPeer::Moves { tick, .. } | ToPeer::Snapshot { tick, .. } = &msg {
             let snap = matches!(msg, ToPeer::Snapshot { .. });
             let tick = *tick;
+            #[cfg(test)]
+            self.got_ticks.push(tick);
             let kind = |m: &ToPeer| matches!(m, ToPeer::Snapshot { .. }) == snap;
-            if !self.recent.iter().any(|(t, m)| *t == tick && kind(m)) {
+            // (v338) Un pas déjà gardé est remplacé : d'un même hôte, les deux copies (relais,
+            // voie rapide) sont identiques ; d'un nouvel hôte (garant qui reprend la partie
+            // depuis sa copie, donc à des pas déjà vus), c'est la sienne qui servira de base.
+            if let Some(e) = self.recent.iter_mut().find(|(t, m)| *t == tick && kind(m)) {
+                e.1 = msg.clone();
+            } else {
                 self.recent.push_back((tick, msg.clone()));
                 // Au plus `DELTA_KEEP` de chaque genre : les plus vieux du même genre s'en vont.
                 if self.recent.iter().filter(|(_, m)| kind(m)).count() > DELTA_KEEP {
@@ -5521,7 +5666,10 @@ impl Guest {
             }
             ToPeer::FastPing { tick } => self.fast_vote(tick, true),
             // (v337) Déjà refaites plus haut.
-            ToPeer::MovesDelta { .. } | ToPeer::SnapDelta { .. } => {}
+            ToPeer::MovesDelta { .. }
+            | ToPeer::SnapDelta { .. }
+            | ToPeer::FastMovesDelta { .. }
+            | ToPeer::FastSnapDelta { .. } => {}
             ToPeer::Hit { head, .. } => out.push(Local::Hit { head }),
             ToPeer::Kill {
                 killer,
@@ -6029,6 +6177,13 @@ mod tests {
         /// combien de mises à jour par seconde l'hôte lui envoie (1 : 256, 1/2 : 128).
         ticks_got: u32,
         ticks_span: u32,
+        /// (v338) Octets passés par le serveur TURN pendant le retard (les deux passages de
+        /// chaque paquet), et combien de secondes de jeu.
+        turn_bytes: u64,
+        turn_secs: f32,
+        /// (v338) Différences venues par la voie rapide et refaites par l'invité, et celles
+        /// dont il n'avait plus la base.
+        fast_deltas: (u32, u32),
     }
 
     /// (v331) Les essais de voie rapide qui ont des passeurs et ceux qui passent par TURN,
@@ -6167,6 +6322,11 @@ mod tests {
         let mut snaps_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let (mut snaps_got, mut snaps_sent) = (0u32, 0u32);
         let mut ticks_seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let (mut turn_from, mut tick_from) = (0u64, 0u32);
+        let host_tick = |h: &NetGame| match h {
+            NetGame::Host(h) => h.tick,
+            _ => 0,
+        };
         let mut done = false;
         for frame in 0..8000 * div as usize {
             // Depuis combien d'images le retard est en place, et sur quel chemin.
@@ -6189,7 +6349,10 @@ mod tests {
             }
             while let Some(e) = hc.poll() {
                 let fast = matches!(&e, Event::FromPeer { data, .. }
-                    if matches!(game::decode::<ToHost>(data), Some(ToHost::InputsFast { .. })));
+                if matches!(
+                    game::decode::<ToHost>(data),
+                    Some(ToHost::InputsFast { .. } | ToHost::InputsFastPacked { .. })
+                ));
                 if fast {
                     by_fast += 1;
                 }
@@ -6230,22 +6393,26 @@ mod tests {
                     now.push(late_g.pop_front().unwrap().1);
                 }
                 while let Some(e) = gc.poll() {
+                    // (v338) Chaque copie d'un état complet, entière ou par différence.
                     if since.is_some()
                         && matches!(&e, Event::FromHost(d)
-                            if matches!(game::decode::<ToPeer>(d), Some(ToPeer::Snapshot { .. })))
+                        if matches!(
+                            game::decode::<ToPeer>(d),
+                            Some(
+                                ToPeer::Snapshot { .. }
+                                    | ToPeer::SnapDelta { .. }
+                                    | ToPeer::FastSnapDelta { .. }
+                            )
+                        ))
                     {
                         snaps_got += 1;
-                    }
-                    if let (Some(_), Event::FromHost(d)) = (since, &e) {
-                        if let Some(ToPeer::Moves { tick, .. } | ToPeer::Snapshot { tick, .. }) =
-                            game::decode::<ToPeer>(d)
-                        {
-                            ticks_seen.insert(tick);
-                        }
                     }
                     let fast = match &e {
                         Event::FromHost(data) => match game::decode::<ToPeer>(data) {
                             Some(ToPeer::Moves { .. }) => !via_relay,
+                            // (v338) Les différences de la voie rapide n'ont que ce chemin.
+                            Some(ToPeer::FastMovesDelta { .. }) => true,
+                            Some(ToPeer::FastSnapDelta { .. }) => since.is_some() && !passeurs_lag,
                             Some(ToPeer::FastPing { .. }) => true,
                             // Relais en retard : la copie venue par les passeurs passe.
                             Some(ToPeer::Snapshot { tick, .. }) => {
@@ -6279,6 +6446,13 @@ mod tests {
                         _ => {}
                     }
                 }
+                // (v338) Les pas que l'invité a eus (entiers ou refaits), d'où qu'ils viennent.
+                if let NetGame::Guest(gs) = g {
+                    let got = std::mem::take(&mut gs.got_ticks);
+                    if since.is_some() {
+                        ticks_seen.extend(got);
+                    }
+                }
             }
             let live = guest
                 .as_ref()
@@ -6291,6 +6465,8 @@ mod tests {
             {
                 slow_from = Some(frame);
                 inputs_before = guest.as_ref().map_or(0, |g| g.relay_inputs());
+                turn_from = server.bytes.load(std::sync::atomic::Ordering::Relaxed);
+                tick_from = host_tick(&host);
             }
             last_frame = frame;
             // L'invité court de la 80e à la 280e image du retard.
@@ -6380,6 +6556,12 @@ mod tests {
             snap_behind,
             snaps_got,
             snaps_sent,
+            turn_bytes: server
+                .bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(turn_from),
+            turn_secs: host_tick(&host).wrapping_sub(tick_from) as f32 / 256.0,
+            fast_deltas: gs.fast_deltas,
             ticks_got: ticks_seen.len() as u32,
             ticks_span: match (ticks_seen.first(), ticks_seen.last()) {
                 (Some(a), Some(b)) => b - a + 1,
@@ -6518,6 +6700,87 @@ mod tests {
             "{} sur {}",
             r.stalled,
             r.frames
+        );
+    }
+
+    /// (v338) Ce qui passe par le serveur TURN dans une partie par la voie rapide (sans
+    /// passeur), avec puis sans les différences et les entrées serrées : les deux passages
+    /// de chaque paquet par le serveur, ce qui compte dans le quota du mois. (Une partie à
+    /// deux : chaque message ne porte qu'un autre joueur ; à 10, l'écart est plus grand.)
+    #[test]
+    fn turn_carries_less_with_differences_and_packed_inputs() {
+        let with = fast_match_with(false, 1, true);
+        FAST_PACKED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let without = fast_match_with(false, 1, true);
+        FAST_PACKED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let rate = |r: &FastRun| r.turn_bytes as f32 / 1024.0 / r.turn_secs.max(0.1);
+        eprintln!(
+            "TURN : {:.1} Ko/s avec différences et entrées serrées, {:.1} Ko/s sans ({:.0} %) ; \
+             différences refaites {}, sans base {}",
+            rate(&with),
+            rate(&without),
+            100.0 * rate(&with) / rate(&without).max(0.1),
+            with.fast_deltas.0,
+            with.fast_deltas.1
+        );
+        assert!(with.end_gap < 0.05, "prédiction = hôte ({})", with.end_gap);
+        assert!(rate(&with) < rate(&without) * 0.8);
+    }
+
+    /// (v338) Les bases des différences : un pas déjà gardé est remplacé par la copie
+    /// suivante, et un nouvel hôte (garant qui reprend depuis sa copie, à des pas déjà vus)
+    /// repart de rien : une différence sur un pas de l'ancien hôte n'est pas refaite.
+    #[test]
+    fn a_new_host_does_not_inherit_the_old_bases() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut world = floor();
+        let mut net = NetGame::guest(tx, [3; 32]);
+        let moves = |x: f32| ToPeer::Moves {
+            tick: 500,
+            ack: 0,
+            you: SimState {
+                pos: [x, 11.0, 8.5],
+                ..Default::default()
+            },
+            players: Vec::new(),
+        };
+        let next = ToPeer::Moves {
+            tick: 502,
+            ack: 0,
+            you: SimState {
+                pos: [9.0, 11.0, 8.5],
+                ..Default::default()
+            },
+            players: Vec::new(),
+        };
+        net.receive(None, &game::encode(&moves(1.0)), &mut world);
+        // Une seconde copie du pas 500, différente : elle remplace la première.
+        net.receive(None, &game::encode(&moves(2.0)), &mut world);
+        let d = game::fast_delta(game::delta(500, &moves(2.0), &next).unwrap());
+        let NetGame::Guest(g) = &mut net else {
+            unreachable!()
+        };
+        assert_eq!(g.recent.len(), 1);
+        let before = g.fast_deltas;
+        net.receive(None, &game::encode(&d), &mut world);
+        let NetGame::Guest(g) = &net else {
+            unreachable!()
+        };
+        assert_eq!(g.fast_deltas.0, before.0 + 1, "refaite sur la copie gardée");
+        net.host_changed();
+        let NetGame::Guest(g) = &net else {
+            unreachable!()
+        };
+        assert!(g.recent.is_empty());
+        let before = g.fast_deltas;
+        net.receive(None, &game::encode(&d), &mut world);
+        let NetGame::Guest(g) = &net else {
+            unreachable!()
+        };
+        assert_eq!(
+            g.fast_deltas.1,
+            before.1 + 1,
+            "plus de base : rien de refait"
         );
     }
 
@@ -6823,6 +7086,9 @@ mod tests {
                         Some(ToPeer::MovesDelta { .. }) => "positions (différences)",
                         Some(ToPeer::Snapshot { .. }) => "états entiers",
                         Some(ToPeer::SnapDelta { .. }) => "états (différences)",
+                        Some(ToPeer::FastMovesDelta { .. } | ToPeer::FastSnapDelta { .. }) => {
+                            "voie rapide (différences)"
+                        }
                         Some(ToPeer::Step { .. }) => "bruits de pas",
                         Some(ToPeer::Backup { .. }) => "copie du garant",
                         Some(ToPeer::Scoreboard { .. }) => "tableau des scores",
