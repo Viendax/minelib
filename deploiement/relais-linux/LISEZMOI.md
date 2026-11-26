@@ -44,8 +44,8 @@ Il est joignable sans port ouvert (iroh). Options :
 - `--journaux` : recevoir les journaux réseau des joueurs qui les partagent ;
 - `--pow <bits>` : la preuve de travail demandée aux inscriptions ;
 - `--no-dht` : ne pas s'inscrire dans le DHT ;
-- (v345) `--admin <pseudo>` : ce compte administre le relais (bannir pour triche, inviter
-  des passeurs). L'option peut être donnée plusieurs fois.
+- (v345) `--admin <pseudo>` : ce compte administre le relais (bannir pour triche). L'option
+  peut être donnée plusieurs fois.
 
 **Un passeur sans joueur :**
 
@@ -61,12 +61,13 @@ Options :
 - `--port <n>` : le premier port UDP (sinon, n'importe lesquels, à ouvrir tous) ;
 - `--relais "<nœud> <clé> <nom>"` : un relais à servir en plus des relais officiels et de
   ceux du DHT (la ligne d'une invitation). L'option peut être donnée plusieurs fois.
-- (v345) `--invitation "<invitation>"` : l'invitation donnée par un administrateur du
-  relais, dans le jeu : `/passeurs inviter` (valable 7 jours, pour 4 passeurs par défaut,
-  `/passeurs inviter 8` pour 8). Le passeur la donne à ce relais à chaque connexion et y
-  devient de confiance : il porte alors aussi les parties FPS, à 256 tick. Il n'y a plus rien
-  à faire ensuite (mises à jour, redémarrages, nouvelle adresse IP). L'administrateur retire
-  sa confiance à un passeur avec `/passeurs retirer <pseudo>` ; `/passeurs liste` les montre.
+- (v345) `--invitation "<invitation>"` : l'invitation donnée dans le jeu par `/forwarder
+  invite` (valable 7 jours, pour 4 passeurs par défaut, `/forwarder invite 8` pour 8). Pour
+  l'instant (v346), un seul compte peut la donner : celui de Viendax. Le passeur la donne à
+  ce relais à chaque connexion et y devient de confiance : il porte alors aussi les parties
+  FPS, à 256 tick. Il n'y a plus rien à faire ensuite (mises à jour, redémarrages, nouvelle
+  adresse IP). `/forwarder remove <pseudo>` lui retire sa confiance ; `/forwarder list` les
+  montre.
 
 **Les deux sur la même machine** (v345) : relancer le script avec l'autre mode. Le relais a
 le service `minelib-relay`, le passeur `minelib-passeur`.
@@ -114,7 +115,7 @@ bouts.
 
 - Les passeurs sans joueur servent aux liens avec les relais (construction, régions). Les
   parties FPS ne prennent que des passeurs de confiance : au moins 3 parties jouées et peu
-  de signalements, ou (v345) invités par un administrateur du relais (`--invitation`). Sans
+  de signalements, ou (v345) invités (`--invitation`). Sans
   invitation, un passeur sans joueur n'y sert donc pas. Quand il y a des passeurs de joueurs
   et des passeurs invités, chaque chaîne prend un de chaque : des machines tenues par les
   mêmes personnes ne voient jamais les deux bouts d'une route.

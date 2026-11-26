@@ -7291,8 +7291,9 @@ fn is_admin(dir: &Path, pseudo: &str) -> bool {
         .any(|l| l.trim().eq_ignore_ascii_case(pseudo))
 }
 
-/// (v345) Passeurs de confiance (`confiance`) : l'invitation donnée par un passeur, et pour
-/// les administrateurs du relais, inviter, la liste, retirer.
+/// (v345) Passeurs de confiance (`confiance`) : l'invitation donnée par un passeur, et (v346)
+/// pour le seul compte qui invite (`proto::can_invite_forwarders`), inviter, la liste,
+/// retirer.
 fn passeur_trust(st: &mut State, pseudo: &str, action: u8, target: &str, arg: &str) -> Response {
     let now = unix_now();
     let text = |t: String| Response::ServerAdmin { text: t };
@@ -7318,11 +7319,8 @@ fn passeur_trust(st: &mut State, pseudo: &str, action: u8, target: &str, arg: &s
             )),
         };
     }
-    if !is_admin(&st.cfg.dir, pseudo) {
-        return err(
-            ErrorCode::Refused,
-            "Réservé aux administrateurs du relais (admins.txt).",
-        );
+    if !proto::can_invite_forwarders(pseudo) {
+        return err(ErrorCode::Refused, "Commande réservée.");
     }
     match action {
         proto::SERVER_PASSEUR_INVITE => {

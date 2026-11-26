@@ -2015,7 +2015,7 @@ impl Game {
                         );
                     }
                 }
-                // (v345) `/passeurs inviter` : l'invitation, copiée dans le presse-papier et
+                // (v345) `/forwarder invite` : l'invitation, copiée dans le presse-papier et
                 // écrite dans le dossier du jeu (elle est longue à recopier du tchat).
                 Event::PasseurInvitation(text) => {
                     let path = self.paths.root.join("invitation_passeurs.txt");

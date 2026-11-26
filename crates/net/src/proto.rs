@@ -194,15 +194,16 @@ pub const SERVER_RESPAWN: u8 = 22;
 pub const RESPAWN_FOLLOWS: &str = "spawn";
 /// (v345) Passeurs de confiance par invitation : un passeur sans joueur (machine toujours
 /// allumée) ne joue jamais, il n'avait donc jamais les 3 parties qu'il faut pour porter la
-/// voie rapide d'une partie FPS. Un administrateur du relais (`admins.txt`) l'invite.
+/// voie rapide d'une partie FPS. (v346) Seul le compte `CERTIFIER` l'invite, pour l'instant
+/// (`can_invite_forwarders`) ; en v345, les administrateurs du relais.
 /// Ces actions valent hors de tout monde (un relais d'avant répond « Seulement sur un
 /// serveur de construction. », sans couper la connexion).
 /// `SERVER_PASSEUR_INVITE` : une invitation pour `reason` passeurs (4 si vide), valable
 /// `PASSEUR_INVITE_DAYS` jours ; réponse : son secret, en hexadécimal (32 caractères).
 pub const SERVER_PASSEUR_INVITE: u8 = 23;
-/// (v345) Administrateur : la liste des passeurs de confiance et des invitations ouvertes.
+/// (v345) La liste des passeurs de confiance et des invitations ouvertes.
 pub const SERVER_PASSEUR_LIST: u8 = 24;
-/// (v345) Administrateur : retirer sa confiance au passeur `pseudo`.
+/// (v345) Retirer sa confiance au passeur `pseudo`.
 pub const SERVER_PASSEUR_REMOVE: u8 = 25;
 /// (v345) Un passeur donne son invitation (`reason` : le secret, en hexadécimal) ; réponse :
 /// `PASSEUR_TRUSTED` s'il est maintenant (ou déjà) de confiance, sinon pourquoi pas.
@@ -1337,6 +1338,14 @@ pub const CERTIFIER: &str = "Fox";
 /// registre.
 pub fn can_certify(pseudo: &str) -> bool {
     pseudo.eq_ignore_ascii_case(CERTIFIER)
+}
+
+/// (v346) Ce compte peut-il inviter des passeurs sans joueur (`SERVER_PASSEUR_INVITE`, la
+/// liste, les retirer) ? Pour l'instant, celui de Viendax seulement (le même que
+/// `CERTIFIER`) : un passeur de confiance voit l'adresse IP d'un bout de chaque route qu'il
+/// porte. Demande de Viendax (26 novembre) : « pour l'instant que moi ».
+pub fn can_invite_forwarders(pseudo: &str) -> bool {
+    can_certify(pseudo)
 }
 
 /// Ce qu'un jeu peut offrir comme garant de zones (construction).

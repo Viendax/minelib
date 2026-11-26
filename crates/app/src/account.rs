@@ -114,10 +114,6 @@ static CHOSEN: std::sync::Mutex<Option<minelib_p2p::Ad>> = std::sync::Mutex::new
 /// (v298) Le relais que ce PC est devenu, faute d'en trouver un (pour l'invitation).
 static OWN: std::sync::Mutex<Option<minelib_p2p::Ad>> = std::sync::Mutex::new(None);
 
-/// (v345) La dernière recherche de relais a fait de ce PC le relais : le compte qui s'y
-/// connecte depuis ce PC l'administre (`minelib_relay::add_admins`).
-static OWN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// (v298) Relais des invitations reçues (`invitation=` dans `options.txt`).
 static INVITED: std::sync::Mutex<Vec<minelib_p2p::Ad>> = std::sync::Mutex::new(Vec::new());
 
@@ -280,7 +276,6 @@ fn auto_relay(
 ) -> anyhow::Result<(String, Option<[u8; 32]>)> {
     let t0 = std::time::Instant::now();
     *CHOSEN.lock().unwrap() = None;
-    OWN_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
     let port = minelib_net::DEFAULT_PORT;
     let local = SocketAddr::from(([127, 0, 0, 1], port));
     if TcpStream::connect_timeout(&local, Duration::from_millis(300)).is_ok() {
@@ -415,7 +410,6 @@ fn auto_relay(
         h.addr,
         t0.elapsed().as_secs_f32()
     );
-    OWN_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     minelib_net::lan::announce(h.addr.port(), h.public);
     let mine = SocketAddr::from(([127, 0, 0, 1], h.addr.port()));
     let public = h.public;
@@ -1101,18 +1095,6 @@ impl Accounts {
                     remember_relay(&self.relay_dir);
                     // (v298) Et la ligne à donner à un ami pour qu'il le rejoigne.
                     write_invitation(&self.relay_dir);
-                    // (v345) Le relais que ce PC tient lui-même : le compte connecté ici
-                    // l'administre (bannir pour triche, inviter des passeurs sans joueur).
-                    if self.embedded.is_some()
-                        || (self.link_auto && OWN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed))
-                    {
-                        if let Err(e) = minelib_relay::add_admins(
-                            &self.relay_dir,
-                            std::slice::from_ref(&pseudo),
-                        ) {
-                            log::warn!("administrateurs du relais de ce PC : {e}");
-                        }
-                    }
                     // Compte gardé sur ce PC : connexion automatique au prochain lancement.
                     if let Some((p, w)) = self.sent.take() {
                         self.login_secret = Some((p.clone(), w.clone()));

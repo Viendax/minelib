@@ -13,11 +13,12 @@
 //! par relais servi ; par défaut n'importe lesquels), `--relais "<nœud> <clé> <nom>"` (en
 //! plus des relais officiels et de ceux du DHT ; plusieurs fois possible).
 //!
-//! (v345) `--invitation "<secret> <nœud> <clé> <nom>"` (passeur) : l'invitation donnée par
-//! un administrateur de ce relais (`/passeurs inviter` dans le jeu). Le passeur la lui donne
-//! à chaque connexion, et y devient de confiance : il porte aussi les parties FPS.
+//! (v345) `--invitation "<secret> <nœud> <clé> <nom>"` (passeur) : l'invitation donnée sur
+//! ce relais (`/forwarder invite` dans le jeu ; v346 : le seul compte de
+//! `minelib_net::proto::can_invite_forwarders`). Le passeur la lui donne à chaque connexion,
+//! et y devient de confiance : il porte aussi les parties FPS.
 //! `--admin <pseudo>` (relais) : ce compte administre le relais (`admins.txt`, plusieurs fois
-//! possible) : bannir pour triche, inviter des passeurs.
+//! possible) : bannir pour triche.
 
 use anyhow::Result;
 
@@ -200,7 +201,7 @@ fn passeur_main() -> Result<()> {
                 None => {
                     eprintln!(
                         "--invitation : illisible (attendu : « <secret> <nœud> <clé> <nom> », \
-                         donnée par /passeurs inviter)"
+                         donnée par /forwarder invite)"
                     );
                     std::process::exit(2);
                 }

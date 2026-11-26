@@ -8,9 +8,9 @@
 #                                [--relais "<nœud> <clé> <nom>"] [--invitation "<…>"]
 #
 # (v345) Les deux sur une même machine : chacun a son service (minelib-relay, minelib-passeur).
-# `--invitation` : celle donnée par un administrateur du relais (/passeurs inviter dans le
-# jeu) ; le passeur y devient de confiance et porte aussi les parties FPS. Rien à refaire
-# ensuite. `--admin <pseudo>` : ce compte administre le relais.
+# `--invitation` : celle donnée dans le jeu (/forwarder invite) ; le passeur y devient de
+# confiance et porte aussi les parties FPS. Rien à refaire ensuite. `--admin <pseudo>` : ce
+# compte administre le relais (bannir pour triche).
 #
 # Ce qu'il met en place :
 # - un compte système `minelib`, sans connexion possible ;

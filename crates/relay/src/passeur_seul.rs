@@ -344,8 +344,7 @@ mod tests {
     fn a_headless_passeur_with_an_invitation_becomes_trusted() {
         let dir =
             std::env::temp_dir().join(format!("minelib-passeur-invite-{}", rand::random::<u32>()));
-        std::fs::create_dir_all(dir.join("relais")).unwrap();
-        std::fs::write(dir.join("relais").join("admins.txt"), "Chef\n").unwrap();
+        // (v346) L'invitation : par le seul compte qui invite (`proto::can_invite_forwarders`).
         let h = start(Config {
             dir: dir.join("relais"),
             bind: "127.0.0.1:0".into(),
@@ -356,7 +355,7 @@ mod tests {
         let addr = h.addr.to_string();
         let chef = Client::spawn(addr.clone(), Some(h.public));
         chef.send(Cmd::Register {
-            pseudo: "Chef".into(),
+            pseudo: minelib_net::proto::CERTIFIER.into(),
             password: "motdepasse".into(),
         });
         let t = Instant::now();

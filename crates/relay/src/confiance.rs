@@ -3,12 +3,13 @@
 //! Pour une partie FPS, le relais ne confie la voie rapide qu'à des passeurs « de
 //! confiance » (`trusted` : au moins 3 parties jouées ici, peu signalés). Un passeur sans
 //! joueur, sur une machine toujours allumée, ne joue jamais : il ne l'était donc jamais, et ne
-//! portait que les tunnels. Un administrateur du relais (`admins.txt`) peut maintenant
-//! l'inviter : un secret, valable pour quelques passeurs pendant `PASSEUR_INVITE_DAYS` jours,
+//! portait que les tunnels. Il peut maintenant être invité (v346 : par le seul compte de
+//! `proto::can_invite_forwarders` ; v345 : un administrateur du relais) : un secret, valable
+//! pour quelques passeurs pendant `PASSEUR_INVITE_DAYS` jours,
 //! que l'hébergeur met dans sa commande d'installation. Le passeur le donne en se connectant,
 //! et son compte devient de confiance pour de bon : rien à refaire chez son hébergeur
-//! (mises à jour, redémarrages, nouvelle adresse), jusqu'à ce qu'un administrateur la lui
-//! retire. Le relais ne garde que l'empreinte du secret.
+//! (mises à jour, redémarrages, nouvelle adresse), jusqu'à ce qu'on la lui retire. Le relais
+//! ne garde que l'empreinte du secret.
 
 use std::path::PathBuf;
 

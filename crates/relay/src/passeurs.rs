@@ -1941,7 +1941,7 @@ fn choose(
             {
                 return None;
             }
-            // (v345) Un passeur invité par un administrateur du relais (`confiance`) n'a pas
+            // (v345) Un passeur invité (`confiance`) n'a pas
             // besoin d'avoir joué : c'est une machine toujours allumée, il ne joue jamais.
             let ours = st.passeurs_ok.trusts(name);
             if !super::unrelated(st, name, names) || !(ours || super::trusted(st, name)) {
@@ -3359,13 +3359,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// (v345) Deux passeurs sans aucune partie jouée, invités par un administrateur du relais
-    /// (des machines toujours allumées), et deux passeurs de joueurs qui ont assez joué : la
+    /// (v345) Deux passeurs sans aucune partie jouée, invités (v346 : par le seul compte qui
+    /// invite, `proto::can_invite_forwarders` ; v345 : un administrateur du relais, qui ne le
+    /// peut plus) (des machines toujours allumées), et deux passeurs de joueurs qui ont assez joué : la
     /// partie FPS a sa voie rapide, et chaque chaîne prend un passeur de chaque sorte (les
     /// machines invitées, tenues par les mêmes personnes, ne voient jamais les deux bouts
-    /// d'une route). Un troisième invité, l'invitation épuisée, ne sert pas. Un joueur qui
-    /// n'est pas administrateur ne peut pas inviter. La confiance retirée, le passeur ne l'a
-    /// plus.
+    /// d'une route). Un troisième invité, l'invitation épuisée, ne sert pas. Un autre compte,
+    /// même administrateur du relais, ne peut pas inviter. La confiance retirée, le passeur ne
+    /// l'a plus.
     #[test]
     fn invited_passeurs_carry_fps_games_alongside_players_passeurs() {
         let _turn = TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3416,13 +3417,17 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(2));
                 }
             };
+        // Un administrateur du relais ne peut pas inviter (v346) ; le compte qui invite, si.
         let chef = login("Chef");
+        let refused = admin(&chef, proto::SERVER_PASSEUR_INVITE, "", "2").unwrap_err();
+        assert!(refused.contains("réservée"), "{refused}");
+        let chef = login(proto::CERTIFIER);
         let secret = admin(&chef, proto::SERVER_PASSEUR_INVITE, "", "2").unwrap();
         // (Ce relais d'essai n'a pas de nœud iroh : le secret seul, sans sa ligne.)
         assert_eq!(secret.len(), 32, "{secret}");
         let vols: Vec<Client> = ["Vol1", "Vol2"].iter().map(|p| login(p)).collect();
         let refused = admin(&vols[0], proto::SERVER_PASSEUR_INVITE, "", "2").unwrap_err();
-        assert!(refused.contains("administrateurs"), "{refused}");
+        assert!(refused.contains("réservée"), "{refused}");
         let invited: Vec<(Client, String)> = ["PsUn", "PsDeux", "PsTrois"]
             .iter()
             .map(|p| {

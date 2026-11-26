@@ -10263,13 +10263,16 @@ impl Session {
                 });
                 true
             }
-            // (v345) Passeurs de confiance du relais (ses administrateurs : `admins.txt`, et
-            // le compte connecté sur le PC qui tient le relais) : une invitation pour des
-            // passeurs sans joueur, la liste, retirer sa confiance à l'un d'eux.
-            "passeurs" | "passeur" => {
+            // (v345) Passeurs de confiance du relais : une invitation pour des passeurs sans
+            // joueur (« forwarders »), la liste, retirer sa confiance à l'un d'eux. (v346)
+            // `/forwarder invite <n>`, et pour le seul compte qui invite
+            // (`proto::can_invite_forwarders`) : pour les autres, la commande n'existe pas.
+            "forwarder" | "forwarders" | "passeurs" | "passeur"
+                if minelib_net::proto::can_invite_forwarders(&self.pseudo) =>
+            {
                 let sub = words.get(1).map(|w| w.to_lowercase()).unwrap_or_default();
                 let (action, pseudo, reason) = match sub.as_str() {
-                    "inviter" | "invite" | "invitation" => (
+                    "invite" | "inviter" | "invitation" => (
                         minelib_net::proto::SERVER_PASSEUR_INVITE,
                         String::new(),
                         words.get(2).map_or("4".to_string(), |n| n.to_string()),
@@ -10279,15 +10282,14 @@ impl Session {
                         String::new(),
                         String::new(),
                     ),
-                    "retirer" | "remove" | "del" if words.len() > 2 => (
+                    "remove" | "retirer" | "del" if words.len() > 2 => (
                         minelib_net::proto::SERVER_PASSEUR_REMOVE,
                         words[2].to_string(),
                         String::new(),
                     ),
                     _ => {
                         self.chat.say(
-                            "Usage : /passeurs inviter [n] | liste | retirer <pseudo> \
-                             (administrateurs du relais).",
+                            "Usage : /forwarder invite [n] | list | remove <pseudo>",
                             chat::GREY,
                         );
                         return true;

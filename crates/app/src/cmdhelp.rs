@@ -229,16 +229,17 @@ pub const HELP: &[Help] = &[
         what: "Signale la carte de la partie FPS en cours",
         forms: &[("/reportmap", "")],
     },
+    // (v346) Montrée seulement au compte qui invite (`FORWARDER`).
     Help {
-        names: &["passeurs", "passeur"],
-        what: "Passeurs de confiance de ce relais (ses administrateurs)",
+        names: &[FORWARDER, "forwarders", "passeurs", "passeur"],
+        what: "Passeurs sans joueur de confiance (forwarders) de ce relais",
         forms: &[
             (
-                "/passeurs inviter [n]",
+                "/forwarder invite [n]",
                 "invitation pour n passeurs sans joueur (4), valable 7 jours : copiée",
             ),
-            ("/passeurs liste", "les passeurs de confiance, et les invitations ouvertes"),
-            ("/passeurs retirer <pseudo>", "lui retire sa confiance"),
+            ("/forwarder list", "les passeurs de confiance, et les invitations ouvertes"),
+            ("/forwarder remove <pseudo>", "lui retire sa confiance"),
         ],
     },
     Help {
@@ -266,6 +267,10 @@ pub const FORM: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 pub const NOTE: [f32; 4] = [0.68, 0.7, 0.74, 1.0];
 pub const SAVED: [f32; 4] = [0.55, 0.9, 0.6, 1.0];
 
+/// (v346) Premier nom de /forwarder : l'aide ne la montre qu'au compte qui invite des passeurs
+/// (`proto::can_invite_forwarders`, le même que celui qui certifie les cartes).
+pub const FORWARDER: &str = "forwarder";
+
 /// (v340) Formes de /fps montrées seulement au compte qui certifie les cartes
 /// (`proto::CERTIFIER`) : pour les autres, elles n'existent pas.
 pub const CERTIFIER_FORMS: &[(&str, &str)] = &[(
@@ -290,7 +295,9 @@ pub fn lines(
         return Vec::new();
     }
     let word = rest.split_whitespace().next().unwrap_or("");
-    let found = matching(word);
+    let mut found = matching(word);
+    // (v346) /forwarder : pour les autres, elle n'existe pas.
+    found.retain(|h| certifier || h.names[0] != FORWARDER);
     let low = word.to_lowercase();
     let exact = found
         .first()
