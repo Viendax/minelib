@@ -1,7 +1,8 @@
 # Publication automatique : à chaque envoi sur GitHub, si le numéro de version du jeu
 # (`VERSION` dans crates/app/src/update.rs) n'a pas encore de Release, GitHub compile le
 # jeu pour Windows et publie la Release `vNN` avec l'exécutable. Les jeux installés la
-# voient et se mettent à jour tout seuls.
+# voient et se mettent à jour tout seuls. (v342) Puis le relais pour Linux, joint à la même
+# Release : les serveurs installés par deploiement/relais-linux se mettent à jour de même.
 name: Release
 
 on:
@@ -92,5 +93,77 @@ jobs:
             "minelib_v$n.exe.sha256" "minelib-relay_v$n.exe.sha256" \
             --repo "${{ github.repository }}" \
             --title "Minelib v$n" --notes "Version $n (publiée automatiquement)." --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # (v342) Le relais pour Linux (serveur, machine virtuelle), joint à la même Release après
+  # le jeu pour Windows : les serveurs installés par deploiement/relais-linux le prennent
+  # d'eux-mêmes dans les dix minutes. Fait aussi pour une Release qui ne l'a pas encore.
+  # Compilé sur Ubuntu 22.04 : il tourne sur toute distribution un peu récente (bibliothèque
+  # C 2.35 ou plus : Debian 12, Ubuntu 22.04 et après).
+  linux:
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Code
+        shell: bash
+        run: |
+          git init -q .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch -q --depth 1 origin "${{ github.sha }}"
+          git checkout -q FETCH_HEAD
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Numéro de version
+        id: v
+        shell: bash
+        run: |
+          n=$(grep -oE 'pub const VERSION: u32 = [0-9]+' crates/app/src/update.rs | grep -oE '[0-9]+$')
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          # Rien sans Release (le travail pour Windows n'a rien publié), ni si elle l'a déjà.
+          if ! names=$(gh release view "v$n" --repo "${{ github.repository }}" --json assets --jq '.assets[].name'); then
+            echo "todo=0" >> "$GITHUB_OUTPUT"
+          elif echo "$names" | grep -qx "minelib-relay_v${n}_linux-x86_64"; then
+            echo "todo=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "todo=1" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Rust
+        if: steps.v.outputs.todo == '1'
+        shell: bash
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Mémoire de compilation
+        if: steps.v.outputs.todo == '1'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            release-linux-
+
+      - name: Compilation
+        if: steps.v.outputs.todo == '1'
+        shell: bash
+        run: cargo build --release -p minelib-relay
+
+      - name: Publication
+        if: steps.v.outputs.todo == '1'
+        shell: bash
+        run: |
+          n=${{ steps.v.outputs.n }}
+          f="minelib-relay_v${n}_linux-x86_64"
+          cp target/release/minelib-relay "$f"
+          strip "$f" || true
+          sha256sum "$f" | cut -d' ' -f1 > "$f.sha256"
+          gh release upload "v$n" "$f" "$f.sha256" --repo "${{ github.repository }}" --clobber
         env:
           GH_TOKEN: ${{ github.token }}
