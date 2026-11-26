@@ -176,10 +176,10 @@ mod tests {
             name_of(q, &req(Request::SkinGet { pseudo: "x".into() })),
             "SkinGet"
         );
-        assert_eq!(q.last(), Some(&"WakeKept"));
+        assert_eq!(q.last(), Some(&"MapsToKeep"));
         assert_eq!(
-            name_of(q, &req(Request::WakeKept { world: "a/b".into() })),
-            "WakeKept"
+            name_of(q, &req(Request::MapsToKeep { room: 1 << 30 })),
+            "MapsToKeep"
         );
         assert_eq!(
             name_of(
@@ -202,10 +202,10 @@ mod tests {
             ),
             "Skin"
         );
-        assert_eq!(s.last(), Some(&"RelayLevel"));
+        assert_eq!(s.last(), Some(&"MapsToKeep"));
         assert_eq!(
-            name_of(s, &resp(Response::RelayLevel { level: 350 })),
-            "RelayLevel"
+            name_of(s, &resp(Response::MapsToKeep { list: Vec::new() })),
+            "MapsToKeep"
         );
         assert_eq!(
             name_of(s, &resp(Response::WorldsForgotten { worlds: vec![] })),

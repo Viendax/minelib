@@ -557,6 +557,11 @@ impl Game {
         minelib_relay::set_receive_logs(options.receive_netlogs);
         // (v349) Place des mondes du relais tenu par ce PC (`place_mondes_mo=`).
         minelib_relay::set_world_space(options.world_space_mb as u64 * 1_000_000);
+        // (v352) Cartes partagées avec les autres joueurs (`partage_cartes_mo=`, `_ko=`).
+        minelib_p2p::cartes::set_game_limits(
+            u64::from(options.map_share_mb),
+            u64::from(options.map_share_kbps),
+        );
         // (v308) Passeur : seulement si le joueur l'a accepté.
         minelib_net::fast::set_passeur_allowed(options.passeur == Some(true));
         jobs::set_uniform_sharing(options.cpu_uniform);

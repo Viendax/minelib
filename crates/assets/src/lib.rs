@@ -163,6 +163,11 @@ pub struct Options {
     /// sacs, et (v350) copies des mondes endormis). Au-delà, des mondes endormis depuis au moins
     /// 30 jours sont oubliés. `place_mondes_mo=1000` (v350 ; 256 en v349).
     pub world_space_mb: u32,
+    /// (v352) Cartes partagées : la place des cartes que ce jeu garde et sert aux autres
+    /// joueurs, en Mo (0 : il n'en sert aucune), et son débit d'envoi au plus, en Ko/s (0 :
+    /// sans limite). `partage_cartes_mo=1000`, `partage_cartes_ko=64`.
+    pub map_share_mb: u32,
+    pub map_share_kbps: u32,
     /// (v308) Ce jeu sert-il de passeur (il porte des paquets chiffrés d'autres joueurs, et
     /// montre son adresse IP à ceux à qui il les remet) ? Rien : pas encore demandé (la
     /// question est posée une fois, au menu d'accueil). `passeur=true` ou `false`.
@@ -219,6 +224,8 @@ impl Default for Options {
             share_netlog: None,
             receive_netlogs: false,
             world_space_mb: 1000,
+            map_share_mb: 1000,
+            map_share_kbps: 64,
             passeur: None,
             relay_key: String::new(),
             pseudo: String::new(),
@@ -299,6 +306,18 @@ impl Options {
             {
                 o.world_space_mb = v.max(1);
             }
+            if let Some(v) = kv
+                .get("partage_cartes_mo")
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                o.map_share_mb = v;
+            }
+            if let Some(v) = kv
+                .get("partage_cartes_ko")
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                o.map_share_kbps = v;
+            }
             if let Some(v) = kv.get("passeur") {
                 o.passeur = match v.as_str() {
                     "true" => Some(true),
@@ -372,7 +391,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\njournal_reseau={}\nrecevoir_journaux={}\npasseur={}\nequipe_fps={}\nplace_mondes_mo={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\njournal_reseau={}\nrecevoir_journaux={}\npasseur={}\nequipe_fps={}\nplace_mondes_mo={}\npartage_cartes_mo={}\npartage_cartes_ko={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -412,6 +431,8 @@ impl Options {
                 },
                 self.fps_team,
                 self.world_space_mb,
+                self.map_share_mb,
+                self.map_share_kbps,
             ),
         )?;
         Ok(())

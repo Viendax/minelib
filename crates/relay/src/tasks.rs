@@ -305,6 +305,9 @@ async fn handshake(
 
 /// Sert une connexion jusqu'à sa fin (comme `super::serve`, sans fil à elle).
 pub(crate) async fn serve(stream: TcpStream, state: Arc<Mutex<State>>, peer: String) -> Result<()> {
+    // (v352) Le nœud iroh du joueur, au bout du préambule (`minelib_p2p::preamble_from`).
+    let (who, node) = minelib_p2p::split_node(&peer);
+    let peer = who.to_string();
     stream.set_nodelay(true)?;
     let private = state.lock().unwrap().id.noise_private;
     // (v347) Par le tunnel : ce qui part se compte par genre (`minelib_net::traffic`).
@@ -331,6 +334,8 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<Mutex<State>>, peer: Str
             .is_ok_and(|a| a.is_loopback());
         // (v347) Par le tunnel, sans adresse IP connue : voir `skin_get`.
         c.no_ip = peer.starts_with("iroh:");
+        // (v352) Son nœud, pour les cartes qu'il sert (`partage`).
+        c.tunnel_node = node;
         st.conns.insert(id, c);
         id
     };

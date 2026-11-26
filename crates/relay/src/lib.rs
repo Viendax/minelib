@@ -20,6 +20,7 @@ mod maps;
 mod mondes;
 pub mod passeur_seul;
 mod passeurs;
+mod partage;
 mod place;
 mod provinces;
 mod registry;
@@ -797,6 +798,20 @@ impl Handle {
         let mut st = self.state.lock().unwrap();
         passeurs::set_own_node(&mut st, node);
     }
+
+    /// (v352) Le nœud de ce relais sert aussi ses cartes (`minelib_p2p::cartes`), sans les
+    /// copier : les jeux les y prennent, avec celles des autres machines qui les ont.
+    pub fn share_maps(&self, cartes: Arc<minelib_p2p::cartes::Cartes>) {
+        let mut st = self.state.lock().unwrap();
+        let all: std::collections::HashSet<[u8; 32]> = st.maps.index.keys().copied().collect();
+        let new: Vec<[u8; 32]> = all
+            .iter()
+            .filter(|s| cartes.held_map(s).is_none())
+            .copied()
+            .collect();
+        st.cartes = Some(cartes.clone());
+        partage::serve_files(cartes, st.maps.dir().to_path_buf(), all, new);
+    }
 }
 
 /// Recherche dans les autres relais du DHT (par tunnel iroh), sauf ce relais (`me`).
@@ -1033,6 +1048,11 @@ struct Conn {
     /// un serveur relais d'iroh, ou des passeurs, ou TURN (le relais ne sait pas lequel).
     /// Les skins qui lui partent sont comptés (`skin_get`).
     no_ip: bool,
+    /// (v352) Son nœud iroh, quand elle vient par le tunnel (`minelib_p2p::preamble_from`).
+    tunnel_node: Option<[u8; 32]>,
+    /// (v352) Le nœud qui sert ses cartes, et les cartes qu'il garde (`Request::MapHave`).
+    map_node: Option<[u8; 32]>,
+    maps_held: HashMap<[u8; 32], proto::MapHeld>,
     /// (v229) Demandes de foudre dans la seconde en cours (`THOR_RATE`).
     thor_rate: (Instant, u32),
     /// (v244) Coups de la Foudre de Zeus déjà publiés ici (demande, fin de son
@@ -1103,6 +1123,9 @@ impl Conn {
             item_rate: (Instant::now(), 0),
             skin_rate: (Instant::now(), 0),
             no_ip: false,
+            tunnel_node: None,
+            map_node: None,
+            maps_held: HashMap::new(),
             light_rate: (Instant::now(), 0),
             thor_rate: (Instant::now(), 0),
             zeus_seen: VecDeque::new(),
@@ -1520,6 +1543,8 @@ struct State {
     place_checked: Instant,
     /// (v350) Mondes endormis gardés ici, à rouvrir sans le PC de personne (`gardes`).
     kept: gardes::Store,
+    /// (v352) Les cartes servies par le nœud du relais (`Handle::share_maps`).
+    cartes: Option<Arc<minelib_p2p::cartes::Cartes>>,
     servers: servers::Store,
     /// (v311) Mondes de construction connus de ce relais, ouverts ou endormis (`mondes`).
     worlds: mondes::Store,
@@ -1683,6 +1708,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         skin_later: (0, 0, Instant::now()),
         forgotten: place::Store::open(cfg_dir.join("mondes_oublies.bin")),
         kept: gardes::Store::open(cfg_dir.join("mondes_gardes")),
+        cartes: None,
         // (Regardée une première fois une minute après le démarrage.)
         place_checked: Instant::now()
             .checked_sub(Duration::from_secs(3540))
@@ -1950,6 +1976,8 @@ pub(crate) fn tunnel_peer(stream: &TcpStream) -> std::io::Result<Option<String>>
     r.read_exact(&mut who)?;
     stream.set_read_timeout(None)?;
     let who = String::from_utf8_lossy(&who).into_owned();
+    // (v352) Sans le nœud du bout (`minelib_p2p::preamble_from`) : relais de région.
+    let who = minelib_p2p::split_node(&who).0.to_string();
     Ok(Some(if who.is_empty() { "iroh:?".into() } else { who }))
 }
 
@@ -8818,12 +8846,25 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 if fps {
                     st.maps.mark_fps(sig);
                 }
+                // (v352) Son nœud la sert aussi.
+                partage::maps_changed(st, vec![sig]);
                 Response::MapStored {
                     offset: total,
                     complete: true,
                 }
             }
             maps::Put::Refused(m) => err(ErrorCode::Refused, m),
+        },
+        // (v352) Cartes partagées : voir `partage`.
+        Request::MapWhere { sig } => Response::MapSources {
+            source: partage::sources(st, id, &sig),
+        },
+        Request::MapHave { node, maps, gone } => {
+            partage::have(st, id, node, maps, gone);
+            return None;
+        }
+        Request::MapsToKeep { room } => Response::MapsToKeep {
+            list: partage::to_keep(st, id, room),
         },
         Request::MapGet { sig, offset } => match st.maps.get(&sig, offset) {
             Some((total, data)) => Response::MapPart {
@@ -10152,6 +10193,9 @@ fn handle_locked(
             | Request::Maps
             | Request::MapPut { .. }
             | Request::MapGet { .. }
+            | Request::MapWhere { .. }
+            | Request::MapHave { .. }
+            | Request::MapsToKeep { .. }
             | Request::MapCertify { .. }
             | Request::Caps { .. }
             | Request::Position { .. }
@@ -12245,6 +12289,145 @@ mod tests {
             );
         }
         drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v352) Le relais dit où prendre une carte : chez les machines qui l'ont (le nœud
+    /// annoncé doit être celui de la connexion), jamais chez celle qui la demande, et lui en
+    /// dernier. Aux passeurs qui ont de la place, les cartes FPS que peu de machines gardent.
+    /// Une carte qu'il n'a pas : l'empreinte que disent le plus de machines.
+    #[test]
+    fn the_relay_tells_who_has_a_map_and_gives_itself_last() {
+        let (h, dir) = crowd_world("cartes_partagees");
+        let net = minelib_p2p::LocalNet::new();
+        let node = minelib_p2p::Node::start_local(&net).unwrap();
+        let cartes = node
+            .share_maps(
+                &dir.join("noeud_cartes"),
+                minelib_p2p::cartes::Limits::SERVER,
+            )
+            .unwrap();
+        let bytes = game::MapPackage {
+            seed: 1,
+            generator: "procedural2".into(),
+            edits: vec![3; 1400],
+            chunks: Vec::new(),
+            torches: Vec::new(),
+            fps: Default::default(),
+        }
+        .to_bytes();
+        let sig = game::signature(&bytes);
+        {
+            let mut st = h.state.lock().unwrap();
+            assert!(matches!(
+                st.maps
+                    .put(0, "Auteur", sig, "carte", 0, bytes.len() as u64, &bytes),
+                maps::Put::Complete
+            ));
+            st.maps.mark_fps(sig);
+        }
+        h.share_maps(cartes.clone());
+        // (Lue une fois par le nœud, dans un fil à part.)
+        let t0 = Instant::now();
+        while cartes.held_map(&sig).is_none() {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "pas servie par le nœud"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let held = cartes.held_map(&sig).unwrap();
+        assert_eq!(held.size, bytes.len() as u64);
+        let relay = cartes.node();
+        let mut guard = h.state.lock().unwrap();
+        let st = &mut *guard;
+        let mut crowd = Crowd::new();
+        let alice = crowd.conn(st, "Alice", false);
+        let bob = crowd.conn(st, "Bob", false);
+        let eve = crowd.conn(st, "Eve", false);
+        let passeur = crowd.conn(st, "Passeur", false);
+        for (id, k) in [(alice, 1u8), (bob, 2), (eve, 5), (passeur, 4)] {
+            st.conns.get_mut(&id).unwrap().tunnel_node = Some([k; 32]);
+        }
+        let have = |st: &mut State, id: u64, k: u8, maps: Vec<proto::MapHeld>, gone| {
+            let r = crowd.ask(
+                st,
+                id,
+                Request::MapHave {
+                    node: [k; 32],
+                    maps,
+                    gone,
+                },
+            );
+            assert!(r.is_none(), "{r:?}");
+        };
+        let at = |st: &mut State, id: u64, sig: [u8; 32]| match crowd.ask(
+            st,
+            id,
+            Request::MapWhere { sig },
+        ) {
+            Some(Response::MapSources { source }) => source,
+            r => panic!("{r:?}"),
+        };
+        let keep = |st: &mut State, room: u64| match crowd.ask(
+            st,
+            passeur,
+            Request::MapsToKeep { room },
+        ) {
+            Some(Response::MapsToKeep { list }) => list,
+            r => panic!("{r:?}"),
+        };
+        have(st, alice, 1, vec![held], Vec::new());
+        // Eve annonce le nœud d'Alice, pas le sien : rien n'est retenu.
+        have(st, eve, 1, vec![held], Vec::new());
+        let s = at(st, bob, sig).unwrap();
+        assert_eq!(s.map, held);
+        assert_eq!(s.nodes, vec![[1; 32], relay], "Alice, puis le relais");
+        assert_eq!(
+            at(st, alice, sig).unwrap().nodes,
+            vec![relay],
+            "pas chez elle"
+        );
+        // Le passeur la prend s'il a la place ; trois machines la gardent : plus proposée.
+        let list = keep(st, 1 << 30);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].map, held);
+        assert!(keep(st, 10).is_empty(), "pas la place");
+        have(st, bob, 2, vec![held], Vec::new());
+        have(st, eve, 5, vec![held], Vec::new());
+        assert!(keep(st, 1 << 30).is_empty(), "trois machines la gardent");
+        // Bob ne l'a plus.
+        have(st, bob, 2, Vec::new(), vec![sig]);
+        let s = at(st, passeur, sig).unwrap();
+        assert_eq!(s.nodes.len(), 3);
+        assert!(!s.nodes.contains(&[2; 32]));
+        assert_eq!(s.nodes.last(), Some(&relay));
+        // Une carte que le relais n'a pas : l'empreinte que disent le plus de machines, et
+        // seulement celles qui disent celle-là.
+        let other = proto::MapHeld {
+            sig: [8; 32],
+            hash: [9; 32],
+            size: 10,
+        };
+        have(st, alice, 1, vec![other], Vec::new());
+        have(st, bob, 2, vec![other], Vec::new());
+        have(
+            st,
+            eve,
+            5,
+            vec![proto::MapHeld {
+                hash: [7; 32],
+                ..other
+            }],
+            Vec::new(),
+        );
+        let s = at(st, passeur, other.sig).unwrap();
+        assert_eq!(s.map, other);
+        let mut nodes = s.nodes.clone();
+        nodes.sort();
+        assert_eq!(nodes, vec![[1; 32], [2; 32]]);
+        assert_eq!(at(st, passeur, [6; 32]), None, "personne ne l'a");
+        drop(guard);
         let _ = std::fs::remove_dir_all(dir);
     }
 

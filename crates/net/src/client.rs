@@ -335,6 +335,18 @@ pub enum Cmd {
         seed: u32,
         charges: u8,
     },
+    /// (v352) Passeur avec de la place : il prend, en tâche de fond, les cartes que peu de
+    /// machines gardent (`Request::MapsToKeep`), pour les servir aussi.
+    KeepMaps,
+    /// (v352) Fin d'une carte prise aux machines qui l'ont, en tâche de fond : pour le jeu
+    /// (`show` : `Event::MapDownloaded`, ou le relais seul s'il a fallu), ou gardée
+    /// seulement. Interne au fil du relais.
+    #[doc(hidden)]
+    MapFetched {
+        sig: [u8; 32],
+        show: bool,
+        got: std::result::Result<Vec<u8>, String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1033,6 +1045,12 @@ struct Worker {
     /// et dernier envoi.
     relay_logs: bool,
     logs_at: Instant,
+    /// (v352) Ce que sait faire le relais connecté (`Response::RelayLevel`, 0 : rien dit).
+    relay_level: u32,
+    /// (v352) Retour des cartes prises en tâche de fond (`Cmd::MapFetched`), et les cartes
+    /// en cours. (Un canal à part : ce fil s'arrête quand le jeu lâche le sien.)
+    maps_back: (Sender<Cmd>, Receiver<Cmd>),
+    map_jobs: std::collections::HashSet<[u8; 32]>,
     /// (v301) Dernière demande de tunnel (`crate::fast::tunnel_want`) déjà envoyée.
     tunnel_seen: u64,
     /// (v329) Dernières adresses TURN dites à ce relais (`crate::fast::turn_addrs`).
@@ -1104,6 +1122,9 @@ impl Worker {
             passeur: None,
             relay_passeurs: false,
             relay_logs: false,
+            relay_level: 0,
+            maps_back: channel(),
+            map_jobs: std::collections::HashSet::new(),
             // (Le premier envoi n'attend pas.)
             logs_at: Instant::now()
                 .checked_sub(Duration::from_secs(10))
@@ -1275,6 +1296,7 @@ impl Worker {
         if self.chan.is_none() {
             self.relay_passeurs = false;
             self.relay_logs = false;
+            self.relay_level = 0;
             // (v333) Ses routes de voie directe ne valaient que pour cette connexion.
             self.close_near();
             self.link_turn = None;
@@ -1425,6 +1447,13 @@ impl Worker {
         // (v314) Dernier message reçu du relais (voir `SILENCE_MAX`).
         let mut heard = Instant::now();
         loop {
+            // (v352) Une carte prise en tâche de fond est revenue.
+            if let Ok(c) = self.maps_back.1.try_recv() {
+                if let Err(e) = self.handle(c) {
+                    log::warn!("relais : {e:#}");
+                }
+                continue;
+            }
             // Commandes du jeu (sans attendre si une connexion est ouverte).
             let cmd = if self.chan.is_some() {
                 match cmds.try_recv() {
@@ -1630,6 +1659,9 @@ impl Worker {
                 return;
             }
             Response::RelayLevel { level } => {
+                self.relay_level = level;
+                // (v352) Les cartes que ce jeu sert, pour que les autres les prennent ici.
+                self.announce_maps();
                 self.emit(Event::RelayLevel(level));
                 return;
             }
@@ -3060,6 +3092,11 @@ impl Worker {
                     })? {
                         Response::MapStored { complete: true, .. } => {
                             self.emit(Event::MapUploaded(sig));
+                            // (v352) Ce jeu la sert aussi.
+                            if let Some(p) = crate::cartes::get() {
+                                p.keep(sig, &bytes);
+                                self.announce_maps();
+                            }
                             return Ok(());
                         }
                         Response::MapStored { offset: o, .. } => {
@@ -3082,43 +3119,57 @@ impl Worker {
                 }
             }
             Cmd::DownloadMap(sig) => {
-                let mut bytes = Vec::new();
-                loop {
-                    match self.request(&Request::MapGet {
-                        sig,
-                        offset: bytes.len() as u64,
-                    })? {
-                        Response::MapPart {
-                            total,
-                            data,
-                            offset,
-                            ..
-                        } if offset == bytes.len() as u64 => {
-                            if data.is_empty() || total > crate::proto::MAP_MAX {
-                                self.emit(Event::MapFailed(sig, "carte incomplète".into()));
-                                return Ok(());
-                            }
-                            bytes.extend_from_slice(&data);
-                            self.emit(Event::MapProgress(
-                                sig,
-                                bytes.len() as f32 / total.max(1) as f32,
-                                false,
-                            ));
-                            if bytes.len() as u64 >= total {
-                                if crate::game::signature(&bytes) != sig {
-                                    self.emit(Event::MapFailed(sig, "carte altérée".into()));
-                                } else {
-                                    self.emit(Event::MapDownloaded { sig, bytes });
-                                }
-                                return Ok(());
-                            }
+                if self.map_jobs.contains(&sig) {
+                    return Ok(());
+                }
+                // (v352) Aux machines qui l'ont d'abord ; le relais seul en dernier recours.
+                if let Some(source) = self.map_sources(sig)? {
+                    self.fetch_in_background(vec![source], true);
+                    return Ok(());
+                }
+                self.download_from_relay(sig)
+            }
+            Cmd::MapFetched { sig, show, got } => {
+                self.map_jobs.remove(&sig);
+                match got {
+                    Ok(bytes) => {
+                        self.announce_maps();
+                        if show {
+                            self.emit(Event::MapDownloaded { sig, bytes });
                         }
-                        Response::Error { code, message } => {
-                            self.emit(Event::MapFailed(sig, error_text(code, &message)));
-                            return Ok(());
-                        }
-                        r => return self.unexpected(r),
+                        Ok(())
                     }
+                    Err(e) => {
+                        log::info!("carte {} : {e} ; prise au relais", crypto::hex(&sig[..6]));
+                        if show {
+                            self.download_from_relay(sig)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            }
+            Cmd::KeepMaps => {
+                let Some(p) = crate::cartes::get() else {
+                    return Ok(());
+                };
+                if self.relay_level < proto::MAP_SOURCES_LEVEL || !self.map_jobs.is_empty() {
+                    return Ok(());
+                }
+                match self.request(&Request::MapsToKeep { room: p.room() })? {
+                    Response::MapsToKeep { list } => {
+                        let list: Vec<proto::MapSource> = list
+                            .into_iter()
+                            .filter(|s| !s.nodes.is_empty() && s.map.size <= proto::MAP_MAX)
+                            .collect();
+                        if !list.is_empty() {
+                            log::info!("cartes : {} à garder pour les autres", list.len());
+                            self.fetch_in_background(list, false);
+                        }
+                        Ok(())
+                    }
+                    Response::Error { .. } => Ok(()),
+                    r => self.unexpected(r),
                 }
             }
             Cmd::Caps(caps) => match self.request(&Request::Caps { caps })? {
@@ -3145,6 +3196,134 @@ impl Worker {
     fn emit_world(&self, world: String) {
         if !world.is_empty() {
             self.emit(Event::World(world));
+        }
+    }
+
+    /// Une carte prise au relais seul, morceau par morceau (`Request::MapGet`).
+    fn download_from_relay(&mut self, sig: [u8; 32]) -> Result<()> {
+        let mut bytes = Vec::new();
+        loop {
+            match self.request(&Request::MapGet {
+                sig,
+                offset: bytes.len() as u64,
+            })? {
+                Response::MapPart {
+                    total,
+                    data,
+                    offset,
+                    ..
+                } if offset == bytes.len() as u64 => {
+                    if data.is_empty() || total > crate::proto::MAP_MAX {
+                        self.emit(Event::MapFailed(sig, "carte incomplète".into()));
+                        return Ok(());
+                    }
+                    bytes.extend_from_slice(&data);
+                    self.emit(Event::MapProgress(
+                        sig,
+                        bytes.len() as f32 / total.max(1) as f32,
+                        false,
+                    ));
+                    if bytes.len() as u64 >= total {
+                        if crate::game::signature(&bytes) != sig {
+                            self.emit(Event::MapFailed(sig, "carte altérée".into()));
+                        } else {
+                            // (v352) Ce jeu la sert ensuite aux autres.
+                            if let Some(p) = crate::cartes::get() {
+                                p.keep(sig, &bytes);
+                                self.announce_maps();
+                            }
+                            self.emit(Event::MapDownloaded { sig, bytes });
+                        }
+                        return Ok(());
+                    }
+                }
+                Response::Error { code, message } => {
+                    self.emit(Event::MapFailed(sig, error_text(code, &message)));
+                    return Ok(());
+                }
+                r => return self.unexpected(r),
+            }
+        }
+    }
+
+    /// (v352) Où prendre une carte, si le relais le sait (`Request::MapWhere`) et si ce
+    /// programme garde des cartes (`crate::cartes`).
+    fn map_sources(&mut self, sig: [u8; 32]) -> Result<Option<proto::MapSource>> {
+        if self.relay_level < proto::MAP_SOURCES_LEVEL || crate::cartes::get().is_none() {
+            return Ok(None);
+        }
+        match self.request(&Request::MapWhere { sig })? {
+            Response::MapSources { source: Some(s) }
+                if s.map.sig == sig && !s.nodes.is_empty() && s.map.size <= proto::MAP_MAX =>
+            {
+                Ok(Some(s))
+            }
+            Response::MapSources { .. } | Response::Error { .. } => Ok(None),
+            r => self.unexpected(r).map(|_| None),
+        }
+    }
+
+    /// (v352) Prend ces cartes aux machines qui les ont, une après l'autre, dans un fil à
+    /// part : la connexion au relais continue pendant ce temps. Chacune revient ici
+    /// (`Cmd::MapFetched`).
+    fn fetch_in_background(&mut self, list: Vec<proto::MapSource>, show: bool) {
+        let Some(peers) = crate::cartes::get() else {
+            return;
+        };
+        let me = self.maps_back.0.clone();
+        let list: Vec<proto::MapSource> = list
+            .into_iter()
+            .filter(|s| self.map_jobs.insert(s.map.sig))
+            .collect();
+        let out = self.out.clone();
+        let started = std::thread::Builder::new()
+            .name("cartes".into())
+            .spawn(move || {
+                for source in list {
+                    let sig = source.map.sig;
+                    let got = peers
+                        .fetch(&source, &mut |f| {
+                            if show {
+                                let _ = out.send(Event::MapProgress(sig, f, false));
+                            }
+                        })
+                        .map_err(|e| format!("{e:#}"));
+                    if me.send(Cmd::MapFetched { sig, show, got }).is_err() {
+                        return;
+                    }
+                }
+            });
+        if started.is_err() {
+            self.map_jobs.clear();
+        }
+    }
+
+    /// (v352) Dit au relais les cartes que ce programme garde et sert (et celles qu'il n'a
+    /// plus), s'il sait quoi en faire.
+    fn announce_maps(&mut self) {
+        if self.relay_level < proto::MAP_SOURCES_LEVEL || self.chan.is_none() {
+            return;
+        }
+        let Some(p) = crate::cartes::get() else {
+            return;
+        };
+        let (node, held, mut gone) = (p.node(), p.held(), p.gone());
+        if held.is_empty() && gone.is_empty() {
+            return;
+        }
+        for part in held.chunks(proto::MAP_HAVE_PART) {
+            let _ = self.oneway(&Request::MapHave {
+                node,
+                maps: part.to_vec(),
+                gone: std::mem::take(&mut gone),
+            });
+        }
+        if !gone.is_empty() {
+            let _ = self.oneway(&Request::MapHave {
+                node,
+                maps: Vec::new(),
+                gone,
+            });
         }
     }
 

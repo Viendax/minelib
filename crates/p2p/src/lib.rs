@@ -14,8 +14,10 @@
 //!   naturellement le relais de tout le monde.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+pub mod cartes;
 mod debit;
 pub mod passeur;
 pub mod portmap;
@@ -374,6 +376,24 @@ pub fn publish(me: Ad) {
 /// le joueur distant (son adresse IP, ou à défaut son identifiant iroh).
 pub const PREAMBLE: &[u8; 4] = b"MLPX";
 
+/// (v352) Le préambule avec le nœud iroh au bout de la connexion (authentifié par iroh) :
+/// le relais sait ainsi quel nœud sert les cartes d'un joueur, par quelque chemin qu'il
+/// vienne (`split_node`).
+pub fn preamble_from(who: &str, node: &[u8; 32]) -> Vec<u8> {
+    preamble(&format!("{who} {}", minelib_net::crypto::hex(node)))
+}
+
+/// (v352) Ce que dit un préambule : qui (adresse IP, ou « iroh:… »), et le nœud s'il y est.
+pub fn split_node(who: &str) -> (&str, Option<[u8; 32]>) {
+    match who.rsplit_once(' ') {
+        Some((w, hex)) => match minelib_net::crypto::unhex(hex).and_then(|b| b.try_into().ok()) {
+            Some(node) => (w, Some(node)),
+            None => (who, None),
+        },
+        None => (who, None),
+    }
+}
+
 pub fn preamble(who: &str) -> Vec<u8> {
     let who = &who.as_bytes()[..who.len().min(255)];
     let mut v = PREAMBLE.to_vec();
@@ -543,11 +563,74 @@ pub fn node_direct(remote: [u8; 32]) -> Option<bool> {
 }
 
 /// Nœud iroh de ce jeu (un par processus).
+/// (v352) Réseau d'essai : les nœuds `Node::start_local` qui s'y trouvent entre eux.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct LocalNet(iroh::address_lookup::MemoryLookup);
+
+impl LocalNet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 pub struct Node {
     rt: tokio::runtime::Runtime,
     ep: iroh::Endpoint,
     /// (v301) Ses routes par les passeurs (voir `passeur`).
     passeurs: passeur::PasseurTransport,
+    /// (v352) Le relais local servi par ce nœud (`serve`).
+    local: Arc<Mutex<Option<SocketAddr>>>,
+    /// (v352) Les cartes qu'il garde et sert (`share_maps`).
+    maps: Arc<OnceLock<Arc<cartes::Cartes>>>,
+}
+
+/// (v352) Toutes les connexions qui arrivent à ce nœud : celles du relais (`ALPN`) vont au
+/// relais local s'il en sert un (`Node::serve`), celles des cartes (`cartes::ALPN`) à ses
+/// cartes s'il en partage (`Node::share_maps`). Les autres sont refermées.
+async fn accept_all(
+    ep: iroh::Endpoint,
+    local: Arc<Mutex<Option<SocketAddr>>>,
+    maps: Arc<OnceLock<Arc<cartes::Cartes>>>,
+) {
+    while let Some(incoming) = ep.accept().await {
+        let (local, maps) = (local.clone(), maps.clone());
+        tokio::spawn(async move {
+            let first = match incoming.remote_addr() {
+                iroh::endpoint::IncomingAddr::Ip(a) => Some(a.ip()),
+                _ => None,
+            };
+            let Ok(conn) = incoming.await else { return };
+            if conn.alpn() == cartes::ALPN {
+                match maps.get().cloned() {
+                    Some(c) => c.accept(conn).await,
+                    None => conn.close(0u32.into(), b"pas de cartes ici"),
+                }
+                return;
+            }
+            let target = *local.lock().unwrap();
+            let Some(local) = target.filter(|_| conn.alpn() == ALPN) else {
+                conn.close(0u32.into(), b"pas de relais ici");
+                return;
+            };
+            while let Ok((send, recv)) = conn.accept_bi().await {
+                let who = remote_key(&conn, first);
+                let node = *conn.remote_id().as_bytes();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    match tokio::net::TcpStream::connect(local).await {
+                        Ok(mut tcp) => {
+                            use tokio::io::AsyncWriteExt;
+                            if tcp.write_all(&preamble_from(&who, &node)).await.is_ok() {
+                                pipe(tcp, send, recv, conn).await
+                            }
+                        }
+                        Err(e) => log::warn!("tunnel vers le relais local : {e}"),
+                    }
+                });
+            }
+        });
+    }
 }
 
 async fn pipe(
@@ -687,6 +770,53 @@ impl Node {
         Self::build_with(None, true, true)
     }
 
+    /// (v352) Nœud d'essai sur cette machine seulement (127.0.0.1, sans serveur d'iroh) :
+    /// les nœuds d'un même `LocalNet` se trouvent entre eux.
+    #[doc(hidden)]
+    pub fn start_local(net: &LocalNet) -> Result<Self> {
+        let lookup = net.0.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("iroh")
+            .enable_all()
+            .build()?;
+        let (ep, passeurs) = rt
+            .block_on(async {
+                let passeurs = passeur::PasseurTransport::bind()?;
+                let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                    .relay_mode(iroh::RelayMode::Disabled)
+                    .clear_address_lookup()
+                    .address_lookup(lookup.clone())
+                    .alpns(vec![ALPN.to_vec(), cartes::ALPN.to_vec()])
+                    .bind_addr("127.0.0.1:0")
+                    .map_err(|e| anyhow!("{e}"))?
+                    .bind()
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?;
+                anyhow::Ok((ep, passeurs))
+            })
+            .map_err(|e| anyhow!("iroh : {e}"))?;
+        let at = ep
+            .bound_sockets()
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| anyhow!("pas d'adresse locale"))?;
+        lookup.add_endpoint_info(iroh::EndpointAddr::new(ep.id()).with_ip_addr(at));
+        let (local, maps) = (Arc::default(), Arc::default());
+        rt.spawn(accept_all(
+            ep.clone(),
+            Arc::clone(&local),
+            Arc::clone(&maps),
+        ));
+        Ok(Self {
+            rt,
+            ep,
+            passeurs,
+            local,
+            maps,
+        })
+    }
+
     fn build(secret: Option<[u8; 32]>, private: bool) -> Result<Self> {
         Self::build_with(secret, private, false)
     }
@@ -718,7 +848,7 @@ impl Node {
                         .relay_mode(iroh::RelayMode::Custom(ours.iter().cloned().collect()))
                 };
                 let mut b = b
-                    .alpns(vec![ALPN.to_vec()])
+                    .alpns(vec![ALPN.to_vec(), cartes::ALPN.to_vec()])
                     .add_custom_transport(std::sync::Arc::new(passeurs.clone()));
                 if let Some(s) = secret {
                     b = b.secret_key(iroh::SecretKey::from_bytes(&s));
@@ -731,7 +861,39 @@ impl Node {
             })
             .map_err(|e| anyhow!("iroh : {e}"))?;
         passeurs.register(*ep.id().as_bytes());
-        Ok(Self { rt, ep, passeurs })
+        let (local, maps) = (Arc::default(), Arc::default());
+        rt.spawn(accept_all(
+            ep.clone(),
+            Arc::clone(&local),
+            Arc::clone(&maps),
+        ));
+        Ok(Self {
+            rt,
+            ep,
+            passeurs,
+            local,
+            maps,
+        })
+    }
+
+    /// (v352) Ce nœud garde et sert des cartes (`cartes`), dans le dossier `dir` (le sien :
+    /// un seul nœud par dossier). Une deuxième fois : les mêmes, avec ces limites.
+    pub fn share_maps(
+        &self,
+        dir: &std::path::Path,
+        limits: cartes::Limits,
+    ) -> Result<Arc<cartes::Cartes>> {
+        if let Some(c) = self.maps.get() {
+            c.set_limits(limits);
+            return Ok(c.clone());
+        }
+        let c = cartes::Cartes::open(dir, self.ep.clone(), self.rt.handle().clone(), limits)?;
+        Ok(self.maps.get_or_init(|| c).clone())
+    }
+
+    /// (v352) Les cartes de ce nœud, s'il en partage.
+    pub fn cartes(&self) -> Option<Arc<cartes::Cartes>> {
+        self.maps.get().cloned()
     }
 
     /// (v301) Ses routes par les passeurs (essais, journal).
@@ -795,33 +957,8 @@ impl Node {
     /// par un préambule ([`preamble`]) qui donne au relais la vraie adresse du joueur
     /// distant : sans lui, tout le monde arriverait de 127.0.0.1.
     pub fn serve(&self, local: SocketAddr) {
-        let ep = self.ep.clone();
-        self.rt.spawn(async move {
-            while let Some(incoming) = ep.accept().await {
-                tokio::spawn(async move {
-                    let first = match incoming.remote_addr() {
-                        iroh::endpoint::IncomingAddr::Ip(a) => Some(a.ip()),
-                        _ => None,
-                    };
-                    let Ok(conn) = incoming.await else { return };
-                    while let Ok((send, recv)) = conn.accept_bi().await {
-                        let who = remote_key(&conn, first);
-                        let conn = conn.clone();
-                        tokio::spawn(async move {
-                            match tokio::net::TcpStream::connect(local).await {
-                                Ok(mut tcp) => {
-                                    use tokio::io::AsyncWriteExt;
-                                    if tcp.write_all(&preamble(&who)).await.is_ok() {
-                                        pipe(tcp, send, recv, conn).await
-                                    }
-                                }
-                                Err(e) => log::warn!("tunnel vers le relais local : {e}"),
-                            }
-                        });
-                    }
-                });
-            }
-        });
+        // (v352) Les connexions sont reçues par `accept_all`.
+        *self.local.lock().unwrap() = Some(local);
     }
 
     /// (v320) Tunnel vers le nœud `remote` qui ne s'ouvre que par une route de passeurs, et
@@ -968,6 +1105,22 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v352) Le préambule porte le nœud du bout ; le relais en retire qui il est (adresse
+    /// ou « iroh:… ») tel qu'avant, et le nœud à part.
+    #[test]
+    fn the_preamble_carries_the_node_at_the_end() {
+        let node = [0xab; 32];
+        let p = preamble_from("203.0.113.7", &node);
+        let who = String::from_utf8(p[5..].to_vec()).unwrap();
+        assert_eq!(p[4] as usize, who.len());
+        assert_eq!(split_node(&who), ("203.0.113.7", Some(node)));
+        assert_eq!(
+            split_node("iroh:0102030405060708"),
+            ("iroh:0102030405060708", None)
+        );
+        assert_eq!(split_node("a b"), ("a b", None));
+    }
 
     /// (v347) Ce que le tunnel écrit par les serveurs relais d'iroh est compté, tout et dans
     /// l'ordre ; par un autre chemin, rien n'est compté.

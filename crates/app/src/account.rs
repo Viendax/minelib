@@ -84,7 +84,18 @@ pub(crate) fn p2p_node(dir: &std::path::Path) -> Option<&'static minelib_p2p::No
         // (v313) Anonyme : plus de lien direct, donc plus d'adresse IP montrée à l'hôte d'un
         // relais ni aux joueurs qu'on sert (sauf `hote_direct=true`).
         match minelib_p2p::Node::start_game(secret) {
-            Ok(n) => Some(n),
+            Ok(n) => {
+                // (v352) Les cartes qu'il a, servies aux autres joueurs ; celles qu'il
+                // demande, prises à tous ceux qui les ont.
+                let limits = minelib_p2p::cartes::game_limits();
+                if limits.place > 0 {
+                    match n.share_maps(&dir.with_file_name("cartes_partagees"), limits) {
+                        Ok(c) => minelib_net::cartes::set(Some(c)),
+                        Err(e) => log::warn!("cartes partagées : {e:#}"),
+                    }
+                }
+                Some(n)
+            }
             Err(e) => {
                 log::warn!("iroh : {e:#}");
                 None
@@ -421,6 +432,10 @@ fn auto_relay(
         node.serve(mine);
         // (v320) Ses joueurs y viennent ensuite par des passeurs.
         h.set_own_node(node.id());
+        // (v352) Le nœud du jeu sert aussi les cartes de son relais.
+        if let Some(c) = node.cartes() {
+            h.share_maps(c);
+        }
         // Pseudos uniques avec les autres relais du DHT.
         h.set_whois(minelib_relay::federated_whois(node, public));
         h.set_peer_servers(minelib_relay::federated_servers(node, public));
@@ -2007,7 +2022,7 @@ impl Accounts {
     /// ligne (`online_copies`). Vide s'il n'est pas connu.
     /// (v350) Le relais connecté garde-t-il les mondes endormis (`Cmd::WakeKept`) ?
     pub fn relay_keeps_worlds(&self) -> bool {
-        self.relay_level >= minelib_net::proto::RELAY_LEVEL
+        self.relay_level >= minelib_net::proto::RELAY_KEEPS_WORLDS
     }
 
     pub fn relay_hex(&self) -> String {

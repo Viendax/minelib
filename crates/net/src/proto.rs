@@ -98,9 +98,16 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL: u32 = 75;
 
 /// (v350) Ce que sait faire un relais, dit aux jeux (`Response::RelayLevel`) : 350, il garde
-/// les mondes endormis et les rouvre sans le PC de personne (`Request::WakeKept`). Un relais
-/// qui ne dit rien est d'avant.
-pub const RELAY_LEVEL: u32 = 350;
+/// les mondes endormis et les rouvre sans le PC de personne (`Request::WakeKept`) ; (v352)
+/// 352, il dit où prendre une carte (`Request::MapWhere`). Un relais qui ne dit rien est
+/// d'avant.
+pub const RELAY_LEVEL: u32 = 352;
+/// (v350) Relais qui garde les mondes endormis (`RELAY_LEVEL`).
+pub const RELAY_KEEPS_WORLDS: u32 = 350;
+/// (v352) Relais qui dit où prendre une carte (`Request::MapWhere`, `Request::MapHave`).
+pub const MAP_SOURCES_LEVEL: u32 = 352;
+/// (v350) Jeux qui lisent `Response::RelayLevel` (le relais ne l'envoie qu'à eux).
+pub const RELAY_LEVEL_SINCE: u32 = 350;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
 /// monde ne s'ouvre qu'en supprimant son plus ancien monde endormi, ce que le joueur
@@ -1131,7 +1138,46 @@ pub enum Request {
     WakeKept {
         world: String,
     },
+    /// (v352) Où prendre une carte : `Response::MapSources`, les machines qui l'ont (relais
+    /// de niveau `MAP_SOURCES_LEVEL`). La carte est prise chez elles par iroh-blobs
+    /// (`minelib_p2p::cartes`) ; `MapGet` reste le dernier recours.
+    MapWhere {
+        sig: [u8; 32],
+    },
+    /// (v352) Les cartes que ce jeu (ou ce passeur) garde et sert, par son nœud iroh `node`
+    /// (le relais le vérifie : c'est celui de la connexion), et celles qu'il n'a plus
+    /// (`gone`). Sans réponse.
+    MapHave {
+        node: [u8; 32],
+        maps: Vec<MapHeld>,
+        gone: Vec<[u8; 32]>,
+    },
+    /// (v352) Passeur qui a `room` octets libres : les cartes que peu de machines gardent,
+    /// à prendre pour les servir aussi. Réponse : `Response::MapsToKeep`.
+    MapsToKeep {
+        room: u64,
+    },
 }
+
+/// (v352) Une carte gardée par une machine : sa signature, son empreinte BLAKE3 (celle
+/// d'iroh-blobs) et sa taille.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MapHeld {
+    pub sig: [u8; 32],
+    pub hash: [u8; 32],
+    pub size: u64,
+}
+
+/// (v352) Où prendre une carte : les nœuds iroh des machines qui l'ont, le relais en
+/// dernier (il garde sa copie en dernier recours).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct MapSource {
+    pub map: MapHeld,
+    pub nodes: Vec<[u8; 32]>,
+}
+
+/// (v352) Cartes au plus par `Request::MapHave` (une trame fait 65 535 octets au plus).
+pub const MAP_HAVE_PART: usize = 600;
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
 /// monde y joint la graine).
@@ -2168,6 +2214,14 @@ pub enum Response {
     RelayLevel {
         level: u32,
     },
+    /// (v352) Réponse à `Request::MapWhere` (`None` : personne n'a cette carte).
+    MapSources {
+        source: Option<MapSource>,
+    },
+    /// (v352) Réponse à `Request::MapsToKeep`.
+    MapsToKeep {
+        list: Vec<MapSource>,
+    },
 }
 
 /// (v349) Un monde endormi oublié par le relais (`Response::WorldsForgotten`) : de quoi faire
@@ -2366,6 +2420,10 @@ impl Response {
                 | Response::Audit { .. }
                 | Response::WorldBeat { .. }
                 | Response::VoiceFrom { .. }
+                // (v352) Poussés à l'accueil, juste avant la réponse de la première requête
+                // (v349, v350) : avant, cette requête les prenait pour sa réponse.
+                | Response::WorldsForgotten { .. }
+                | Response::RelayLevel { .. }
         )
     }
 }
@@ -3012,7 +3070,8 @@ mod push_tests {
     /// (v307) Ce que le relais envoie de lui-même pour les tunnels, les passeurs et les
     /// journaux n'est jamais pris pour la réponse à une demande en cours. (Les v301 et
     /// v304 l'avaient oublié : un jeu qui attendait une réponse recevait « réponse
-    /// inattendue ».)
+    /// inattendue ».) (v352) Ni ce qu'il dit à l'accueil, juste avant la réponse de la
+    /// première requête : les v349 et v350 l'avaient oublié à leur tour.
     #[test]
     fn what_the_relay_sends_on_its_own_is_never_taken_for_a_reply() {
         for r in [
@@ -3038,8 +3097,12 @@ mod push_tests {
                 lot: 1,
                 routes: Vec::new(),
             },
+            Response::RelayLevel { level: RELAY_LEVEL },
+            Response::WorldsForgotten { worlds: Vec::new() },
         ] {
             assert!(r.is_push(), "{r:?}");
         }
+        assert!(!Response::MapSources { source: None }.is_push());
+        assert!(!Response::MapsToKeep { list: Vec::new() }.is_push());
     }
 }

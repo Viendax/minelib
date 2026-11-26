@@ -160,6 +160,16 @@ impl Headless {
         self.slots.len()
     }
 
+    /// (v352) Prend, pour les servir, les cartes que peu de machines gardent sur les relais
+    /// où ce passeur est entré (s'il garde des cartes : `minelib_net::cartes`).
+    pub fn keep_maps(&self) {
+        for s in self.slots.iter().filter(|s| s.joined) {
+            if let Some(c) = &s.client {
+                c.send(Cmd::KeepMaps);
+            }
+        }
+    }
+
     /// À appeler souvent : entre aux relais, s'y annonce, y retourne après une coupure.
     pub fn tend(&mut self) {
         let (dir, ip) = (self.opts.dir.clone(), self.opts.ip);

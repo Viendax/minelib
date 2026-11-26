@@ -6,7 +6,7 @@
 #                                --admin <pseudo>, --place-mondes <Mo>…]
 #   sudo sh installer.sh passeur [--ip <adresse publique>] [--port <premier port UDP>]
 #                                [--relais "<nœud> <clé> <nom>"] [--invitation "<…>"]
-#                                [--sans-journaux]
+#                                [--sans-journaux] [--place-cartes <Mo>]
 #
 # (v345) Les deux sur une même machine : chacun a son service (minelib-relay, minelib-passeur).
 # `--invitation` : celle donnée dans le jeu (/forwarder invite) ; le passeur y devient de

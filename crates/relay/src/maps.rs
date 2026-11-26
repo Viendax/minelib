@@ -252,6 +252,11 @@ impl Store {
         }
     }
 
+    /// (v352) Dossier des cartes (une par fichier, `file`).
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     pub fn has(&self, sig: &[u8; 32]) -> bool {
         self.index.contains_key(sig)
     }
@@ -420,7 +425,7 @@ impl Store {
     }
 }
 
-fn file(sig: &[u8; 32]) -> String {
+pub(crate) fn file(sig: &[u8; 32]) -> String {
     format!("{}.map", crypto::hex(sig))
 }
 

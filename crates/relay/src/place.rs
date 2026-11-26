@@ -165,6 +165,8 @@ pub(crate) fn sweep_maps(st: &mut State) -> (usize, u64) {
         .collect();
     let (n, bytes) = st.maps.sweep(&keep, MAP_GRACE);
     if n > 0 {
+        // (v352) Son nœud ne les sert plus.
+        super::partage::maps_changed(st, Vec::new());
         log::info!(
             "place des mondes : {n} cartes d'avant effacées ({:.1} Mo), plus rien ne les demandait",
             bytes as f64 / 1e6
@@ -313,7 +315,7 @@ pub(crate) fn tell(st: &mut State, id: u64) {
     let Some(c) = st.conns.get(&id) else {
         return;
     };
-    if c.version >= proto::RELAY_LEVEL {
+    if c.version >= proto::RELAY_LEVEL_SINCE {
         transport::push(
             &c.tx,
             &Response::RelayLevel {

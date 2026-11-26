@@ -55,6 +55,10 @@ Il est joignable sans port ouvert (iroh). Options :
   monde solo. Les cartes d'avant (une par ouverture d'un monde) que plus rien ne demande sont
   effacées.
 
+(v352) Le nœud du relais sert aussi ses cartes aux jeux, avec les autres machines qui les ont
+(iroh-blobs, sans les copier : `cartes_partagees` ne garde que leur index et leurs
+empreintes).
+
 **Un passeur sans joueur :**
 
 ```sh
@@ -77,6 +81,10 @@ Options :
   adresse IP). `/forwarder remove <pseudo>` lui retire sa confiance ; `/forwarder list` les
   montre.
 - (v347) `--sans-journaux` : ne pas envoyer le journal réseau (voir plus bas).
+- (v352) `--place-cartes <Mo>` : la place des cartes gardées pour les autres (2 000 Mo par
+  défaut ; 0 : aucune). Toutes les dix minutes, le passeur demande aux relais les cartes FPS
+  que moins de trois machines gardent, les plus jouées d'abord, les prend et les sert aux
+  jeux (dossier `cartes`). Quand la place manque, les moins récentes partent.
 
 **Les deux sur la même machine** (v345) : relancer le script avec l'autre mode. Le relais a
 le service `minelib-relay`, le passeur `minelib-passeur`.

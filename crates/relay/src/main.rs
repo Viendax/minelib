@@ -29,6 +29,10 @@
 //! (v347) Un passeur envoie ses lignes de journal réseau aux relais qui les demandent
 //! (`minelib_net::netlog` : ni pseudo, ni adresse, ni nœud), comme un jeu dont le joueur l'a
 //! accepté, sans question : il n'y a pas de joueur. `--sans-journaux` : ne pas les envoyer.
+//!
+//! (v352) Le nœud du relais sert aussi ses cartes (`minelib_p2p::cartes`, sans les copier).
+//! Un passeur garde, pour les servir, les cartes FPS que peu de machines ont, dans
+//! `--place-cartes <Mo>` (2000 par défaut ; 0 : aucune).
 
 use anyhow::Result;
 
@@ -102,6 +106,7 @@ fn main() -> Result<()> {
         minelib_relay::add_admins(&cfg.dir, &admins)?;
     }
     let key_path = cfg.dir.with_file_name("noeud.key");
+    let maps_dir = cfg.dir.join("cartes_partagees");
     let h = minelib_relay::start(cfg)?;
     println!("Relais prêt sur {}", h.addr);
     println!(
@@ -138,6 +143,11 @@ fn main() -> Result<()> {
                 node.serve(local);
                 // (v320) Ses joueurs y viennent ensuite par des passeurs.
                 h.set_own_node(node.id());
+                // (v352) Son nœud sert aussi ses cartes, avec celles des autres machines.
+                match node.share_maps(&maps_dir, minelib_p2p::cartes::Limits::SERVER) {
+                    Ok(c) => h.share_maps(c),
+                    Err(e) => eprintln!("Cartes partagées impossibles : {e:#}"),
+                }
                 minelib_p2p::publish(minelib_p2p::Ad {
                     node: node.id(),
                     noise: h.public,
@@ -210,6 +220,8 @@ fn passeur_main() -> Result<()> {
     let mut invites: Vec<([u8; 32], [u8; 16])> = Vec::new();
     // (v347) Le journal réseau, envoyé aux relais qui le demandent, sauf `--sans-journaux`.
     let mut share_logs = true;
+    // (v352) Place des cartes gardées pour les autres (Mo ; 0 : aucune).
+    let mut maps_mb: u64 = 2000;
     let mut i = 1;
     while i < args.len() {
         let v = args.get(i + 1).cloned().unwrap_or_default();
@@ -232,6 +244,13 @@ fn passeur_main() -> Result<()> {
                 }
             },
             "--port" => port = v.parse().unwrap_or(0),
+            "--place-cartes" => match v.parse() {
+                Ok(n) => maps_mb = n,
+                Err(_) => {
+                    eprintln!("--place-cartes : un nombre de Mo attendu ({v})");
+                    std::process::exit(2);
+                }
+            },
             "--relais" => extra.extend(minelib_p2p::parse_relays(&v)),
             "--invitation" => match minelib_p2p::parse_invitation(&v) {
                 Some((secret, ad)) => {
@@ -286,6 +305,20 @@ fn passeur_main() -> Result<()> {
         },
         dir.display()
     );
+    // (v352) Les cartes que peu de machines gardent, servies aussi d'ici.
+    if maps_mb > 0 {
+        let limits = minelib_p2p::cartes::Limits {
+            place: maps_mb.saturating_mul(1_000_000),
+            ..minelib_p2p::cartes::Limits::SERVER
+        };
+        match node.share_maps(&dir.join("cartes"), limits) {
+            Ok(c) => {
+                println!("Cartes gardées pour les autres : {maps_mb} Mo au plus.");
+                minelib_net::cartes::set(Some(c));
+            }
+            Err(e) => eprintln!("Cartes partagées impossibles : {e:#}"),
+        }
+    }
     let mut p = Headless::new(Options {
         dir: dir.clone(),
         ip,
@@ -296,6 +329,9 @@ fn passeur_main() -> Result<()> {
     }
     let mut next_find = Instant::now();
     let mut next_say = Instant::now() + Duration::from_secs(60);
+    // (v352) Deux minutes après le démarrage (le temps d'entrer aux relais), puis toutes
+    // les dix minutes.
+    let mut next_maps = Instant::now() + Duration::from_secs(120);
     loop {
         if Instant::now() >= next_find {
             next_find = Instant::now() + Duration::from_secs(600);
@@ -323,6 +359,10 @@ fn passeur_main() -> Result<()> {
             }
         }
         p.tend();
+        if maps_mb > 0 && Instant::now() >= next_maps {
+            next_maps = Instant::now() + Duration::from_secs(600);
+            p.keep_maps();
+        }
         if Instant::now() >= next_say {
             next_say = Instant::now() + Duration::from_secs(60);
             println!(
