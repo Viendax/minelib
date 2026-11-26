@@ -246,7 +246,8 @@ impl Crowd {
         for _ in 0..RECHECK_PER_FRAME.min(self.npcs.len()) {
             self.recheck = (self.recheck + 1) % self.npcs.len();
             let i = self.recheck;
-            let skin = skins.of(&self.npcs[i].name);
+            // (v344) Sans le demander au relais : un joueur simulé n'a pas de compte.
+            let skin = skins.cached(&self.npcs[i].name);
             let n = &mut self.npcs[i];
             n.covered = covered(world, n.pos);
             // (Le personnage caché garde le sien.)
@@ -1230,6 +1231,30 @@ mod tests {
         for _ in 0..(seconds * 60.0) as usize {
             c.update(w, &skins, Vec3::new(0.5, 11.0, 0.5), 1.0 / 60.0);
         }
+    }
+
+    /// (v344) La foule d'essai de 4 000 (26 novembre, 02:54) : chaque joueur simulé voyait son
+    /// skin demandé au relais, une demande qui attend sa réponse sur la connexion du joueur ;
+    /// 4 000 d'affilée la bloquaient des minutes (« le relais ne répond pas », puis des
+    /// réponses décalées : un /tp recevait le skin de pnj4002). Un joueur simulé n'a pas de
+    /// compte : rien n'est plus demandé pour lui.
+    #[test]
+    fn simulated_players_never_ask_the_relay_for_skins() {
+        let w = flat();
+        let mut c = Crowd::new();
+        let mut skins = crate::skin::Skins::default();
+        for _ in 0..(40.0 * 60.0) as usize {
+            c.update(&w, &skins, Vec3::new(0.5, 11.0, 0.5), 1.0 / 60.0);
+        }
+        assert!(c.npcs.len() > 1000, "{} joueurs simulés", c.npcs.len());
+        assert!(skins.take_wanted_max(usize::MAX).is_empty());
+        // Un vrai joueur, lui, est demandé (par paquets : quelques-uns à la fois).
+        for p in ["Haumax", "Viendax", "Zoe"] {
+            assert!(skins.of(p).is_none());
+        }
+        assert_eq!(skins.take_wanted_max(2), vec!["haumax", "viendax"]);
+        assert_eq!(skins.take_wanted_max(2), vec!["zoe"]);
+        assert!(skins.take_wanted_max(2).is_empty());
     }
 
     /// (v238) « Il a la même vie qu'un joueur » : vingt coups pour le tuer ; tué, il

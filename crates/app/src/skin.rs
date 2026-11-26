@@ -342,6 +342,17 @@ impl Skins {
         }
     }
 
+    /// (v344) Skin connu de ce pseudo, sans rien demander au relais : pour les joueurs
+    /// simulés de la foule d'essai, qui n'ont pas de compte. Avant, chacun était demandé au
+    /// relais (`of`) : 4 000 demandes d'affilée pour une foule de 4 000, qui bloquaient la
+    /// connexion du joueur pendant des minutes (26 novembre, 02:54).
+    pub fn cached(&self, pseudo: &str) -> Option<Arc<Skin>> {
+        if pseudo.is_empty() || pseudo.contains(' ') {
+            return None;
+        }
+        self.others.get(&pseudo.to_lowercase()).cloned().flatten()
+    }
+
     /// (v177) Skin d'un joueur d'une partie FPS : un bot a le sien (dessiné pour lui, selon
     /// son équipe : `bot_skin`), les autres comme `of`.
     pub fn in_match(&self, pseudo: &str, team: u8) -> Option<Arc<Skin>> {
@@ -385,9 +396,16 @@ impl Skins {
         }
     }
 
-    /// Pseudos à demander (et marqués comme demandés).
-    pub fn take_wanted(&mut self) -> Vec<String> {
-        let w = std::mem::take(&mut *self.wanted.borrow_mut());
+    /// Pseudos à demander (et marqués comme demandés). (v344) Au plus `max` ; les autres
+    /// restent à demander. Chaque
+    /// demande attend sa réponse sur la connexion du joueur : par paquets, ses autres
+    /// commandes ne restent pas derrière elles.
+    pub fn take_wanted_max(&mut self, max: usize) -> Vec<String> {
+        let w: Vec<String> = {
+            let mut all = self.wanted.borrow_mut();
+            let n = max.min(all.len());
+            all.drain(..n).collect()
+        };
         for k in &w {
             self.others.entry(k.clone()).or_insert(None);
         }

@@ -69,6 +69,10 @@ const POS_FASTEST: f32 = 1.0 / 256.0;
 /// parties FPS par TURN. Chaque octet par TURN compte deux fois dans le quota du mois ; par
 /// les passeurs, en direct ou par nos serveurs, rien ne change (256).
 const POS_FASTEST_TURN: f32 = 1.0 / 128.0;
+
+/// (v344) Sans position de personne depuis ce temps (s), notre chunk est redit au relais du
+/// monde (voir `BuildNet::update`).
+const REPOS_EVERY: f32 = 10.0;
 /// (v333) Positions par le relais quand toutes nos positions rapides vont directement à nos
 /// plus proches voisins (`minelib_net::fast::Near`) : de quoi tenir le relais au courant
 /// (place gardée, modifications en retard) et les joueurs plus loin, 16 par seconde.
@@ -330,6 +334,9 @@ pub struct BuildNet {
     /// `POS_RELAY_DIRECT`).
     near: Option<minelib_net::fast::Near>,
     near_timer: f32,
+    /// (v344) Avant de redire notre chunk au relais du monde quand rien n'arrive de personne
+    /// (`REPOS_EVERY`).
+    repos_timer: f32,
     direct_all: bool,
     /// (v287) Relevé du réseau, écrit au journal chaque minute sans rien qui désigne un
     /// joueur : positions parties (pour tous, rapprochées), positions reçues, modifications
@@ -792,6 +799,7 @@ impl BuildNet {
             turn_link: false,
             near: None,
             near_timer: 0.0,
+            repos_timer: REPOS_EVERY,
             direct_all: false,
             net: [0; 6],
             net_since: std::time::Instant::now(),
@@ -2184,6 +2192,19 @@ impl BuildNet {
                 self.root_province = province;
             }
             self.was_deep = deep;
+        }
+        // (v344) Rien reçu de personne depuis `REPOS_EVERY` : notre chunk est redit au relais
+        // du monde. Il ne l'apprend que de `Position`, envoyée quand on change de chunk :
+        // perdue, ou arrivée trop tôt, on restait invisible pour tous, et sans voir personne,
+        // même à deux blocs d'un autre (26 novembre, 02:39 à 02:43 : 0 position reçue de
+        // personne, jusqu'à un /tp).
+        self.repos_timer -= dt;
+        if self.repos_timer <= 0.0 {
+            self.repos_timer = REPOS_EVERY;
+            let alone = self.others.values().all(|o| o.seen > REPOS_EVERY);
+            if alone && !deep && !self.dozing {
+                self.send(Request::Position { chunk });
+            }
         }
         self.doze_tick(chunk, deep, dt);
         self.flush_lights(dt);
@@ -8146,6 +8167,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (v344) Comme le 26 novembre (02:39) : le joueur qui rejoint tient lui-même le relais de
+    /// secours du monde (sa connexion de garant, avec son pseudo, est alors dans ce monde), le
+    /// créateur en est témoin. Tous deux au même endroit, par un vrai relais : chacun voit
+    /// l'autre.
+    #[test]
+    fn players_at_one_place_see_each_other_when_one_keeps_the_backup_relay() {
+        let dir = std::env::temp_dir().join(format!("minelib-secours-joueur-{}", rand_u32()));
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        h.set_standby_local(true);
+        let addr = h.addr.to_string();
+        let mut a = Bot::new(&addr, h.public, "Haumax", false);
+        a.c.send(Cmd::Host {
+            kind: 1,
+            name: "Nouveau monde 1".into(),
+            map: "essai".into(),
+            map_sig: [7; 32],
+            max_players: 0,
+            seed: 0,
+            terrain: 0,
+        });
+        let mut room = None;
+        let t = Instant::now();
+        while room.is_none() {
+            while let Some(e) = a.c.poll() {
+                match e {
+                    Event::Hosted(r) => room = Some(r),
+                    Event::Link(l) => a.link = Some(l),
+                    Event::Identity(k) => a.identity = Some(k),
+                    _ => {}
+                }
+            }
+            assert!(t.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let room = room.unwrap();
+        a.start_net(true);
+        let mut b = Bot::new(&addr, h.public, "Viendax", false);
+        b.c.send(Cmd::Join(room));
+        b.wait(|e| matches!(e, Event::Joined { .. }));
+        b.start_net(false);
+        let mut bg = Bot::new(&addr, h.public, "Viendax", true);
+        bg.c.send(Cmd::GarantAvailable(true));
+        let mut ag: Option<Bot> = None;
+        b.pos = a.pos;
+        let dt = 0.02;
+        let mut standby_seen = None;
+        for step in 0..600 {
+            if step == 100 {
+                let g = Bot::new(&addr, h.public, "Haumax", true);
+                g.c.send(Cmd::GarantAvailable(true));
+                ag = Some(g);
+            }
+            a.pos.x = 64.0 + (step as f32 * 0.05).sin();
+            b.pos.x = 64.5 + (step as f32 * 0.05).cos();
+            a.tick(dt);
+            b.tick(dt);
+            bg.tick(dt);
+            if let Some(g) = &mut ag {
+                g.tick(dt);
+            }
+            if standby_seen.is_none() && bg.standby.is_some() {
+                standby_seen = Some(step);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let c = h.committee(room);
+        let sees = |x: &Bot, who: &str| x.net.as_ref().is_some_and(|n| n.others.contains_key(who));
+        assert!(standby_seen.is_some(), "Viendax tient le relais de secours");
+        assert!(c.is_some_and(|c| c.standby.is_some()));
+        assert!(sees(&a, "Viendax") && sees(&b, "Haumax"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (v285) Six joueurs au même endroit, par un vrai relais : chacun voit arriver à
     /// chaque image les positions de ses 3 voisins les plus proches (256 par seconde quand
     /// la machine suit), et celles des 2 autres au rythme d'avant (60 par seconde).
@@ -8265,6 +8365,50 @@ mod tests {
             .fold(0.0, f32::max);
         assert!(jumps < 0.5, "bond de {jumps}");
         assert!(shown[119] > 15.0, "il avance : {}", shown[119]);
+    }
+
+    /// (v344) Personne entendu depuis `REPOS_EVERY` : notre chunk est redit au relais du monde
+    /// (sa demande `Position`, perdue, nous laissait invisible) ; quand un voisin est entendu,
+    /// plus rien de tel (on ne charge pas le relais d'une foule).
+    #[test]
+    fn alone_our_chunk_is_said_again_to_the_relay() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut b = BuildNet::new(tx, "Moi".into(), false);
+        let mut w = World::new(0);
+        let count = |rx: &std::sync::mpsc::Receiver<Inbound>| {
+            rx.try_iter()
+                .filter(|m| match m {
+                    Inbound::Push(bytes) => matches!(
+                        game::decode::<Request>(bytes),
+                        Some(Request::Position { .. })
+                    ),
+                    _ => false,
+                })
+                .count()
+        };
+        let dt = 0.1;
+        for _ in 0..((REPOS_EVERY * 3.0 + 1.0) / dt) as usize {
+            let _ = b.update(&mut w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, dt);
+        }
+        // La première (nouveau chunk), puis une toutes les `REPOS_EVERY`.
+        assert_eq!(count(&rx), 4);
+        let voisin = game::encode(&BuildMsg::Player {
+            pseudo: "Voisin".into(),
+            pos: [2.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            crouch: 0.0,
+            speed: 0.0,
+            ping: 0,
+            held: 0,
+        });
+        for k in 0..((REPOS_EVERY * 3.0) / dt) as usize {
+            if k % 5 == 0 {
+                b.receive(7, [0, 0], &voisin, &mut w);
+            }
+            let _ = b.update(&mut w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, dt);
+        }
+        assert_eq!(count(&rx), 0, "un voisin entendu : rien de redit");
     }
 
     /// (v222) Ce que tient un autre joueur arrive avec sa position : la lampe torche allumée à

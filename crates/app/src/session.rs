@@ -71,6 +71,28 @@ fn bite_parts(low: bool) -> &'static [usize] {
         &[0, 1, 2, 3, 4, 6]
     }
 }
+
+/// (v269, v272) Taille d'une morsure de L'Évidé (cubes de côté), tirée de sa graine.
+fn bite_size(seed: u32) -> usize {
+    3 + (seed >> 9) as usize % 2
+}
+
+/// (v344) Une morsure publiée par le relais, faite au corps d'un autre joueur tel qu'on le
+/// garde ici : l'endroit tiré de la visée (`aim`), la taille de la graine, comme le jeu de la
+/// victime le fait chez lui (`evide_bitten`) ; sans endroit à viser, au hasard de la graine.
+fn bite_like_the_victim(
+    flesh: &mut crate::flesh::Flesh,
+    low: bool,
+    aim: u32,
+    seed: u32,
+) -> Option<crate::flesh::Bite> {
+    let grids = crate::player_model::flesh_grids();
+    let size = bite_size(seed);
+    match flesh.pick(aim, bite_parts(low), &grids) {
+        Some((part, cell)) => flesh.bite_at(part, cell, size, &grids),
+        None => flesh.bite_somewhere(seed, size, bite_parts(low), &grids),
+    }
+}
 /// (v272) Notre bouchée : on mord à `EAT_IN` s, le geste dure `EAT_S` s ; vitesse à laquelle
 /// on se plie (rad/s). (v290) « Je n'arrive plus à manger le monstre […] que ça fonctionne
 /// quand je clique » : notre bouche n'a plus à arriver sur le morceau (elle n'y arrivait
@@ -362,6 +384,10 @@ const LOAD_MIN_S: f32 = 0.5;
 /// affichés pour continuer à jouer sans écran de chargement (le reste de la distance de rendu
 /// arrive pendant qu'on joue).
 const ARRIVE_READY: i32 = 4;
+
+/// (v344) Mort en construction en ligne : temps laissé au relais pour dire où réapparaître
+/// (sa réponse arrive d'habitude en un aller-retour).
+const RESPAWN_WAIT_S: f32 = 1.5;
 
 /// (v343) L'arrivée demande-t-elle l'écran de chargement ? (Chunks affichés autour d'elle,
 /// et combien il en faut.)
@@ -907,6 +933,9 @@ pub struct Session {
     /// (v318) Notre dernier `/tp` en ligne : ses tours, la place sur la carte, quand (ils
     /// comptent quand le relais nous y place, `BuildSpawn`).
     tp_laps_online: Option<(crate::laps::Laps, [f64; 3], std::time::Instant)>,
+    /// (v344) Mort en construction en ligne : depuis quand on attend que le relais dise où
+    /// réapparaître (`SERVER_RESPAWN`).
+    respawn_wait: Option<std::time::Instant>,
     /// (v220) Monde pas encore chargé (voir `LOAD_MIN_S` et `loading_done`, la seule porte) :
     /// on n'y apparaît pas. Ni touches ni physique (le joueur reste où il arrive), sa position
     /// ne part pas aux autres (construction en ligne) et il ne se présente pas à l'hôte (partie
@@ -1482,6 +1511,7 @@ impl Session {
             laps_seen: laps,
             teleport_laps: None,
             tp_laps_online: None,
+            respawn_wait: None,
             loading: Some(Loading::new()),
             items_seeded: false,
             delete_world_asked: false,
@@ -2152,6 +2182,15 @@ impl Session {
         self.streamer.set_loading(self.loading.is_some());
         // (v220) Monde pas encore chargé : on n'y apparaît pas (voir `loading`).
         self.check_loaded(renderer);
+        // (v344) Mort en ligne : le relais n'a rien dit à temps (ou le placement promis n'est
+        // pas venu), on réapparaît au point d'apparition du monde.
+        if self
+            .respawn_wait
+            .is_some_and(|t| t.elapsed().as_secs_f32() >= RESPAWN_WAIT_S)
+        {
+            self.respawn_wait = None;
+            self.respawn_here();
+        }
         // (v309) Passé la limite de la carte bouclée : dit au tchat.
         self.watch_laps();
         // Test des touches : il lit le clavier et la souris, le jeu ne reçoit rien.
@@ -7792,8 +7831,8 @@ impl Session {
     /// l'écran de chargement revient jusqu'à ce qu'il le soit (`loading_done`). Pas en partie
     /// FPS (les départs sont dans la carte, déjà chargée). (v343) Seulement si ce qui est
     /// autour de l'arrivée (`ARRIVE_READY` chunks) n'est pas déjà affiché : avant, toute la
-    /// distance de rendu comptait, et un `/tp` à deux blocs ou une mort près du point
-    /// d'apparition faisaient revenir l'écran de chargement (les chunks du bord de la vue,
+    /// distance de rendu comptait, et presque chaque `/tp` ou mort, même à deux blocs,
+    /// faisait revenir l'écran de chargement (les chunks du bord de la vue,
     /// qui arrivent du relais en ligne, n'étaient pas encore là), et pendant ce temps les
     /// autres joueurs ne nous voyaient plus.
     fn arrive_elsewhere(&mut self) {
@@ -8339,7 +8378,7 @@ impl Session {
         }
         // (v272) « La morsure n'est pas assez grande » : un cube de 3 ou 4 de côté
         // (2 ou 3 en v269), là où il visait.
-        let size = 3 + (seed >> 9) as usize % 2;
+        let size = bite_size(seed);
         let grids = crate::player_model::flesh_grids();
         let flesh = self
             .flesh
@@ -8429,10 +8468,17 @@ impl Session {
                 let chest = self.player.pos + Vec3::Y * 1.1;
                 self.evide_bitten(low, mouth.unwrap_or(chest), seed);
             } else if let Some(at) = place(&victim) {
-                // Un autre joueur est mordu : le bruit, et son sang.
+                // Un autre joueur est mordu : le bruit, son sang, et (v344) le morceau qui lui
+                // part, tiré comme chez lui (même visée, même taille) : « je ne voyais pas
+                // Haumax se faire manger par l'Évidé, et l'inverse aussi ».
                 let chest = at + Vec3::Y * 1.1;
                 crate::audio::jelly_bite(chest.distance(ear));
                 self.fps.bleed(chest, Vec3::ZERO, BLEED_SPURT, true);
+                let flesh = self
+                    .flesh
+                    .entry(victim.to_lowercase())
+                    .or_insert_with(|| crate::flesh::Flesh::of(crate::flesh::Hard::Bones));
+                bite_like_the_victim(flesh, low, aim, seed);
             }
         }
         for (owner, id, part, cell, by, _health) in eats {
@@ -8523,6 +8569,11 @@ impl Session {
         if self.net.is_some() {
             return;
         }
+        // (v344) Déjà mort, le relais va dire où réapparaître (sous le monde, on tomberait de
+        // nouveau à chaque image en attendant).
+        if self.respawn_wait.is_some() {
+            return;
+        }
         self.chat
             .say("Vous êtes mort ! Retour au point d'apparition.", chat::RED);
         // (v299) Son corps reste où il est mort : il tombe, fond en sang, laisse ses os.
@@ -8533,14 +8584,19 @@ impl Session {
             let push = Vec3::new(back.x, 0.0, back.z).normalize_or_zero() * 1.2;
             self.fall_body(&pose, vel, push, flesh, skin);
         }
-        self.player.pos = self.spawn;
-        // Point d'apparition en l'air (monde enregistré en volant) : on réapparaît posé sur
-        // le sol en dessous, sinon on retomberait et on mourrait en boucle.
-        let (x, z) = (self.spawn.x.floor() as i32, self.spawn.z.floor() as i32);
-        if let Some(top) = self.world.top_solid(x, z) {
-            if (top as f32 + 1.0) < self.spawn.y {
-                self.player.pos.y = top as f32 + 1.0;
-            }
+        // (v344) En construction en ligne : au point d'apparition du serveur (`/setspawn`)
+        // s'il en a un (le relais nous y place, `SERVER_RESPAWN`), sinon à celui du monde dès
+        // sa réponse (`Event::RespawnReply`), ou sous `RESPAWN_WAIT_S` sans elle. Avant :
+        // toujours au point d'apparition du monde, même quand un OP en avait fixé un autre.
+        if self.build.is_some() {
+            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                action: minelib_net::proto::SERVER_RESPAWN,
+                pseudo: String::new(),
+                reason: String::new(),
+            });
+            self.respawn_wait = Some(std::time::Instant::now());
+        } else {
+            self.respawn_here();
         }
         self.player.flying = false;
         self.player.vel = Vec3::ZERO;
@@ -8554,6 +8610,20 @@ impl Session {
         self.eat_bow = 0.0;
         self.eat_turn = (0.0, 0.0);
         self.fps.respawn();
+    }
+
+    /// Réapparition au point d'apparition de ce jeu.
+    fn respawn_here(&mut self) {
+        self.player.pos = self.spawn;
+        // Point d'apparition en l'air (monde enregistré en volant) : on réapparaît posé sur
+        // le sol en dessous, sinon on retomberait et on mourrait en boucle.
+        let (x, z) = (self.spawn.x.floor() as i32, self.spawn.z.floor() as i32);
+        if let Some(top) = self.world.top_solid(x, z) {
+            if (top as f32 + 1.0) < self.spawn.y {
+                self.player.pos.y = top as f32 + 1.0;
+            }
+        }
+        self.player.vel = Vec3::ZERO;
         // (v283) Réapparu loin : pas en jeu tant que le monde n'y est pas chargé.
         self.arrive_elsewhere();
     }
@@ -8858,8 +8928,18 @@ impl Session {
                 }
                 // WorldEdit refusé (pas OP) : les blocs reviennent.
                 // Arrivée sur le serveur : là où l'on était (gardé par le relais).
+                // (v344) Mort : le serveur n'a pas de point d'apparition (ou le relais est
+                // d'avant) : au point d'apparition du monde, tout de suite.
+                Event::RespawnReply { placed } => {
+                    if !*placed && self.respawn_wait.take().is_some() {
+                        self.respawn_here();
+                    }
+                    return;
+                }
                 Event::BuildSpawn { pos, yaw, pitch } => {
-                    // (À l'arrivée : sa dernière position ici ; (v223) `/tp`.)
+                    // (À l'arrivée : sa dernière position ici ; (v223) `/tp` ; (v344) après
+                    // une mort, au point d'apparition du serveur.)
+                    self.respawn_wait = None;
                     let look = (yaw.is_finite() && pitch.is_finite()).then_some((*yaw, *pitch));
                     // (v318) Place absolue, en double précision : loin de l'origine de la
                     // partie, elle en change (sans quitter le serveur).
@@ -13239,17 +13319,23 @@ impl Session {
             let shown = |o: &&crate::buildnet::Other| {
                 in_match.is_empty() || !in_match.contains(&o.pseudo.to_lowercase())
             };
-            others.extend(b.others.values().filter(shown).map(|o| Other {
-                pseudo: &o.pseudo,
-                pos: o.pos,
-                yaw: o.yaw,
-                pitch: o.pitch,
-                crouch: o.crouch,
-                walk: None,
-                skin: self.skins.of(&o.pseudo),
-                covered: None,
-                held: o.held,
-                hurt: 0.0,
+            let bitten = !self.flesh.is_empty();
+            others.extend(b.others.values().filter(shown).map(|o| {
+                Other {
+                    pseudo: &o.pseudo,
+                    pos: o.pos,
+                    yaw: o.yaw,
+                    pitch: o.pitch,
+                    crouch: o.crouch,
+                    walk: None,
+                    skin: self.skins.of(&o.pseudo),
+                    covered: None,
+                    held: o.held,
+                    hurt: 0.0,
+                    flesh: bitten
+                        .then(|| self.flesh.get(&o.pseudo.to_lowercase()))
+                        .flatten(),
+                }
             }));
         }
         if let Some(c) = &self.crowd {
@@ -13267,6 +13353,7 @@ impl Session {
                 covered: Some(n.covered),
                 held: None,
                 hurt: n.hurt,
+                flesh: None,
             }));
         }
         // (v227) Les foules d'essai des autres OP, dessinées pareil.
@@ -13282,6 +13369,7 @@ impl Session {
                 covered: Some(n.covered),
                 held: None,
                 hurt: n.hurt,
+                flesh: None,
             }));
         }
         if !others.is_empty() {
@@ -13362,6 +13450,16 @@ impl Session {
                     }
                     boxes
                 };
+                // (v344) Mordu par L'Évidé : son corps avec ses morceaux en moins (il n'est pas
+                // dessiné en instance, qui le montrerait entier).
+                if let Some(f) = o.flesh.filter(|f| !f.is_whole()) {
+                    if shadow && d2 <= shadow_d2 {
+                        shadows.push((o.pos, boxes_of(&other), None));
+                    }
+                    model.extend(crate::player_model::build_bitten(&other, Some(f)));
+                    model.extend(crate::player_model::joint_sections(&other, Some(f)));
+                    continue;
+                }
                 if players.len() < minelib_render::MAX_PLAYERS {
                     let layer = layers.layer(other.skin.as_ref(), renderer);
                     let prev = w.map_or_else(
@@ -14595,6 +14693,9 @@ struct Other<'a> {
     held: Option<minelib_net::poses::Held>,
     /// (v226) Temps qui reste du rouge d'un coup reçu (PNJ de la foule d'essai), en s.
     hurt: f32,
+    /// (v344) Ce que L'Évidé lui a mangé (construction en ligne : les morsures publiées par le
+    /// relais, refaites ici comme chez lui).
+    flesh: Option<&'a crate::flesh::Flesh>,
 }
 
 /// (v226) Lumière d'un PNJ qui vient de recevoir un coup (`hurt` secondes de rouge qui
@@ -15582,6 +15683,94 @@ mod loading_tests {
         let gate = &src[src.find("fn loading_done(").unwrap()..];
         let gate = &gate[..gate.find("\n}\n").unwrap()];
         assert!(!gate.contains("||"), "une autre façon d'entrer : {gate}");
+    }
+
+    /// (v344) Mort en construction en ligne : le jeu demande au relais où réapparaître
+    /// (`SERVER_RESPAWN` : au point d'apparition du serveur s'il en a un, voir l'essai du
+    /// relais) ; sans lui (réponse « pas de placement », ou relais d'avant), au point
+    /// d'apparition du monde dès la réponse ; sans réponse sous `RESPAWN_WAIT_S`, de même.
+    /// Mort une fois : pas de nouvelle mort à chaque image en attendant (sous le monde).
+    #[test]
+    fn an_online_death_asks_the_relay_where_to_reappear() {
+        let src = include_str!("session.rs");
+        let body = |name: &str| {
+            let f = &src[src.find(name).unwrap()..];
+            f[..f.find("\n    }\n").unwrap()].to_string()
+        };
+        let die = body("    fn die(&mut self) {");
+        let wait_at = die
+            .find("if self.respawn_wait.is_some()")
+            .expect("une seule mort");
+        let ask = die.find("SERVER_RESPAWN").expect("demandé au relais");
+        assert!(wait_at < ask);
+        let online = &die[die.find("if self.build.is_some()").unwrap()..];
+        let (relay, here) = online.split_once("} else {").unwrap();
+        assert!(relay.contains("respawn_wait = Some") && !relay.contains("respawn_here"));
+        assert!(here.trim_start().starts_with("self.respawn_here()"));
+        let update = body("    pub fn update(&mut self, input: &Input, dt: f32");
+        assert!(update.contains("RESPAWN_WAIT_S") && update.contains("self.respawn_here()"));
+        let placed = &src[src
+            .find("Event::BuildSpawn { pos, yaw, pitch } => {")
+            .unwrap()..];
+        assert!(placed[..600].contains("self.respawn_wait = None"));
+        let reply = &src[src.find("Event::RespawnReply { placed } => {").unwrap()..];
+        let reply = &reply[..reply.find("return;").unwrap()];
+        assert!(reply.contains("!*placed && self.respawn_wait.take().is_some()"));
+        assert!(reply.contains("self.respawn_here()"));
+        assert!((0.5..=3.0).contains(&RESPAWN_WAIT_S));
+    }
+
+    /// (v344) « Je ne voyais pas Haumax se faire manger par l'Évidé, et l'inverse aussi » :
+    /// une morsure publiée par le relais sur un autre joueur ne faisait chez nous que le
+    /// bruit et le sang ; son corps restait entier. Elle est maintenant refaite sur le corps
+    /// qu'on garde de lui (par pseudo), exactement comme son jeu la fait chez lui : même
+    /// endroit (tiré de la visée), même taille, morsure après morsure ; et un joueur mordu
+    /// est dessiné avec ses morceaux en moins (pas en instance, qui le montrerait entier).
+    #[test]
+    fn a_bite_on_another_player_takes_the_same_piece_here_as_at_his_place() {
+        let grids = crate::player_model::flesh_grids();
+        let mut his = crate::flesh::Flesh::of(crate::flesh::Hard::Bones);
+        let mut ours = crate::flesh::Flesh::of(crate::flesh::Hard::Bones);
+        let mut x = 0x2545_f491u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for k in 0..12 {
+            let (low, aim, seed) = (k % 4 == 3, next(), next());
+            // Chez lui (`evides_online` puis `evide_bitten`) : l'endroit visé, puis la
+            // morsure de la taille tirée.
+            let spot = his.pick(aim, bite_parts(low), &grids);
+            let at_his = match spot {
+                Some((part, cell)) => his.bite_at(part, cell, bite_size(seed), &grids),
+                None => his.bite_somewhere(seed, bite_size(seed), bite_parts(low), &grids),
+            };
+            let here = bite_like_the_victim(&mut ours, low, aim, seed);
+            assert_eq!(at_his, here, "morsure {k}");
+        }
+        assert!(!ours.is_whole());
+        let src = include_str!("session.rs");
+        let online = &src[src
+            .find("    fn evides_online(&mut self, dt: f32) {")
+            .unwrap()..];
+        let other = &online[online
+            .find("} else if let Some(at) = place(&victim) {")
+            .unwrap()..];
+        let other = &other[..other.find("\n            }\n").unwrap()];
+        assert!(other.contains(".entry(victim.to_lowercase())"));
+        assert!(other.contains("bite_like_the_victim(flesh, low, aim, seed)"));
+        let draw = &src[src
+            .find("if let Some(f) = o.flesh.filter(|f| !f.is_whole()) {")
+            .unwrap()..];
+        let draw = &draw[..draw.find("continue;").unwrap()];
+        assert!(draw.contains("build_bitten(&other, Some(f))") && !draw.contains("players.push"));
+        // Sans les espaces : la mise en forme du code peut changer les retraits.
+        let squeeze = |s: &str| s.split_whitespace().collect::<String>();
+        assert!(squeeze(src).contains(&squeeze(
+            "flesh: bitten.then(|| self.flesh.get(&o.pseudo.to_lowercase())).flatten(),"
+        )));
     }
 
     /// (v343) « Quand je suis mort le monde a rechargé ; quand je me tp alors que haumax est à

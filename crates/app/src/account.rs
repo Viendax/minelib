@@ -551,6 +551,9 @@ pub struct Accounts {
     sent: Option<(String, String)>,
     /// Partie à rejoindre dès la connexion à son relais (voir `join_elsewhere`).
     join_after_login: Option<u64>,
+    /// (v344) Compte copié sur ce relais (il ne l'avait pas) alors qu'il a la double
+    /// authentification ailleurs : le nom du relais, dit au joueur à l'entrée.
+    copied_without_totp: Option<String>,
     lan_before: bool,
     /// La connexion automatique du lancement a été tentée.
     auto_tried: bool,
@@ -656,6 +659,7 @@ impl Accounts {
             maps: Vec::new(),
             lan_relay: false,
             join_after_login: None,
+            copied_without_totp: None,
             lan_before: false,
             sent: None,
             auto_tried: false,
@@ -772,6 +776,29 @@ impl Accounts {
         self.relay_dir
             .with_file_name("comptes")
             .join(format!("{}.coffre", pseudo.to_lowercase()))
+    }
+
+    /// (v344) Marque de ce PC : ce compte a la double authentification (sur un relais).
+    fn totp_path(&self, pseudo: &str) -> PathBuf {
+        self.relay_dir
+            .with_file_name("comptes")
+            .join(format!("{}.2fa", pseudo.to_lowercase()))
+    }
+
+    fn note_totp(&self, pseudo: &str, on: bool) {
+        let p = self.totp_path(pseudo);
+        if on {
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            let _ = std::fs::write(p, b"1");
+        } else {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    fn had_totp(&self, pseudo: &str) -> bool {
+        self.totp_path(pseudo).exists()
     }
 
     pub fn logged_in(&self) -> bool {
@@ -1041,6 +1068,18 @@ impl Accounts {
                     self.confirm.clear();
                     self.code.clear();
                     self.new_pseudo = Some(pseudo.clone());
+                    // (v344) Ce PC retient qui a la double authentification : copié sur un
+                    // relais qui ne l'avait pas, le compte l'y perd (`AccountCopied`).
+                    if totp {
+                        self.note_totp(&pseudo, true);
+                    }
+                    if let Some(relay) = self.copied_without_totp.take().filter(|_| !totp) {
+                        self.info = Some(format!(
+                            "Ton compte vient d'être copié sur le relais « {relay} », qui ne \
+                             l'avait pas, mais sans sa double authentification (elle ne se copie \
+                             pas d'un relais à l'autre) : réactive-la ici, dans Compte."
+                        ));
+                    }
                     self.account = Some(Account {
                         pseudo,
                         fingerprint,
@@ -1083,6 +1122,8 @@ impl Accounts {
                     self.code.clear();
                     if let Some(a) = &mut self.account {
                         a.totp = true;
+                        let p = a.pseudo.clone();
+                        self.note_totp(&p, true);
                     }
                     self.info = Some("Double authentification activée.".into());
                 }
@@ -1091,8 +1132,21 @@ impl Accounts {
                     self.code.clear();
                     if let Some(a) = &mut self.account {
                         a.totp = false;
+                        let p = a.pseudo.clone();
+                        self.note_totp(&p, false);
                     }
                     self.info = Some("Double authentification désactivée.".into());
+                }
+                // (v344) Le compte vient d'être copié sur ce relais (il ne l'avait pas), sans
+                // sa double authentification : elle ne se copie pas d'un relais à l'autre. Si
+                // ce PC la lui connaît, le joueur le sait tout de suite.
+                Event::AccountCopied { pseudo, relay } => {
+                    if self.had_totp(&pseudo) {
+                        log::warn!(
+                            "compte copié sur le relais « {relay} » sans sa double authentification"
+                        );
+                        self.copied_without_totp = Some(relay);
+                    }
                 }
                 Event::Servers(mut list) => {
                     self.busy = None;
@@ -1348,6 +1402,7 @@ impl Accounts {
                 | Event::SeedLock { .. }
                 | Event::Zeus { .. }
                 | Event::BuildSpawn { .. }
+                | Event::RespawnReply { .. }
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)
                 | Event::MapCertified { .. }

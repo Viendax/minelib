@@ -58,7 +58,7 @@ pub fn clear_match_lock(root: &std::path::Path) {
 }
 
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 343;
+pub const VERSION: u32 = 344;
 const REPO: &str = "https://api.github.com/repos/Viendax/minelib/releases";
 const EVERY: Duration = Duration::from_secs(120);
 
@@ -237,12 +237,47 @@ fn install_and_restart(bytes: &[u8], version: u32) -> Result<()> {
         let _ = std::fs::write(v, version.to_string());
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // (v344) La nouvelle version prend la place de celle-ci : elle doit pouvoir prendre le
+    // verrou du jeu (`hold_instance_lock`).
+    release_instance_lock();
     std::process::Command::new(&exe)
         .args(args)
         .spawn()
         .context("lancement de la nouvelle version")?;
     log::info!("mise à jour installée, redémarrage");
     std::process::exit(0);
+}
+
+/// (v344) Verrou du jeu (`<dossier du jeu>/jeu.lock`), tenu tant que le jeu tourne.
+static INSTANCE_LOCK: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// (v344) Un seul jeu à la fois sur un même dossier du jeu. Deux jeux ouverts (l'autre PC de
+/// Viendax, 26 novembre : relancé à la main pendant qu'une mise à jour redémarrait) se
+/// partagent ses fichiers, son relais, ses comptes. Rend faux si un autre jeu tient déjà
+/// le verrou (le système le rend si ce jeu-là s'arrête, même en plantant).
+pub fn hold_instance_lock(root: &std::path::Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("jeu.lock"))
+    else {
+        // (Dossier en lecture seule, par exemple : on n'empêche rien.)
+        return true;
+    };
+    match f.try_lock() {
+        Ok(()) => {
+            *INSTANCE_LOCK.lock().unwrap() = Some(f);
+            true
+        }
+        Err(std::fs::TryLockError::WouldBlock) => false,
+        Err(_) => true,
+    }
+}
+
+/// (v344) Rend le verrou du jeu (juste avant de lancer la version qui le remplace).
+pub fn release_instance_lock() {
+    INSTANCE_LOCK.lock().unwrap().take();
 }
 
 /// Efface l'ancienne version laissée par une mise à jour.
@@ -315,6 +350,22 @@ pub struct Updater {
     pub integrity: Integrity,
     /// Partie FPS en ligne en cours dans cette version : pas de mise à jour avant sa fin.
     pub hold: Option<u32>,
+    /// (v344) Téléchargée, installée dans un instant : le temps d'afficher ce qui se passe.
+    installing: Option<(Vec<u8>, u32, Instant)>,
+}
+
+/// (v344) Le message du redémarrage reste affiché ce temps avant que la fenêtre se ferme.
+const RESTART_SAY_S: f32 = 2.0;
+
+/// (v344) Ce qu'on voit juste avant le redémarrage : la fenêtre se ferme, et celle de la
+/// nouvelle version met jusqu'à une minute à s'ouvrir (préparation des shaders). Avant, rien
+/// n'était dit : sur l'autre PC de Viendax (26 novembre, 02:36), le jeu semblait planté, et
+/// il a été relancé à la main pendant que la nouvelle version démarrait (deux jeux ouverts).
+pub fn restart_note(version: u32) -> String {
+    format!(
+        "Version {version} installée : le jeu redémarre. Sa fenêtre revient d'elle-même en \
+         moins d'une minute, ne le relance pas."
+    )
 }
 
 /// Ce que l'on sait de la version : pas encore vérifiée, à jour, ou impossible à vérifier.
@@ -373,6 +424,7 @@ impl Updater {
             },
             integrity: Integrity::Unknown,
             hold: None,
+            installing: None,
         }
     }
 
@@ -390,6 +442,18 @@ impl Updater {
     pub fn poll(&mut self, fresh: bool) {
         if !self.enabled {
             return;
+        }
+        if self
+            .installing
+            .as_ref()
+            .is_some_and(|(_, _, t)| t.elapsed().as_secs_f32() >= RESTART_SAY_S)
+        {
+            if let Some((bytes, version, _)) = self.installing.take() {
+                if let Err(e) = install_and_restart(&bytes, version) {
+                    self.downloading = false;
+                    self.status = Some(format!("Mise à jour impossible : {e:#}"));
+                }
+            }
         }
         if let Some(rx) = &self.integrity_rx {
             if let Ok(Msg::Integrity(i)) = rx.try_recv() {
@@ -431,12 +495,11 @@ impl Updater {
                 }
             }
             Msg::NoRelease => self.check = Check::NoRelease,
+            // (v344) Installée un peu après : le message du redémarrage a le temps d'être vu.
             Msg::Downloaded(bytes) => {
                 let version = self.available.as_ref().map_or(VERSION, |r| r.version);
-                if let Err(e) = install_and_restart(&bytes, version) {
-                    self.downloading = false;
-                    self.status = Some(format!("Mise à jour impossible : {e:#}"));
-                }
+                self.status = Some(restart_note(version));
+                self.installing = Some((bytes, version, Instant::now()));
             }
             Msg::Failed(e) => {
                 if !self.downloading && self.available.is_none() && self.check != Check::Launcher {
@@ -524,6 +587,29 @@ impl Updater {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v344) Un seul jeu à la fois sur un dossier du jeu : un second lancement trouve le
+    /// verrou pris ; rendu (redémarrage de mise à jour), la nouvelle version le prend.
+    #[test]
+    fn a_second_game_finds_the_lock_taken_until_it_is_released() {
+        let dir = std::env::temp_dir().join(format!("minelib-verrou-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(hold_instance_lock(&dir));
+        assert!(!hold_instance_lock(&dir), "déjà lancé");
+        release_instance_lock();
+        assert!(hold_instance_lock(&dir), "après le redémarrage");
+        release_instance_lock();
+        let note = restart_note(345);
+        assert!(note.contains("345") && note.contains("ne le relance pas"));
+        assert!((1.0..=4.0).contains(&RESTART_SAY_S));
+        let src = include_str!("update.rs");
+        let install = &src[src.find("fn install_and_restart(").unwrap()..];
+        let install = &install[..install.find("\n}\n").unwrap()];
+        assert!(
+            install.find("release_instance_lock()").unwrap() < install.find(".spawn()").unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reads_the_github_release() {

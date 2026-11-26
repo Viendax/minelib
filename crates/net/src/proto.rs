@@ -181,6 +181,14 @@ pub const SERVER_MATCH: u8 = 20;
 /// (`Response::SeedLock`) : à l'arrivée, quand un OP la change, quand on devient OP ou qu'on
 /// ne l'est plus, et à qui le demande.
 pub const SERVER_SEED: u8 = 21;
+/// (v344) Réapparition après une mort en construction en ligne : le relais place le joueur
+/// (`BuildSpawn`) au point d'apparition du serveur (`/setspawn`) s'il en a un, et le dit
+/// dans sa réponse (`ServerAdmin { text: RESPAWN_FOLLOWS }`, le placement part après elle) ;
+/// sinon (réponse vide, ou relais d'avant qui ne connaît pas l'action), le jeu fait
+/// réapparaître le joueur tout de suite au point d'apparition du monde.
+pub const SERVER_RESPAWN: u8 = 22;
+/// (v344) Réponse à `SERVER_RESPAWN` : un `BuildSpawn` suit.
+pub const RESPAWN_FOLLOWS: &str = "spawn";
 
 /// (v229) Temps qu'il fait, dans `Response::SetWeather` : beau temps, pluie, orage ; ou
 /// aucun temps imposé (celui des horloges du monde, que chaque jeu calcule).

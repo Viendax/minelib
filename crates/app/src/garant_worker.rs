@@ -136,12 +136,22 @@ impl Drop for ShardHost {
 /// Relais de secours d'un monde de construction, tenu par ce jeu pour les joueurs de ce
 /// monde : il en garde une copie (historique, sacs de survie) et le reprend quand une
 /// majorité des gardiens du monde n'entend plus le relais du monde, ou quand celui-ci
-/// s'arrête proprement (voir `minelib_net::guard`). Il reste lancé tant que ce jeu tourne.
+/// s'arrête proprement (voir `minelib_net::guard`). Il reste lancé tant que ce jeu le tient
+/// (v344 : lâché, il s'arrête).
 pub struct StandbyHost {
     pub room: u64,
     handle: minelib_relay::Handle,
     _node: Option<Arc<minelib_p2p::Node>>,
     pub taken: bool,
+}
+
+/// (v344) Un relais de secours qui n'est plus tenu (remplacé par un autre, monde quitté,
+/// jeu fermé) s'arrête pour de bon : avant, chacun restait ouvert jusqu'à la fin du jeu
+/// (8 à la fois le 26 novembre, chacun avec ses fils, son port et son nœud).
+impl Drop for StandbyHost {
+    fn drop(&mut self) {
+        self.handle.stop();
+    }
 }
 
 impl StandbyHost {

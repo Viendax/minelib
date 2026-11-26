@@ -76,6 +76,8 @@ pub struct Handle {
     state: Arc<Mutex<State>>,
     /// Relais arrêté (essais : sa chute).
     killed: Arc<std::sync::atomic::AtomicBool>,
+    /// (v344) Relais fermé pour de bon (`stop`) : il n'écoute plus, ses fils s'arrêtent.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Interroge les autres relais : clés des comptes qui y portent ce pseudo.
@@ -760,6 +762,21 @@ impl Handle {
             use transport::Sink;
             c.tx.put(transport::Inbound::Closed);
         }
+    }
+
+    /// (v344) Ferme ce relais pour de bon : ses connexions sont coupées, il n'écoute plus, et
+    /// ses fils s'arrêtent. Un relais de secours remplacé par un autre (ou dont le joueur a
+    /// quitté le monde) restait ouvert jusqu'à la fin du jeu : 8 à la fois, mesuré le
+    /// 26 novembre (chacun avec ses fils et son port).
+    pub fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.kill();
+    }
+
+    /// (v344) Ce relais est-il fermé (`stop`) ?
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Les pseudos deviennent uniques avec les autres relais : avant chaque inscription,
@@ -1648,6 +1665,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
     let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let killed_accept = killed.clone();
     let killed_guards = killed.clone();
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped_accept = stopped.clone();
     // Les connexions sont servies par des tâches, sur quelques fils (voir `tasks`).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(tasks::workers())
@@ -1686,13 +1705,21 @@ pub fn start(cfg: Config) -> Result<Handle> {
                 // suivantes sont refusées (un seul PC ne peut pas épuiser le relais).
                 let open: Arc<Mutex<OpenSlots>> = Arc::default();
                 loop {
-                    let (stream, addr) = match listener.accept().await {
-                        Ok(c) => c,
-                        Err(_) => {
+                    // (v344) Fermé pour de bon (`Handle::stop`) : on n'écoute plus, et le
+                    // fil (avec ceux des tâches) s'arrête.
+                    if stopped_accept.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let accepted =
+                        tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+                    let (stream, addr) = match accepted {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(_)) => {
                             // (Plus de descripteurs, par exemple : on réessaie un peu après.)
                             tokio::time::sleep(Duration::from_millis(20)).await;
                             continue;
                         }
+                        Err(_) => continue,
                     };
                     // (Relais tombé, essais : plus rien n'est accepté.)
                     if killed_accept.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1736,6 +1763,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         province_from,
         state: state_for_handle,
         killed,
+        stopped,
     })
 }
 
@@ -7692,6 +7720,31 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     text: String::new(),
                 });
             }
+            // (v344) Réapparition après une mort : au point d'apparition du serveur
+            // (`/setspawn`) s'il en a un. La réponse dit s'il suit (« spawn » : un
+            // `BuildSpawn`, qui part après elle) ; sinon le jeu réapparaît tout de suite au
+            // point d'apparition du monde.
+            if action == proto::SERVER_RESPAWN {
+                let at = st.servers.spawn(&server);
+                let sent = match (at, st.conns.get(&id)) {
+                    (Some(p), Some(c)) => transport::push(
+                        &c.tx,
+                        &Response::BuildSpawn {
+                            pos: [p[0], p[1], p[2]],
+                            yaw: p[3] as f32,
+                            pitch: p[4] as f32,
+                        },
+                    ),
+                    _ => false,
+                };
+                return Some(Response::ServerAdmin {
+                    text: if sent {
+                        proto::RESPAWN_FOLLOWS.to_string()
+                    } else {
+                        String::new()
+                    },
+                });
+            }
             // (v243) Partie FPS du serveur (ouverte par un OP, qui la mène avec ses bots).
             if action == proto::SERVER_MATCH {
                 let op = st.servers.is_op(&server, &creator, pseudo);
@@ -7838,8 +7891,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         // inventaire est tenu ici.
                         st.bags.set_mode(&server, who, &reason);
                         provinces::push_settings(st, &server);
+                        // (v344) Sa connexion de joueur : pas celle de garant de son jeu,
+                        // qui peut être dans ce monde aussi (son relais de secours).
                         let to = st.conns.values().find(|c| {
                             c.room == Some(rid)
+                                && !c.garant_only
                                 && c.pseudo
                                     .as_deref()
                                     .is_some_and(|p| p.eq_ignore_ascii_case(who))
@@ -7905,8 +7961,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                                 "Position inconnue (joueur jamais venu sur ce serveur, ou coordonnées illisibles).",
                             ));
                         };
+                        // (v344) Sa connexion de joueur, pas celle de garant de son jeu
+                        // (qui tient peut-être le relais de secours de ce monde, avec le même
+                        // pseudo) : le placement y partait parfois, et il ne bougeait pas.
                         let conn = st.conns.values().find(|c| {
                             c.room == Some(rid)
+                                && !c.garant_only
                                 && c.pseudo
                                     .as_deref()
                                     .is_some_and(|p| p.eq_ignore_ascii_case(who))
@@ -7929,6 +7989,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     if act == servers::Action::Kill {
                         let target_conn = st.conns.iter().find(|(_, c)| {
                             c.room == Some(rid)
+                                && !c.garant_only
                                 && c.pseudo
                                     .as_deref()
                                     .is_some_and(|p| p.eq_ignore_ascii_case(&target))
@@ -8902,6 +8963,23 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // (v312) Où ce relais le voit : la portée des morsures et des bouchées de L'Évidé
             // se compte de là, pas de ce qu'en dit un autre joueur.
             st.evide_seen.insert(id, pose.pos);
+            // (v344) Son chunk tel que ce relais le tient vient de `Position`, envoyé quand il
+            // change. S'il n'y est pas, ou plus le même (une demande perdue, arrivée avant
+            // l'entrée dans le monde), personne ne recevait ses positions et il ne recevait
+            // celles de personne : sa position le donne aussi.
+            if let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1)) {
+                let known = st
+                    .rooms
+                    .get(&rid)
+                    .and_then(|r| r.build.positions.get(&id).copied());
+                if known != Some(chunk) {
+                    st.positions_seen += 1;
+                    send_catch_up(st, rid, id, chunk, true);
+                    refresh_needs(st, rid, id);
+                    send_shards(st, rid, id);
+                    provinces::send_list(st, rid, id);
+                }
+            }
             if let Some(room) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
                 // Plus de positions que le jeu n'en envoie : pas diffusée.
                 if !room.build.pos_due(id) {
@@ -12327,6 +12405,20 @@ mod tests {
         let e = wait_error(&squat);
         assert!(e.to_lowercase().contains("pris"), "{e}");
         let c2 = Client::spawn(h2.addr.to_string(), Some(h2.public));
+        // (v344) Depuis un PC sans le coffre (l'autre PC de Viendax, 26 novembre) : le jeu
+        // dit que ce relais ne connaît peut-être pas le compte, et lequel.
+        c2.send(Cmd::Login {
+            pseudo: "Nomade".into(),
+            password: "motdepasse".into(),
+            totp: None,
+            backup: None,
+            device: None,
+        });
+        let e = wait_error(&c2);
+        assert!(
+            e.contains("incorrect") && e.contains("(« nouveau ») ne connaît pas ton compte"),
+            "{e}"
+        );
         c2.send(Cmd::Login {
             pseudo: "Nomade".into(),
             password: "mauvais!!".into(),
@@ -12345,10 +12437,21 @@ mod tests {
             backup: Some(vault),
             device: None,
         });
-        match wait(&c2, |e| matches!(e, Event::LoggedIn { .. })) {
-            Event::LoggedIn { fingerprint, .. } => assert_eq!(fingerprint, fp1),
-            _ => unreachable!(),
+        // (v344) Copié sur ce relais : le jeu l'apprend (sans sa double authentification).
+        let (mut copied, mut fp) = (None, None);
+        let t = Instant::now();
+        while fp.is_none() && t.elapsed() < Duration::from_secs(20) {
+            while let Some(e) = c2.poll() {
+                match e {
+                    Event::AccountCopied { pseudo, relay } => copied = Some((pseudo, relay)),
+                    Event::LoggedIn { fingerprint, .. } => fp = Some(fingerprint),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(fp, Some(fp1));
+        assert_eq!(copied, Some(("Nomade".to_string(), "nouveau".to_string())));
         let _ = std::fs::remove_dir_all(d1);
         let _ = std::fs::remove_dir_all(d2);
     }
@@ -14564,6 +14667,305 @@ mod tests {
             }
             _ => unreachable!(),
         }
+        // (v344) Zoé n'est jamais venue, et le serveur n'a pas de point d'apparition : elle
+        // n'est placée nulle part (elle reste là où son jeu a ouvert le monde, au point
+        // d'apparition du monde), pas auprès du créateur.
+        transport::push(
+            &clink,
+            &Request::Nearby {
+                chunk: [0, 0],
+                data: game::encode(&game::BuildMsg::Player {
+                    pseudo: "Createur".into(),
+                    pos: [12.5, 75.0, -3.5],
+                    yaw: 0.5,
+                    pitch: 0.0,
+                    crouch: 0.0,
+                    speed: 0.0,
+                    ping: 0,
+                    held: 0,
+                }),
+            },
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let (zoe, _zlink) = login("Zoe");
+        zoe.send(Cmd::Join(room));
+        wait(&zoe, |e| matches!(e, Event::Joined { .. }));
+        let placed_within = |c: &Client, ms: u64| {
+            let t = Instant::now();
+            let mut placed = None;
+            while t.elapsed() < Duration::from_millis(ms) {
+                while let Some(e) = c.poll() {
+                    if let Event::BuildSpawn { pos, .. } = e {
+                        placed = Some(pos);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            placed
+        };
+        zoe.send(Cmd::ServerAdmin {
+            action: proto::SERVER_GAMEMODE_QUERY,
+            pseudo: String::new(),
+            reason: String::new(),
+        });
+        assert_eq!(placed_within(&zoe, 300), None, "pas auprès du créateur");
+        // Morte, sans point d'apparition du serveur : la réponse dit qu'aucun placement ne
+        // suit (son jeu la fait réapparaître au point d'apparition du monde, tout de suite).
+        let respawn = |c: &Client| {
+            c.send(Cmd::ServerAdmin {
+                action: proto::SERVER_RESPAWN,
+                pseudo: String::new(),
+                reason: String::new(),
+            });
+        };
+        respawn(&zoe);
+        match wait(&zoe, |e| matches!(e, Event::RespawnReply { .. })) {
+            Event::RespawnReply { placed } => assert!(!placed),
+            _ => unreachable!(),
+        }
+        assert_eq!(placed_within(&zoe, 200), None);
+        // Un OP fixe le point d'apparition du serveur : morte, elle y réapparaît (la réponse
+        // l'annonce, le placement suit), sans un mot au tchat.
+        createur.send(Cmd::ServerAdmin {
+            action: proto::SERVER_SETSPAWN,
+            pseudo: String::new(),
+            reason: "20.5 70 8.5 1.5 0".into(),
+        });
+        wait(
+            &createur,
+            |e| matches!(e, Event::ServerAdmin(t) if t.starts_with("Point d'apparition du serveur")),
+        );
+        respawn(&zoe);
+        let mut said = Vec::new();
+        let t = Instant::now();
+        let (mut reply, mut at) = (None, None);
+        while (reply.is_none() || at.is_none()) && t.elapsed() < Duration::from_secs(5) {
+            while let Some(e) = zoe.poll() {
+                match e {
+                    Event::RespawnReply { placed } => reply = Some(placed),
+                    Event::BuildSpawn { pos, .. } => at = Some(pos),
+                    Event::ServerAdmin(t) => said.push(t),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(reply, Some(true));
+        assert_eq!(at, Some([20.5, 70.0, 8.5]));
+        assert!(said.is_empty(), "rien au tchat : {said:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v344) Le relais du monde n'apprenait le chunk d'un joueur que de `Position`, envoyée
+    /// quand il change de chunk : perdue (ou arrivée avant l'entrée dans le monde), le joueur
+    /// ne recevait les positions de personne, même à côté d'un autre, tant qu'il ne changeait
+    /// pas de chunk (26 novembre, 02:39 à 02:43). Ses positions le donnent maintenant aussi.
+    #[test]
+    fn a_player_whose_chunk_never_came_still_sees_his_neighbours() {
+        let dir = std::env::temp_dir().join(format!("minelib-chunk-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        let (haumax, hlink) = login("Haumax");
+        haumax.send(Cmd::Host {
+            kind: 1,
+            name: "Nouveau monde 1".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+            seed: 0,
+            terrain: 0,
+        });
+        let room = match wait(&haumax, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let (viendax, vlink) = login("Viendax");
+        viendax.send(Cmd::Join(room));
+        wait(&viendax, |e| matches!(e, Event::Joined { .. }));
+        let chunk = [3, -2];
+        transport::push(&hlink, &Request::Position { chunk });
+        let pose = |who: &str, x: f64| {
+            game::encode(&game::BuildMsg::Player {
+                pseudo: who.into(),
+                pos: [x, 70.0, -30.5],
+                yaw: 0.0,
+                pitch: 0.0,
+                crouch: 0.0,
+                speed: 0.0,
+                ping: 0,
+                held: 0,
+            })
+        };
+        // Viendax n'a jamais dit son chunk (sa demande `Position` perdue) : seulement ses
+        // positions, à deux blocs de Haumax.
+        let t = Instant::now();
+        let mut seen = false;
+        while !seen && t.elapsed() < Duration::from_secs(5) {
+            transport::push(
+                &vlink,
+                &Request::Nearby {
+                    chunk,
+                    data: pose("Viendax", 50.5),
+                },
+            );
+            transport::push(
+                &hlink,
+                &Request::Nearby {
+                    chunk,
+                    data: pose("Haumax", 52.5),
+                },
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            while let Some(e) = viendax.poll() {
+                if let Event::FromZone { data, .. } = e {
+                    if let Some(game::BuildMsg::Poses(p)) = game::decode::<game::BuildMsg>(&data) {
+                        seen |= !minelib_net::poses::unpack_poses(&p)
+                            .unwrap_or_default()
+                            .is_empty();
+                    }
+                }
+            }
+        }
+        assert!(seen, "Viendax ne reçoit pas les positions de Haumax");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v344) La connexion de garant d'un joueur peut tenir le relais de secours du monde où il
+    /// joue (26 novembre : Viendax dans le monde de Haumax) : elle est alors dans ce monde,
+    /// avec son pseudo. Un `/tp` de ce joueur (ou `/kill`, `/gamemode`) partait parfois à
+    /// elle et non à sa connexion de joueur : il ne bougeait pas.
+    #[test]
+    fn a_teleport_goes_to_the_player_not_to_his_own_standby() {
+        let dir = std::env::temp_dir().join(format!("minelib-tp-garant-{}", rand::random::<u32>()));
+        {
+            let mut st = stats::Store::open(dir.join("stats")).unwrap();
+            st.get_mut("Viendax").games = 5;
+            st.save("Viendax");
+        }
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        h.set_standby_local(true);
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let haumax = login("Haumax");
+        haumax.send(Cmd::Host {
+            kind: 1,
+            name: "Nouveau monde 1".into(),
+            map: "monde".into(),
+            map_sig: [4; 32],
+            max_players: 0,
+            seed: 0,
+            terrain: 0,
+        });
+        let room = match wait(&haumax, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let viendax = login("Viendax");
+        viendax.send(Cmd::Join(room));
+        wait(&viendax, |e| matches!(e, Event::Joined { .. }));
+        let g = Client::spawn_garant(addr.clone(), h.public);
+        g.send(Cmd::Login {
+            pseudo: "Viendax".into(),
+            password: "motdepasse".into(),
+            totp: None,
+            backup: None,
+            device: None,
+        });
+        wait(&g, |e| matches!(e, Event::LoggedIn { .. }));
+        g.send(Cmd::GarantAvailable(true));
+        wait(&g, |e| matches!(e, Event::StandbyTask { .. }));
+        let in_room = h
+            .state
+            .lock()
+            .unwrap()
+            .conns
+            .values()
+            .filter(|c| c.room == Some(room) && c.pseudo.as_deref() == Some("Viendax"))
+            .count();
+        assert_eq!(in_room, 2, "sa connexion de joueur et celle de garant");
+        for k in 0..8 {
+            haumax.send(Cmd::ServerAdmin {
+                action: proto::SERVER_TELEPORT,
+                pseudo: "Viendax".into(),
+                reason: format!("{} 70 5", 10 + k),
+            });
+            match wait(&viendax, |e| matches!(e, Event::BuildSpawn { .. })) {
+                Event::BuildSpawn { pos, .. } => assert_eq!(pos, [10.0 + k as f64, 70.0, 5.0]),
+                _ => unreachable!(),
+            }
+        }
+        while let Some(e) = g.poll() {
+            assert!(
+                !matches!(e, Event::BuildSpawn { .. }),
+                "à sa connexion de garant"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v344) Un relais fermé pour de bon (`Handle::stop`, relais de secours remplacé) coupe
+    /// ses connexions, n'écoute plus, et rend son port ; avant, il restait ouvert jusqu'à la
+    /// fin du jeu (8 relais de secours à la fois le 26 novembre).
+    #[test]
+    fn a_stopped_relay_lets_go_of_its_port_and_players() {
+        let dir = std::env::temp_dir().join(format!("minelib-arret-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr;
+        let c = Client::spawn(addr.to_string(), Some(h.public));
+        c.send(Cmd::Register {
+            pseudo: "Joueur".into(),
+            password: "motdepasse".into(),
+        });
+        wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+        assert!(!h.is_stopped());
+        h.stop();
+        assert!(h.is_stopped());
+        wait(&c, |e| matches!(e, Event::Lost));
+        let t = Instant::now();
+        while std::net::TcpStream::connect(addr).is_ok() {
+            assert!(t.elapsed() < Duration::from_secs(5), "il écoute encore");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(std::net::TcpListener::bind(addr).is_ok(), "port rendu");
         let _ = std::fs::remove_dir_all(dir);
     }
 

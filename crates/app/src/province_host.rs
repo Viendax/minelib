@@ -89,6 +89,14 @@ type Launched = (
     ([u8; 32], String, [u8; 32]),
 );
 
+/// (v344) Lâché (province rendue, monde quitté, jeu fermé), son relais s'arrête pour de bon
+/// (comme celui de secours d'un monde, `StandbyHost`).
+impl Drop for ProvinceHost {
+    fn drop(&mut self) {
+        self.handle.stop();
+    }
+}
+
 impl ProvinceHost {
     /// Lance le relais de la province et annonce au relais du monde (par `link`) où le
     /// joindre.

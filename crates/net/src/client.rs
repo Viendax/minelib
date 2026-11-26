@@ -18,6 +18,21 @@ use crate::transport::{Channel, Inbound, Incoming};
 
 /// Délai pour joindre le relais et pour chaque réponse.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// (v344) Une réponse en retard (voir `Worker::late`) est attendue au plus ce temps après le
+/// délai de sa requête.
+const LATE_KEEP: Duration = Duration::from_secs(120);
+
+/// (v344) Ce qu'on dit d'un message du relais qu'on ne sait pas lire.
+const UNREADABLE: &str = "message du relais illisible : il n'a sans doute pas la même version \
+                          du jeu que toi (son hôte doit relancer son jeu pour qu'il se mette à \
+                          jour)";
+
+/// (v344) L'erreur vient-elle d'un message qu'on ne sait pas lire (format d'une autre
+/// version) ?
+fn unreadable(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<postcard::Error>().is_some())
+}
 /// Ping régulier pour garder la session ouverte.
 const KEEPALIVE: Duration = Duration::from_secs(20);
 /// Mesure de l'aller-retour jusqu'au relais (envoyée au relais).
@@ -327,6 +342,12 @@ pub enum Event {
         pseudo: String,
         vault: Vec<u8>,
     },
+    /// (v344) Le compte vient d'être copié sur ce relais (il ne l'avait pas) avec le coffre
+    /// gardé sur ce PC : sans sa double authentification, qui ne se copie pas.
+    AccountCopied {
+        pseudo: String,
+        relay: String,
+    },
     LoggedIn {
         pseudo: String,
         fingerprint: String,
@@ -398,6 +419,11 @@ pub enum Event {
     },
     /// Réponse d'une commande d'OP (texte à afficher).
     ServerAdmin(String),
+    /// (v344) Réponse à `SERVER_RESPAWN` : un placement (`BuildSpawn`) suit, ou non (point
+    /// d'apparition du monde : tout de suite). Rien au tchat.
+    RespawnReply {
+        placed: bool,
+    },
     /// Exclu du serveur (banni), avec la raison.
     Kicked(String),
     /// (v311) Suppression du monde : le compte a la double authentification, il faut un
@@ -934,7 +960,17 @@ struct Worker {
     pinned: Option<[u8; 32]>,
     out: Sender<Event>,
     chan: Option<Channel>,
+    /// (v344) Requêtes restées sans réponse dans le délai (`request`), la plus ancienne
+    /// d'abord, et depuis quand : le relais répond à chacune, dans l'ordre, même en retard.
+    /// Ces réponses-là sont mises de côté (`late_reply`) : avant, chacune devenait la réponse
+    /// de la requête suivante, et tout restait décalé (26 novembre, 02:58 : un /tp recevait
+    /// le skin de « pnj4002 », la requête d'après la réponse du /tp).
+    late: std::collections::VecDeque<Instant>,
+    /// (v344) Un message illisible du relais a déjà été noté au journal (une fois suffit).
+    unreadable_said: bool,
     pow_bits: u8,
+    /// (v344) Nom du relais (son bonjour), pour le dire au joueur.
+    relay_name: String,
     /// Pseudo de la session ouverte.
     pseudo: String,
     /// Clé du relais connecté (sel de l'empreinte matérielle).
@@ -1012,7 +1048,10 @@ impl Worker {
             pinned,
             out,
             chan: None,
+            late: std::collections::VecDeque::new(),
+            unreadable_said: false,
             pow_bits: 20,
+            relay_name: String::new(),
             pseudo: String::new(),
             relay_pub: [0; 32],
             garant: false,
@@ -1401,6 +1440,15 @@ impl Worker {
                     Err(anyhow!("le relais ne répond plus"))
                 }
                 Ok(None) => Ok(None),
+                // (v344) Un message poussé illisible (relais d'une autre version du jeu) :
+                // laissé, la connexion reste. Avant, elle était tenue pour perdue.
+                Err(e) if unreadable(&e) => {
+                    if !self.unreadable_said {
+                        self.unreadable_said = true;
+                        log::warn!("relais : {UNREADABLE} ({e:#})");
+                    }
+                    Ok(None)
+                }
                 Err(e) => Err(e),
             };
             let mut measured = None;
@@ -1434,6 +1482,8 @@ impl Worker {
                 self.emit(Event::Rtt(ms));
             }
             match got {
+                // (v344) Pas un message poussé : la réponse en retard d'une requête d'avant.
+                Ok(Some(r)) if !r.is_push() && self.late_pending() => self.late_reply(r),
                 Ok(Some(r)) => self.on_push(r),
                 Ok(None) => {}
                 Err(_) => {
@@ -1867,7 +1917,12 @@ impl Worker {
             key,
         });
         match chan.recv::<Response>()? {
-            Response::Hello { pow_bits, .. } => self.pow_bits = pow_bits,
+            Response::Hello {
+                pow_bits, relay, ..
+            } => {
+                self.pow_bits = pow_bits;
+                self.relay_name = relay.chars().take(48).collect();
+            }
             Response::Error { code, message } => {
                 // (v314) Relais d'une autre version du jeu, trouvé automatiquement : on
                 // en cherchera un autre au prochain essai (la recherche écarte ceux qui ne
@@ -1881,6 +1936,7 @@ impl Worker {
             r => return Err(anyhow!("réponse inattendue : {r:?}")),
         }
         self.chan = Some(chan);
+        self.late.clear();
         Ok(())
     }
 
@@ -1895,13 +1951,55 @@ impl Worker {
         loop {
             let left = end.saturating_duration_since(Instant::now());
             let chan = self.chan.as_mut().ok_or_else(|| anyhow!("pas connecté"))?;
-            match chan.recv_any::<Response>(left)? {
-                None => return Err(anyhow!("le relais ne répond pas")),
+            let got = chan.recv_any::<Response>(left).map_err(|e| {
+                // (v344) Avant : « Found a bool that wasn't 0 or 1 » (26 novembre, 02:38).
+                if unreadable(&e) {
+                    anyhow!("{UNREADABLE} ({e:#})")
+                } else {
+                    e
+                }
+            })?;
+            match got {
+                None => {
+                    self.late.push_back(Instant::now());
+                    return Err(anyhow!("le relais ne répond pas"));
+                }
                 Some(Incoming::Push(b)) => chan.send_raw(&b)?,
                 Some(Incoming::Msg(r)) if r.is_push() => self.on_push(r),
                 Some(Incoming::Msg(Response::Pong)) if !matches!(req, Request::Ping) => {}
+                // (v344) La réponse d'une requête d'avant, arrivée après son délai : pas la
+                // nôtre (elle vient après).
+                Some(Incoming::Msg(r)) if self.late_pending() => self.late_reply(r),
                 Some(Incoming::Msg(r)) => return Ok(r),
             }
+        }
+    }
+
+    /// (v344) Une réponse en retard est-elle attendue ? (Au-delà de `LATE_KEEP`, on ne
+    /// l'attend plus : le relais l'aurait donnée.)
+    fn late_pending(&mut self) -> bool {
+        while self.late.front().is_some_and(|t| t.elapsed() > LATE_KEEP) {
+            self.late.pop_front();
+        }
+        !self.late.is_empty()
+    }
+
+    /// (v344) Réponse arrivée après le délai de sa requête : ce qu'elle dit d'elle-même arrive
+    /// quand même au jeu (le skin de qui, le texte d'une commande d'OP, un refus) ; le reste
+    /// est laissé.
+    fn late_reply(&mut self, r: Response) {
+        self.late.pop_front();
+        match r {
+            Response::Skin { pseudo, png } => self.emit(Event::Skin { pseudo, png }),
+            Response::ServerAdmin { text }
+                if !text.is_empty() && text != proto::RESPAWN_FOLLOWS =>
+            {
+                self.emit(Event::ServerAdmin(text))
+            }
+            Response::Error { code, message } => {
+                self.emit(Event::Error(error_text(code, &message)))
+            }
+            _ => log::debug!("relais : réponse arrivée après son délai, laissée"),
         }
     }
 
@@ -2186,6 +2284,15 @@ impl Worker {
                     .map_err(|_| anyhow!("calcul des clés du compte interrompu"))??;
                 let wrong = error_text(ErrorCode::WrongCredentials, "");
                 match self.login(&pseudo, &keys, totp, device) {
+                    // (v344) Sans copie du compte sur ce PC : peut-être un compte qu'un autre
+                    // relais garde (celui où il a été créé). Avant, seulement « Pseudo ou mot
+                    // de passe incorrect » (26 novembre, l'autre PC de Viendax).
+                    Err(e) if e.to_string() == wrong && backup.is_none() => Err(anyhow!(
+                        "{wrong} Ou ce relais (« {} ») ne connaît pas ton compte : il est gardé \
+                         par le relais où tu l'as créé. Connecte-toi une fois ici depuis un PC \
+                         où le compte est déjà ouvert : il y sera copié.",
+                        self.relay_name
+                    )),
                     Err(e) if e.to_string() == wrong && backup.is_some() => {
                         // Compte inconnu de ce relais (nouveau relais) : réinscription avec
                         // le coffre gardé, s'il s'ouvre avec ce mot de passe.
@@ -2204,6 +2311,14 @@ impl Worker {
                             Response::Registered { .. } => {}
                             r => return self.unexpected(r),
                         }
+                        log::info!(
+                            "compte copié sur le relais « {} » (il ne l'avait pas)",
+                            self.relay_name
+                        );
+                        self.emit(Event::AccountCopied {
+                            pseudo: pseudo.clone(),
+                            relay: self.relay_name.clone(),
+                        });
                         self.login(&pseudo, &keys, totp, device)
                     }
                     r => r,
@@ -2458,6 +2573,23 @@ impl Worker {
                 }
                 r => self.unexpected(r),
             },
+            // (v344) Réapparition : la réponse ne s'affiche pas. Un relais d'avant ne connaît
+            // pas l'action (il refuse, ou répond la liste des OP) : pas de placement.
+            Cmd::ServerAdmin {
+                action: proto::SERVER_RESPAWN,
+                pseudo,
+                reason,
+            } => {
+                let r = self.request(&Request::ServerAdmin {
+                    action: proto::SERVER_RESPAWN,
+                    pseudo,
+                    reason,
+                })?;
+                let placed =
+                    matches!(&r, Response::ServerAdmin { text } if text == proto::RESPAWN_FOLLOWS);
+                self.emit(Event::RespawnReply { placed });
+                Ok(())
+            }
             Cmd::ServerAdmin {
                 action,
                 pseudo,
@@ -2957,6 +3089,78 @@ impl Worker {
             }
             r => self.unexpected(r),
         }
+    }
+}
+
+#[cfg(test)]
+mod late_tests {
+    use super::*;
+
+    /// (v344) Une requête restée sans réponse dans le délai : sa réponse, quand elle arrive
+    /// enfin, n'est plus prise pour celle de la requête suivante (avant, tout restait
+    /// décalé d'une réponse : 26 novembre, 02:58). Ce qu'elle dit d'elle-même arrive quand
+    /// même au jeu.
+    #[test]
+    fn a_reply_that_comes_after_its_timeout_is_set_aside() {
+        let (tx, rx) = channel();
+        let mut w = Worker::new("essai".into(), None, tx);
+        assert!(!w.late_pending());
+        w.late.push_back(Instant::now());
+        w.late.push_back(Instant::now());
+        assert!(w.late_pending());
+        w.late_reply(Response::Skin {
+            pseudo: "pnj4002".into(),
+            png: Vec::new(),
+        });
+        assert!(w.late_pending(), "une autre attendue");
+        w.late_reply(Response::ServerAdmin {
+            text: "Téléporté.".into(),
+        });
+        assert!(!w.late_pending());
+        let got: Vec<Event> = rx.try_iter().collect();
+        assert!(matches!(&got[0], Event::Skin { pseudo, .. } if pseudo == "pnj4002"));
+        assert!(matches!(&got[1], Event::ServerAdmin(t) if t == "Téléporté."));
+        // Trop vieille : plus attendue (la réponse suivante est bien celle de sa requête).
+        w.late
+            .push_back(Instant::now() - LATE_KEEP - Duration::from_secs(1));
+        assert!(!w.late_pending());
+        let src = include_str!("client.rs");
+        let req = &src[src
+            .find("    fn request(&mut self, req: &Request)")
+            .unwrap()..];
+        let req = &req[..req.find("\n    }\n").unwrap()];
+        let timeout = req.find("self.late.push_back(Instant::now())").unwrap();
+        assert!(timeout < req.find("le relais ne répond pas").unwrap());
+        let late = req
+            .find("if self.late_pending() => self.late_reply(r)")
+            .unwrap();
+        assert!(late < req.find("Some(Incoming::Msg(r)) => return Ok(r)").unwrap());
+        assert!(src
+            .contains("Ok(Some(r)) if !r.is_push() && self.late_pending() => self.late_reply(r)"));
+        let connect = &src[src.find("    fn connect_once(&mut self)").unwrap()..];
+        assert!(connect[..connect.find("\n    }\n").unwrap()].contains("self.late.clear()"));
+    }
+}
+
+#[cfg(test)]
+mod unreadable_tests {
+    use super::*;
+
+    /// (v344) « Found a bool that wasn't 0 or 1 » (26 novembre, 02:38) : la liste des cartes
+    /// d'un relais d'une version d'avant, que ce jeu lisait avec un champ de plus. Le jeu dit
+    /// maintenant ce que c'est ; et un message poussé illisible ne coupe plus la connexion.
+    #[test]
+    fn an_unreadable_relay_message_says_the_versions_differ() {
+        let e: anyhow::Error = match postcard::from_bytes::<proto::Response>(&[0xff; 4]) {
+            Err(e) => e.into(),
+            Ok(_) => unreachable!(),
+        };
+        assert!(unreadable(&e));
+        assert!(unreadable(&e.context("en lisant la réponse")));
+        assert!(!unreadable(&anyhow!("connexion fermée")));
+        assert!(UNREADABLE.contains("pas la même version"));
+        let src = include_str!("client.rs");
+        assert!(src.contains("Err(e) if unreadable(&e) => {"));
     }
 }
 

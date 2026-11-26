@@ -417,6 +417,9 @@ struct Game {
     /// panneau. Avant, un refus n'était dit nulle part hors d'un monde en ligne : rien ne se
     /// passait.
     friend_adding: Option<(String, f32)>,
+    /// (v344) Demandes de skins au relais : jetons (`SKIN_ASKS_PER_S`, au plus
+    /// `SKIN_ASKS_BURST`) et dernier remplissage.
+    skin_asks: (f32, std::time::Instant),
     /// (v271) Pseudo proposé par le relais pour un ami inconnu (celui qui lui ressemble :
     /// « lside » pour « 1side ») : bouton « Ajouter » du panneau, tant que le message y est.
     friends_suggest: Option<String>,
@@ -633,6 +636,7 @@ impl Game {
             friends_ui: friends::FriendsUi::default(),
             friends_note: None,
             friend_adding: None,
+            skin_asks: (SKIN_ASKS_BURST, std::time::Instant::now()),
             friends_suggest: None,
             current_room: None,
             slider_drag: None,
@@ -2925,7 +2929,15 @@ impl Game {
             // (v157) Têtes de joueurs : leur skin, tenu à jour.
             s.update_head_skins(&self.accounts.pseudo());
             let dozing = self.accounts.dozing();
-            for p in s.skins.take_wanted() {
+            // (v344) Quelques-unes par seconde : chacune attend sa réponse sur la connexion
+            // du joueur, ses autres commandes (tchat, /tp…) passent entre elles.
+            let (tokens, at) = &mut self.skin_asks;
+            *tokens = (*tokens + at.elapsed().as_secs_f32() * SKIN_ASKS_PER_S).min(SKIN_ASKS_BURST);
+            *at = std::time::Instant::now();
+            let n = tokens.floor() as usize;
+            let wanted = s.skins.take_wanted_max(n);
+            *tokens -= wanted.len() as f32;
+            for p in wanted {
                 match s.build.as_ref().filter(|_| dozing) {
                     Some(b) => b.ask_skin(&p),
                     None => self.accounts.room(Cmd::SkinGet(p)),
@@ -6020,6 +6032,10 @@ struct LastShot {
 /// s'accroupir et la radio). (v262) Dans les menus et le tchat ouvert : toujours.
 const SHOT_COPY_S: f32 = 60.0;
 
+/// (v344) Skins demandés au relais : 4 par seconde, 8 d'un coup au plus.
+const SKIN_ASKS_PER_S: f32 = 4.0;
+const SKIN_ASKS_BURST: f32 = 8.0;
+
 fn stamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6132,6 +6148,17 @@ fn main() -> anyhow::Result<()> {
         std::env::consts::ARCH,
         log_path.display()
     );
+    // (v344) Un seul jeu à la fois sur ce dossier : un second lancement (pendant qu'une
+    // mise à jour redémarre le jeu, dont la fenêtre met jusqu'à une minute à s'ouvrir) le dit
+    // et s'arrête.
+    if !update::hold_instance_lock(&dir) {
+        log::warn!(
+            "Minelib est déjà lancé sur ce PC (dossier {}) : ce lancement s'arrête",
+            dir.display()
+        );
+        already_running_note();
+        return Ok(());
+    }
     // Voie rapide des parties FPS : quand ce jeu sert de passeur, il demande à la box
     // d'ouvrir son port (elle a jusqu'à 10 s pour répondre).
     minelib_net::fast::set_mapper(Box::new(|port| {
@@ -6161,6 +6188,31 @@ fn main() -> anyhow::Result<()> {
         }
     }
     result
+}
+
+/// (v344) Ce qu'on dit à qui lance le jeu une seconde fois.
+const ALREADY_RUNNING: &str = "Minelib est déjà ouvert sur ce PC.\n\nS'il vient d'être lancé \
+                               (ou de se mettre à jour), sa fenêtre arrive : la préparation des \
+                               shaders prend jusqu'à une minute.";
+
+#[cfg(windows)]
+fn already_running_note() {
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    let text = windows::core::HSTRING::from(ALREADY_RUNNING);
+    // SAFETY : deux chaînes terminées par zéro qui vivent pendant l'appel.
+    unsafe {
+        MessageBoxW(
+            None,
+            &text,
+            windows::core::w!("Minelib"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn already_running_note() {
+    eprintln!("{ALREADY_RUNNING}");
 }
 
 /// Volumes du chat vocal choisis pour chaque joueur (`pseudo=volume`, une ligne chacun).
