@@ -64,6 +64,11 @@ const POS_EVERY: f32 = 0.1;
 const POS_CROWD: f32 = 1.0 / 60.0;
 /// (v275) Avec peu de voisins (`POS_CLOSE` au plus) : voir `pos_every`.
 const POS_FASTEST: f32 = 1.0 / 256.0;
+/// (v341) Le plus rapide quand nos positions passent par TURN (notre lien avec le relais
+/// qui les reçoit, ou les routes directes de nos voisins) : 128 par seconde, comme les
+/// parties FPS par TURN. Chaque octet par TURN compte deux fois dans le quota du mois ; par
+/// les passeurs, en direct ou par nos serveurs, rien ne change (256).
+const POS_FASTEST_TURN: f32 = 1.0 / 128.0;
 /// (v333) Positions par le relais quand toutes nos positions rapides vont directement à nos
 /// plus proches voisins (`minelib_net::fast::Near`) : de quoi tenir le relais au courant
 /// (place gardée, modifications en retard) et les joueurs plus loin, 16 par seconde.
@@ -81,6 +86,16 @@ const STALE_S: f32 = 3.0;
 /// Servi par un relais de région : là où l'on est, redit au relais du monde toutes les…
 /// (gardé pour notre retour sur ce serveur).
 const SPOT_EVERY: f32 = 10.0;
+
+/// (v341) Intervalle le plus court entre deux de nos positions : 1/256 s, ou 1/128 s quand
+/// elles passent par TURN.
+fn pos_fastest(turn: bool) -> f32 {
+    if turn {
+        POS_FASTEST_TURN
+    } else {
+        POS_FASTEST
+    }
+}
 
 /// Intervalle entre deux envois de sa position, selon le nombre de joueurs autour : 60
 /// fois par seconde jusqu'à 16 voisins, puis de moins en moins (30 à 32 voisins), jamais
@@ -306,6 +321,9 @@ pub struct BuildNet {
     /// une fois par seconde.
     close_timer: f32,
     slow_link: (f32, bool),
+    /// (v341) Ce lien passe par TURN (revu avec `slow_link`) : 128 positions par seconde au
+    /// plus (`POS_FASTEST_TURN`).
+    turn_link: bool,
     /// (v333) Voie directe des voisins donnée par le relais du monde (routes par TURN vers
     /// nos plus proches voisins), prochaine position par elle, et si toutes nos positions
     /// rapides y passaient à la dernière (le relais n'en reçoit alors plus que
@@ -771,6 +789,7 @@ impl BuildNet {
             pos_timer: 0.0,
             close_timer: 0.0,
             slow_link: (0.0, false),
+            turn_link: false,
             near: None,
             near_timer: 0.0,
             direct_all: false,
@@ -2409,7 +2428,13 @@ impl BuildNet {
                 None => crate::account::world_link_slow(),
             };
             self.slow_link = (1.0, slow);
+            self.turn_link = match node {
+                Some(n) => minelib_p2p::node_on_turn(n) == Some(true),
+                None => crate::account::world_link_turn(),
+            };
         }
+        // (v341) Par TURN, une position par 1/128 s au plus, de l'une ou l'autre sorte.
+        let fastest = pos_fastest(self.turn_link);
         // (v285) Jamais plus d'une position par 1/256 s, de l'une ou l'autre sorte
         // (`close_timer`) : le relais n'en accepte pas davantage.
         let mut sent = false;
@@ -2422,10 +2447,10 @@ impl BuildNet {
             let every = if self.direct_all {
                 pos_every(self.others.len(), slow).max(POS_RELAY_DIRECT)
             } else {
-                pos_every(self.others.len(), slow)
+                pos_every(self.others.len(), slow).max(fastest)
             };
             self.pos_timer = (self.pos_timer + every).max(0.0);
-            self.close_timer = (self.close_timer + POS_FASTEST).max(0.0);
+            self.close_timer = (self.close_timer + fastest).max(0.0);
             sent = true;
             self.net[0] += 1;
             // (v333) Sans pseudo : les relais mettent celui de la session (le relais du monde
@@ -2475,7 +2500,7 @@ impl BuildNet {
             && !self.direct_all
             && self.others.len() > POS_CLOSE
         {
-            self.close_timer = (self.close_timer + POS_FASTEST).max(0.0);
+            self.close_timer = (self.close_timer + fastest).max(0.0);
             self.net[1] += 1;
             let msg = BuildMsg::Player {
                 pseudo: String::new(),
@@ -2495,15 +2520,16 @@ impl BuildNet {
                 },
             );
         }
-        // (v333) Voie directe des voisins : nos positions rapides (256 par seconde) vont par
-        // TURN à ceux de nos plus proches voisins dont la route passe, quand nos positions
-        // vont au relais du monde (c'est lui qui donne ces routes). Si elles leur vont à
-        // tous, le relais n'en reçoit plus que 16 par seconde (`direct_all`).
+        // (v333) Voie directe des voisins : nos positions rapides vont par TURN à ceux de nos
+        // plus proches voisins dont la route passe, quand nos positions vont au relais du
+        // monde (c'est lui qui donne ces routes). Si elles leur vont à tous, le relais n'en
+        // reçoit plus que 16 par seconde (`direct_all`). (v341) Ces routes passent toujours
+        // par TURN : 128 par seconde (avant : 256).
         let to_world = self.shards.link(proto::region_of(chunk)).is_none()
             && self.province_link(chunk).is_none();
         match self.near.as_ref().filter(|_| to_world && !self.hidden) {
             Some(n) if self.near_timer <= 0.0 => {
-                self.near_timer = (self.near_timer + POS_FASTEST).max(0.0);
+                self.near_timer = (self.near_timer + POS_FASTEST_TURN).max(0.0);
                 let wanted = n.wanted();
                 let mut served = Vec::new();
                 if !wanted.is_empty() {
@@ -2537,6 +2563,8 @@ impl BuildNet {
                 } else {
                     "relais de région ou de province, en direct"
                 }
+            } else if self.turn_link {
+                "relais du monde, par TURN (128 positions par seconde au plus)"
             } else {
                 "relais du monde"
             };
@@ -3213,6 +3241,10 @@ mod tests {
         // Par le relais d'une région ou d'une province (hébergé par un joueur) : 60.
         assert_eq!((1.0 / pos_every(2, true)).round() as u32, 60);
         assert_eq!([hz(0), hz(4), hz(16), hz(32), hz(96), hz(3000)], [60, 60, 60, 30, 10, 10]);
+        // (v341) Par TURN : 128 au plus, même à 3 voisins ; au-delà, rien ne change.
+        let turn =
+            |others: usize| (1.0 / pos_every(others, false).max(pos_fastest(true))).round() as u32;
+        assert_eq!([turn(1), turn(3), turn(4), turn(32)], [128, 128, 60, 30]);
         // Chacun reçoit au plus `POS_BUDGET` positions par seconde, à tout nombre de voisins.
         for others in 1..200 {
             let got = hz(others) as f32 * others as f32;
@@ -3267,7 +3299,8 @@ mod tests {
 
     /// (v333) Deux joueurs côte à côte dans un monde de construction, leurs liens avec le
     /// relais par TURN : le relais leur donne une route directe ; chacun envoie alors ses
-    /// positions rapides par elle (256 par seconde), et au relais seulement 16 par seconde.
+    /// positions rapides par elle ((v341) 128 par seconde, par TURN ; 256 avant), et au
+    /// relais seulement 16 par seconde.
     /// L'autre le voit par elle, sous le pseudo que le relais donne à son numéro.
     #[test]
     fn side_by_side_players_send_their_positions_directly_and_spare_the_relay() {
@@ -3403,7 +3436,10 @@ mod tests {
             "VOISINS : {relay_hz:.0} positions par seconde au relais, {direct_hz:.0} en direct"
         );
         assert!(relay_hz < 24.0, "au relais : {relay_hz:.0} par seconde");
-        assert!(direct_hz > 150.0, "en direct : {direct_hz:.0} par seconde");
+        assert!(
+            (100.0..160.0).contains(&direct_hz),
+            "en direct : {direct_hz:.0} par seconde (128 par TURN)"
+        );
         let b = &bots[1].1;
         let seen = b.others.get("VoisinA").expect("B voit A");
         assert!(seen.direct < DIRECT_FRESH, "B voit A par la voie directe");

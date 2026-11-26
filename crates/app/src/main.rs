@@ -1401,10 +1401,10 @@ impl Game {
                 &mut c,
                 "Relayer pour les autres joueurs ?",
                 &[
-                    "Ton jeu porte des paquets chiffrés d'autres joueurs, les leurs portent les",
-                    "tiens : c'est ce qui cache les adresses IP entre joueurs. Ceux à qui ton jeu",
-                    "remet un paquet voient ton adresse (pas ton pseudo). Qui relaie est servi",
-                    "en premier quand les passeurs manquent. Paramètres avancés.",
+                    "Ton jeu fait passer des paquets scellés d'autres parties, sans les lire.",
+                    "C'est ce qui donne le 256 tick en FPS (sans assez de relais : 128).",
+                    "Ceux à qui ton jeu remet un paquet voient ton adresse IP, pas ton pseudo.",
+                    "Qui relaie est servi en premier. Se change dans Paramètres avancés.",
                 ],
             );
             if yes {
@@ -4274,9 +4274,10 @@ impl Game {
         let flip_pass = c.button(label, cx, y, 300.0, true);
         y += 23.0 * s;
         for line in [
-            "Ton jeu porte des paquets chiffrés d'autres joueurs, les leurs portent les tiens : c'est ce qui",
-            "cache les adresses IP entre joueurs. Ceux à qui ton jeu remet un paquet voient ton adresse.",
-            "Quand les passeurs manquent, ceux qui relaient sont servis en premier.",
+            "Ton jeu fait passer des paquets scellés de parties d'autres joueurs, sans pouvoir les lire.",
+            "C'est ce qui donne le 256 tick en FPS ; sans assez de joueurs qui relaient, souvent 128.",
+            "Ceux à qui ton jeu remet un paquet voient ton adresse IP, jamais ton pseudo.",
+            "Qui relaie est servi en premier. Ta box doit ouvrir un port : le jeu le lui demande tout seul.",
         ] {
             c.text_center(line, y, ds, GREY);
             y += 7.0 * ds;
@@ -4292,10 +4293,10 @@ impl Game {
         let flip_direct = c.button(label, cx, y, 300.0, true);
         y += 23.0 * s;
         for line in [
-            "Oui : ton jeu se relie en direct aux joueurs qui l'ont mis à oui eux aussi (un peu moins de",
-            "retard). Eux voient alors ton adresse IP, et toi la leur ; quand ton PC sert une région, une",
-            "province ou un relais, ceux qui y jouent en direct savent que c'est toi. Pour tous les autres,",
-            "rien ne change : personne ne voit ton adresse. Pris en compte au prochain lancement du jeu.",
+            "Oui : ton jeu se relie en direct aux joueurs qui l'ont mis à oui eux aussi. Vous voyez alors",
+            "vos adresses IP ; si ton PC sert une région ou un relais, ils savent que c'est toi.",
+            "Pas besoin pour le 256 tick : ce sont les joueurs qui relaient qui le donnent. Pour tous les",
+            "autres, rien ne change. Pris en compte au prochain lancement du jeu.",
         ] {
             c.text_center(line, y, ds, if direct { WHITE } else { GREY });
             y += 7.0 * ds;

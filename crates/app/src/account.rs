@@ -53,6 +53,15 @@ pub(crate) fn world_link_slow() -> bool {
     minelib_p2p::node_direct(ad.node) == Some(false) && !minelib_p2p::own_relays_in_use()
 }
 
+/// (v341) Le lien avec le relais du monde passe-t-il par TURN ? Faux sans tunnel (relais
+/// de ce PC, du réseau local).
+pub(crate) fn world_link_turn() -> bool {
+    let Some(ad) = CHOSEN.lock().unwrap().clone() else {
+        return false;
+    };
+    minelib_p2p::node_on_turn(ad.node) == Some(true)
+}
+
 /// Nœud iroh du jeu (un seul, gardé pour la durée du jeu). Son identité est gardée à côté
 /// du dossier du relais (`noeud.key`) : la même à chaque lancement.
 fn node(dir: &std::path::Path) -> Option<&'static minelib_p2p::Node> {

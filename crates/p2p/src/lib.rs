@@ -467,6 +467,34 @@ fn link_probe(addr: &str) -> Option<bool> {
     })
 }
 
+/// (v341) Le tunnel de ce jeu vers le nœud `remote` passe-t-il en ce moment par TURN (le
+/// chemin choisi par iroh est une route de passeurs, et son saut en cours le saut TURN) ?
+/// `None` s'il n'y a pas de tunnel vers lui (réseau local, même machine).
+pub fn node_on_turn(remote: [u8; 32]) -> Option<bool> {
+    let links: Vec<(iroh::endpoint::Connection, passeur::PasseurTransport)> = {
+        let l = LOCAL_LINKS.lock().unwrap();
+        l.iter()
+            .filter(|(_, c, _)| c.close_reason().is_none() && *c.remote_id().as_bytes() == remote)
+            .map(|(_, c, p)| (c.clone(), p.clone()))
+            .collect()
+    };
+    let mut any = None;
+    for (conn, passeurs) in links {
+        let paths = conn.paths();
+        let on = paths
+            .iter()
+            .find(|p| p.is_selected())
+            .is_some_and(|p| match p.remote_addr() {
+                iroh::TransportAddr::Custom(c) => {
+                    passeur::route_of(c).is_some_and(|r| passeurs.via_turn(r))
+                }
+                _ => false,
+            });
+        any = Some(any.unwrap_or(false) || on);
+    }
+    any
+}
+
 /// (v285) Ce jeu joint-il le nœud `remote` en direct ? `None` s'il n'y a pas de tunnel
 /// vers lui (réseau local, même machine) ; `Some(false)` tant que tout passe par un
 /// serveur relais d'iroh (hôte anonyme, ou box qui ne laisse pas faire) : ces serveurs
@@ -1215,6 +1243,9 @@ mod tests {
             assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
         }
         assert!(guest.passeurs().via_turn(0x61));
+        // (v341) Ce que la construction regarde pour passer à 128 positions par seconde.
+        assert_eq!(node_on_turn(host.id()), Some(true));
+        assert_eq!(node_on_turn([9; 32]), None, "pas de tunnel vers lui");
         let (sent, received) = guest.passeurs().turn_counts();
         assert!(sent > 20 && received > 20, "{sent} envoyés, {received} reçus");
         let carried = server.relayed.load(std::sync::atomic::Ordering::Relaxed);
