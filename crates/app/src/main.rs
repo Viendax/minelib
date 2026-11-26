@@ -555,6 +555,8 @@ impl Game {
         // il est le relais, l'a demandé (paramètres avancés).
         minelib_net::netlog::set_share(options.share_netlog == Some(true));
         minelib_relay::set_receive_logs(options.receive_netlogs);
+        // (v349) Place des mondes du relais tenu par ce PC (`place_mondes_mo=`).
+        minelib_relay::set_world_space(options.world_space_mb as u64 * 1_000_000);
         // (v308) Passeur : seulement si le joueur l'a accepté.
         minelib_net::fast::set_passeur_allowed(options.passeur == Some(true));
         jobs::set_uniform_sharing(options.cpu_uniform);
@@ -2074,6 +2076,54 @@ impl Game {
                             s.chat.say(text, chat::YELLOW);
                         }
                     }
+                }
+                // (v349) Mondes endormis oubliés par le relais pour faire de la place : la copie
+                // qu'en garde ce PC devient un monde solo, à rouvrir en ligne.
+                Event::WorldsForgotten(worlds) => {
+                    let relay = self.accounts.relay_hex();
+                    let mut kept = Vec::new();
+                    for w in worlds {
+                        let copy = online_copies::forgotten(
+                            &self.paths.root,
+                            &self.paths.saves,
+                            &relay,
+                            w,
+                        );
+                        log::info!(
+                            "monde « {} » oublié par le relais (personne n'y avait joué depuis {} \
+                             jours){}",
+                            w.name,
+                            w.idle_days,
+                            if copy.is_some() {
+                                " : sa copie est dans les mondes solo"
+                            } else {
+                                ""
+                            }
+                        );
+                        if copy.is_some() {
+                            kept.push(w.name.clone());
+                        }
+                    }
+                    self.refresh_worlds();
+                    self.notify(match (worlds.as_slice(), kept.len()) {
+                        ([w], 1) => format!(
+                            "« {} » : personne n'y avait joué depuis {} jours, le relais l'a \
+                             oublié pour faire de la place. Ta copie est dans tes mondes solo \
+                             (« Ouvrir en ligne » le relance).",
+                            w.name, w.idle_days
+                        ),
+                        ([w], _) => format!(
+                            "« {} » : personne n'y avait joué depuis {} jours, le relais l'a \
+                             oublié pour faire de la place.",
+                            w.name, w.idle_days
+                        ),
+                        (all, n) => format!(
+                            "{} mondes endormis oubliés par le relais pour faire de la place ; \
+                             {n} copies sont dans tes mondes solo (« Ouvrir en ligne » les \
+                             relance).",
+                            all.len()
+                        ),
+                    });
                 }
                 Event::Kicked(reason) => {
                     let world = self.world_key.clone();

@@ -3,7 +3,7 @@
 # jour tout seul à chaque nouvelle version publiée sur GitHub (celle des joueurs).
 #
 #   sudo sh installer.sh relais  [options de minelib-relay : --name <nom>, --journaux,
-#                                --admin <pseudo>…]
+#                                --admin <pseudo>, --place-mondes <Mo>…]
 #   sudo sh installer.sh passeur [--ip <adresse publique>] [--port <premier port UDP>]
 #                                [--relais "<nœud> <clé> <nom>"] [--invitation "<…>"]
 #                                [--sans-journaux]

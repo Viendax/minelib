@@ -196,6 +196,88 @@ pub fn forget(root: &Path, relay: &str, world: &str) {
 /// répondu) : elle devient un monde solo, « <nom> (pas ouvert en ligne) », plutôt que de
 /// rester où personne ne la verrait. Rend son dossier.
 pub fn to_solo(root: &Path, saves: &Path, dir: &Path) -> Result<PathBuf> {
+    to_solo_as(root, saves, dir, "pas ouvert en ligne")
+}
+
+/// (v349) Le relais `relay` a oublié le monde endormi `w` pour faire de la place (personne n'y
+/// avait joué depuis longtemps). La copie qu'en garde ce PC devient un monde solo, « <nom>
+/// (oublié par le relais) », complété de la clé de son terrain (et de sa graine, chez son
+/// créateur) : de quoi y jouer, et le rouvrir en ligne (« Ouvrir en ligne » en fait un
+/// nouveau serveur). Une carte téléchargée reste où elle est, complétée de même. Rend où est
+/// la copie ; rien si ce PC n'en a pas.
+pub fn forgotten(
+    root: &Path,
+    saves: &Path,
+    relay: &str,
+    w: &minelib_net::proto::ForgottenWorld,
+) -> Option<PathBuf> {
+    let (gone, rest): (Vec<Line>, Vec<Line>) = read(root)
+        .into_iter()
+        .partition(|l| l.world == w.world && l.relay == relay);
+    let latest = gone.iter().max_by_key(|l| l.saved)?;
+    write(root, &rest);
+    let dir = abs(root, &latest.dir);
+    if !dir.join("level.txt").exists() {
+        return None;
+    }
+    let dir = if is_copy(root, &dir) && !rest.iter().any(|r| r.dir == latest.dir) {
+        match to_solo_as(root, saves, &dir, "oublié par le relais") {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("copie d'un monde oublié par le relais : {e:#}");
+                dir
+            }
+        }
+    } else {
+        dir
+    };
+    if let Err(e) = give_seed(&dir, w.terrain, w.seed) {
+        log::warn!("copie d'un monde oublié par le relais, sa graine : {e:#}");
+    }
+    Some(dir)
+}
+
+/// (v349) La graine qu'une copie n'avait pas (le relais la gardait) : écrite dans son
+/// `level.txt`. Un monde créé depuis la v330 prend la clé de son terrain (`cle=`, et sa graine
+/// publique `seed=` pour sa météo), et sa graine (`graine=`) si on la connaît ; un monde
+/// d'avant, sa graine (`seed=`, qui fait son terrain).
+fn give_seed(dir: &Path, terrain: u64, seed: u64) -> Result<()> {
+    if terrain == 0 && seed == 0 {
+        return Ok(());
+    }
+    let path = dir.join("level.txt");
+    let text = fs::read_to_string(&path)?;
+    let v2 = text.lines().any(|l| l.trim() == "generator=procedural2");
+    let mut out: String = text
+        .lines()
+        .filter(|l| !(l.starts_with("seed=") || l.starts_with("cle=") || l.starts_with("graine=")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    if v2 {
+        let key = if terrain != 0 {
+            terrain
+        } else {
+            minelib_net::graine::terrain_key(seed)
+        };
+        out += &format!(
+            "seed={}\ncle={key:016x}\n",
+            minelib_net::graine::public_seed(key)
+        );
+        if seed != 0 {
+            out += &format!("graine={seed}\n");
+        }
+    } else {
+        out += &format!(
+            "seed={}\n",
+            if terrain != 0 { terrain } else { seed } as u32
+        );
+    }
+    fs::write(&path, out)?;
+    Ok(())
+}
+
+/// Une copie devient un monde solo, « <nom> (`why`) ».
+fn to_solo_as(root: &Path, saves: &Path, dir: &Path, why: &str) -> Result<PathBuf> {
     anyhow::ensure!(
         is_copy(root, dir),
         "pas une copie en ligne : {}",
@@ -216,7 +298,7 @@ pub fn to_solo(root: &Path, saves: &Path, dir: &Path) -> Result<PathBuf> {
         let text: String = text
             .lines()
             .map(|l| match l.strip_prefix("name=") {
-                Some(old) => format!("name={} (pas ouvert en ligne)\n", old.trim()),
+                Some(old) => format!("name={} ({why})\n", old.trim()),
                 None => format!("{l}\n"),
             })
             .collect();
@@ -364,6 +446,66 @@ mod tests {
         assert!(!d.exists() && find(&root, "r1", "ana/Île").is_none());
         assert_eq!(files(&solo), before);
         assert_eq!(find(&root, "r1", "ana/Île#2"), Some(b));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// (v349) « Ceux qui y ont joué l'ont toujours et peuvent le relancer » : un monde oublié
+    /// par le relais pour faire de la place devient, chez qui en garde la copie, un monde solo
+    /// complet (la clé de son terrain, sa graine chez le créateur), avec ce qu'on y avait
+    /// construit. Un monde d'un autre relais, ou dont ce PC n'a pas de copie, ne bouge pas.
+    #[test]
+    fn a_world_the_relay_forgot_becomes_a_solo_world_to_reopen() {
+        let root = root();
+        let saves = root.join("saves");
+        let solo = crate::save::create_world(&saves, "Île", 7).unwrap();
+        let copy = fork(&root, &solo).unwrap();
+        // Comme la copie d'un serveur de construction : sans graine ni clé.
+        let level = fs::read_to_string(copy.join("level.txt")).unwrap();
+        let bare: String = level
+            .lines()
+            .filter(|l| !l.starts_with("graine=") && !l.starts_with("cle="))
+            .map(|l| {
+                if l.starts_with("seed=") {
+                    "seed=0\n".to_string()
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        fs::write(copy.join("level.txt"), bare).unwrap();
+        fs::write(copy.join("edits.bin"), [4, 5, 6]).unwrap();
+        keep(&root, "r1", "ana/Île", &copy);
+        let key = minelib_net::graine::terrain_key(7);
+        let w = |world: &str| minelib_net::proto::ForgottenWorld {
+            world: world.into(),
+            name: "Île".into(),
+            idle_days: 64,
+            terrain: key,
+            seed: 7,
+        };
+        assert!(
+            forgotten(&root, &saves, "r2", &w("ana/Île")).is_none(),
+            "autre relais"
+        );
+        assert!(
+            forgotten(&root, &saves, "r1", &w("ana/autre")).is_none(),
+            "pas de copie"
+        );
+        assert!(copy.exists());
+        let to = forgotten(&root, &saves, "r1", &w("ana/Île")).unwrap();
+        assert!(!copy.exists() && to.starts_with(&saves));
+        assert_eq!(fs::read(to.join("edits.bin")).unwrap(), [4, 5, 6]);
+        let meta = crate::save::list_worlds(&saves)
+            .into_iter()
+            .find(|m| m.dir == to)
+            .unwrap()
+            .meta;
+        assert_eq!(meta.name, "Île (oublié par le relais)");
+        assert_eq!((meta.key, meta.graine), (Some(key), Some(7)));
+        assert_eq!(meta.seed, minelib_net::graine::public_seed(key));
+        assert!(find(&root, "r1", "ana/Île").is_none());
+        // Le monde solo d'origine ne bouge pas.
+        assert!(solo.join("level.txt").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

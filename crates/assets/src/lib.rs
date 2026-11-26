@@ -159,6 +159,10 @@ pub struct Options {
     /// (v307) Quand ce PC est le relais : recevoir les journaux réseau des joueurs qui les
     /// partagent, dans `journaux_reseau.txt` (paramètres avancés). `recevoir_journaux=true`.
     pub receive_netlogs: bool,
+    /// (v349) Quand ce PC est le relais : la place de ses mondes, en Mo (registre, réglages,
+    /// sacs ; il ne garde pas leurs blocs). Au-delà, des mondes endormis depuis au moins
+    /// 30 jours sont oubliés. `place_mondes_mo=256`.
+    pub world_space_mb: u32,
     /// (v308) Ce jeu sert-il de passeur (il porte des paquets chiffrés d'autres joueurs, et
     /// montre son adresse IP à ceux à qui il les remet) ? Rien : pas encore demandé (la
     /// question est posée une fois, au menu d'accueil). `passeur=true` ou `false`.
@@ -214,6 +218,7 @@ impl Default for Options {
             invitation: String::new(),
             share_netlog: None,
             receive_netlogs: false,
+            world_space_mb: 256,
             passeur: None,
             relay_key: String::new(),
             pseudo: String::new(),
@@ -288,6 +293,12 @@ impl Options {
             if let Some(v) = kv.get("recevoir_journaux") {
                 o.receive_netlogs = v == "true";
             }
+            if let Some(v) = kv
+                .get("place_mondes_mo")
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                o.world_space_mb = v.max(1);
+            }
             if let Some(v) = kv.get("passeur") {
                 o.passeur = match v.as_str() {
                     "true" => Some(true),
@@ -361,7 +372,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\njournal_reseau={}\nrecevoir_journaux={}\npasseur={}\nequipe_fps={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\njournal_reseau={}\nrecevoir_journaux={}\npasseur={}\nequipe_fps={}\nplace_mondes_mo={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -400,6 +411,7 @@ impl Options {
                     None => "demander",
                 },
                 self.fps_team,
+                self.world_space_mb,
             ),
         )?;
         Ok(())

@@ -19,6 +19,7 @@ mod maps;
 mod mondes;
 pub mod passeur_seul;
 mod passeurs;
+mod place;
 mod provinces;
 mod registry;
 mod servers;
@@ -47,6 +48,9 @@ use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
 pub use journaux::set_receive_logs;
+/// (v349) La place donnée aux mondes de ce relais (octets) : au-delà, des mondes endormis
+/// depuis au moins 30 jours sont oubliés (`place`).
+pub use place::set_place as set_world_space;
 pub use registry::{Body, Registry};
 
 /// Réglages du relais.
@@ -1509,6 +1513,10 @@ struct State {
     /// (v347) « Plus tard » répondus depuis la dernière ligne du journal : par la part des
     /// connexions sans adresse IP, par le rythme d'une connexion ; et quand.
     skin_later: (u32, u32, Instant),
+    /// (v349) Mondes oubliés pour faire de la place, à dire à leur créateur et à leur
+    /// gardien ; et la dernière fois que la place a été regardée (`place`).
+    forgotten: place::Store,
+    place_checked: Instant,
     servers: servers::Store,
     /// (v311) Mondes de construction connus de ce relais, ouverts ou endormis (`mondes`).
     worlds: mondes::Store,
@@ -1670,6 +1678,11 @@ pub fn start(cfg: Config) -> Result<Handle> {
         passeurs_ok: confiance::Store::open(cfg_dir.join("passeurs_confiance.bin")),
         skin_no_ip: (SKIN_NO_IP_BURST, Instant::now()),
         skin_later: (0, 0, Instant::now()),
+        forgotten: place::Store::open(cfg_dir.join("mondes_oublies.bin")),
+        // (Regardée une première fois une minute après le démarrage.)
+        place_checked: Instant::now()
+            .checked_sub(Duration::from_secs(3540))
+            .unwrap_or_else(Instant::now),
         servers: servers::Store::open(cfg_dir.join("serveurs.bin")),
         worlds: mondes::Store::open(cfg_dir.join("mondes.bin")),
         bags: bags::Store::open(cfg_dir.join("sacs.bin")),
@@ -4447,6 +4460,7 @@ fn upkeep(st: &mut State) {
     upkeep_contacts(st);
     upkeep_build(st);
     upkeep_zeus(st);
+    place::upkeep(st);
     let rooms: Vec<u64> = st
         .rooms
         .iter()
@@ -4710,6 +4724,8 @@ fn delete_world(st: &mut State, rid: u64, creator: u64, key: &str) {
     }
     st.worlds.delete(key);
     st.servers.forget(key);
+    // (v349) Ses sacs aussi.
+    st.bags.forget(key);
 }
 
 /// (v311) Le registre des mondes suit ce qui s'y passe : joueurs présents (record,
@@ -7565,6 +7581,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 }
                 st.worlds.delete(&old);
                 st.servers.forget(&old);
+                st.bags.forget(&old);
                 log::info!("monde endormi supprimé par son créateur pour en ouvrir un autre");
             }
             st.worlds.note_open(pseudo);
@@ -11765,6 +11782,120 @@ mod tests {
             assert_eq!(ask(&crowd, st, near, "Personne"), proto::SKIN_LATER);
             st.conns.get_mut(&near).unwrap().skin_rate.0 -= Duration::from_secs(1);
             assert!(ask(&crowd, st, near, "Personne").is_empty());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v349) « Limiter la place de l'enregistrement des mondes dans le relais en fonction de
+    /// la place qu'on lui donne, effacer les mondes pas joués au bout de genre 1 mois (ça peut
+    /// rester plus longtemps s'il n'y a pas trop de nouveaux qui prennent la place) ; ceux qui
+    /// y ont joué l'ont toujours et peuvent le relancer. » Au-delà de la place donnée, le
+    /// relais oublie des mondes endormis depuis au moins 30 jours, le moins récemment actif
+    /// d'abord, jusqu'à ce que ça tienne, et rien de plus. Jamais un monde joué depuis moins
+    /// longtemps, ni un monde ouvert. Leurs réglages et leurs sacs partent avec eux. Leur
+    /// créateur et leur gardien l'apprennent à leur prochaine connexion (une fois), avec la
+    /// clé du terrain, et la graine pour le créateur seulement ; un jeu d'avant la v349 non.
+    #[test]
+    fn the_relay_forgets_long_unplayed_worlds_when_it_needs_the_room() {
+        let (h, dir) = crowd_world("place_mondes");
+        {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            let (_, open) = host_world(&mut crowd, st);
+            // (Un monde ouvert dont le registre dirait qu'il est vieux : jamais oublié.)
+            let open_key = st.rooms[&open].server.clone();
+            st.worlds.age(&open_key, 400, false);
+            // Six mondes endormis d'Alice, gardés par Bob, de 200 à 5 jours sans joueurs.
+            let ages = [200u64, 90, 45, 20, 5, 1];
+            let keys: Vec<String> = (0..ages.len()).map(|i| format!("alice/monde{i}")).collect();
+            for (i, (k, &days)) in keys.iter().zip(&ages).enumerate() {
+                st.worlds
+                    .opened(k, &format!("Monde {i}"), "monde", "Alice", "Bob");
+                st.worlds.asleep(k, "Bob");
+                st.worlds.age(k, days, true);
+                st.servers.note_world_seed(
+                    k,
+                    "Alice",
+                    "Alice",
+                    servers::WorldSeed {
+                        seed: 1000 + i as u64,
+                        terrain: 2000 + i as u64,
+                    },
+                );
+                let mut bag = bags::Bag::default();
+                bag.items.insert(7, 3 + i as u32);
+                st.bags.put(k, "bob", bag);
+            }
+            let size = |st: &State, k: &str| place::bytes_of(st, k);
+            assert!(keys.iter().all(|k| size(st, k) > 0));
+            let total: u64 = st.worlds.all().map(|w| place::bytes_of(st, &w.key)).sum();
+            // Tout tient : rien n'est oublié.
+            let now = mondes::now();
+            assert!(place::free_to(st, now, total).is_empty());
+            // De quoi faire de la place pour deux : les deux plus anciens partent, pas plus.
+            let budget = total - size(st, &keys[0]) - size(st, &keys[1]);
+            assert_eq!(
+                place::free_to(st, now, budget),
+                vec![keys[0].clone(), keys[1].clone()]
+            );
+            assert!(st.worlds.get(&keys[0]).is_none() && st.worlds.get(&keys[1]).is_none());
+            assert_eq!(
+                st.servers.world_seed(&keys[0]),
+                servers::WorldSeed::default()
+            );
+            assert_eq!(st.bags.bytes_of(&keys[1]), 0);
+            assert!(st.worlds.get(&keys[2]).is_some());
+            // Plus de place du tout : seul celui de 45 jours part encore ; ceux de moins de
+            // 30 jours et le monde ouvert restent.
+            assert_eq!(place::free_to(st, now, 1), vec![keys[2].clone()]);
+            for k in &keys[3..] {
+                assert!(st.worlds.get(k).is_some(), "{k}");
+            }
+            assert!(st.worlds.get(&open_key).is_some());
+            // Ils l'apprennent à leur connexion, une fois : la graine au créateur seulement.
+            let alice = crowd.conn(st, "Alice", false);
+            st.conns.get_mut(&alice).unwrap().version = 349;
+            place::tell(st, alice);
+            let told = |crowd: &Crowd, id: u64| -> Vec<proto::ForgottenWorld> {
+                crowd
+                    .got(id)
+                    .0
+                    .into_iter()
+                    .flat_map(|r| match r {
+                        Response::WorldsForgotten { worlds } => worlds,
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            };
+            let mut seen = told(&crowd, alice);
+            seen.sort_by(|a, b| a.world.cmp(&b.world));
+            assert_eq!(seen.len(), 3);
+            assert_eq!(
+                (
+                    seen[0].world.as_str(),
+                    seen[0].name.as_str(),
+                    seen[0].seed,
+                    seen[0].terrain
+                ),
+                ("alice/monde0", "Monde 0", 1000, 2000)
+            );
+            assert!(seen[0].idle_days >= 199, "{:?}", seen[0]);
+            place::tell(st, alice);
+            assert!(told(&crowd, alice).is_empty(), "une fois");
+            let old = crowd.conn(st, "Bob", false);
+            st.conns.get_mut(&old).unwrap().version = 348;
+            place::tell(st, old);
+            assert!(told(&crowd, old).is_empty(), "jeu d'avant la v349");
+            let bob = crowd.conn(st, "Bob", false);
+            st.conns.get_mut(&bob).unwrap().version = 349;
+            place::tell(st, bob);
+            let seen = told(&crowd, bob);
+            assert_eq!(seen.len(), 3);
+            assert!(seen.iter().all(|w| w.seed == 0 && w.terrain >= 2000));
+            // Les deux le savent : plus rien n'est gardé d'eux.
+            assert!(st.forgotten.list().is_empty());
         }
         drop(h);
         let _ = std::fs::remove_dir_all(dir);

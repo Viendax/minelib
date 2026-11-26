@@ -104,6 +104,30 @@ impl Store {
         }
     }
 
+    /// (v349) Le monde `server` est oublié ou supprimé : ses sacs et ses modes aussi.
+    pub fn forget(&mut self, server: &str) {
+        let a = self.data.bags.remove(server).is_some();
+        let b = self.data.modes.remove(server).is_some();
+        self.changed.retain(|(s, _)| s != server);
+        self.modes_changed.retain(|(s, _)| s != server);
+        self.dirty |= a || b;
+    }
+
+    /// (v349) Ce que les sacs et les modes du serveur `server` prennent dans `sacs.bin`.
+    pub fn bytes_of(&self, server: &str) -> u64 {
+        let len = |v: Option<Vec<u8>>| v.map_or(0, |b| b.len() as u64 + server.len() as u64 + 1);
+        len(self
+            .data
+            .bags
+            .get(server)
+            .and_then(|v| postcard::to_allocvec(v).ok()))
+            + len(self
+                .data
+                .modes
+                .get(server)
+                .and_then(|v| postcard::to_allocvec(v).ok()))
+    }
+
     /// Un relais de secours garde (ou ne garde plus) une copie des sacs de ce serveur.
     pub fn watch(&mut self, server: &str, on: bool) {
         if on {

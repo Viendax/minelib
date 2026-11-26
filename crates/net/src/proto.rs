@@ -91,6 +91,8 @@ use serde::{Deserialize, Serialize};
 /// (v345, toujours 75) `Request::AccountMove`, `Request::AccountTotp` et `Response::Moved`
 /// (envoyés seulement à un relais officiel : un relais d'avant ferme la connexion, le jeu
 /// recopie alors le compte comme avant, sans sa double authentification).
+/// (v349, toujours 75) `Response::WorldsForgotten` (poussé seulement aux jeux de la v349 ou
+/// après).
 pub const PROTOCOL: u32 = 75;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
@@ -2142,6 +2144,26 @@ pub enum Response {
         index: u64,
         device: [u8; 32],
     },
+    /// (v349) Poussé à l'entrée d'un jeu de la v349 ou après : des mondes endormis que ce
+    /// relais a oubliés pour faire de la place (personne n'y avait joué depuis au moins
+    /// 30 jours), dont ce compte est le créateur ou garde le dernier état.
+    WorldsForgotten {
+        worlds: Vec<ForgottenWorld>,
+    },
+}
+
+/// (v349) Un monde endormi oublié par le relais (`Response::WorldsForgotten`) : de quoi faire
+/// de sa copie un monde solo complet, à rouvrir en ligne.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ForgottenWorld {
+    /// Sa clé (`ServerEntry::world`) et son nom.
+    pub world: String,
+    pub name: String,
+    /// Jours sans joueurs quand il a été oublié.
+    pub idle_days: u32,
+    /// Clé de son terrain (0 : pas connue) ; sa graine, à son créateur seulement (0 sinon).
+    pub terrain: u64,
+    pub seed: u64,
 }
 
 /// Passeur d'une route de la voie rapide : où lui écrire (IPv4, port UDP) et la clé du

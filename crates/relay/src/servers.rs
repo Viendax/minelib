@@ -509,6 +509,61 @@ impl Store {
         self.save();
     }
 
+    /// (v349) Oubliés pour faire de la place (`place`) : comme `forget`, avec une seule
+    /// écriture de chaque fichier.
+    pub fn forget_many(&mut self, servers: &[String]) {
+        let mut seeds = false;
+        let mut opened = false;
+        for s in servers {
+            self.servers.remove(s);
+            self.whitelists.remove(s);
+            self.defaults.remove(s);
+            self.spawns.remove(s);
+            self.times.remove(s);
+            self.weathers.remove(s);
+            self.legends.remove(s);
+            self.op_ready.remove(s);
+            seeds |= self.world_seeds.remove(s).is_some();
+            opened |= self.seeds_open.remove(s);
+            self.positions_dirty |= self.positions.remove(s).is_some();
+        }
+        if seeds {
+            self.save_world_seeds();
+        }
+        if opened {
+            if let Ok(b) = postcard::to_allocvec(&self.seeds_open) {
+                let _ = crate::accounts::write_atomic(&self.path.with_extension("graine"), &b);
+            }
+        }
+        if self.positions_dirty {
+            self.save_positions_now();
+        }
+        self.save();
+    }
+
+    /// (v349) Ce que les réglages du serveur `server` prennent dans les fichiers (octets, à
+    /// peu près : chaque entrée comme elle est écrite, avec sa clé).
+    pub fn bytes_of(&self, server: &str) -> u64 {
+        fn len<T: Serialize>(v: Option<&T>) -> u64 {
+            v.and_then(|v| postcard::to_allocvec(v).ok())
+                .map_or(0, |b| b.len() as u64)
+        }
+        let parts = [
+            len(self.servers.get(server)),
+            len(self.whitelists.get(server)),
+            len(self.defaults.get(server)),
+            len(self.positions.get(server)),
+            len(self.times.get(server)),
+            len(self.weathers.get(server)),
+            len(self.spawns.get(server)),
+            len(self.legends.get(server)),
+            len(self.world_seeds.get(server)),
+            self.seeds_open.contains(server) as u64,
+        ];
+        let key = server.len() as u64 + 1;
+        parts.iter().filter(|&&n| n > 0).map(|n| n + key).sum()
+    }
+
     fn save(&self) {
         if let Ok(b) = postcard::to_allocvec(&self.servers) {
             let _ = crate::accounts::write_atomic(&self.path, &b);

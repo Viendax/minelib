@@ -1460,6 +1460,7 @@ impl Accounts {
                 | Event::BuildSpawn { .. }
                 | Event::RespawnReply { .. }
                 | Event::PasseurInvitation(_)
+                | Event::WorldsForgotten(_)
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)
                 | Event::MapCertified { .. }

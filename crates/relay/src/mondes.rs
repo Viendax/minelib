@@ -226,6 +226,40 @@ impl Store {
         }
     }
 
+    /// (v349) Oubliés pour faire de la place (`place`) : une seule écriture.
+    pub fn delete_many(&mut self, keys: &[String]) {
+        let before = self.worlds.len();
+        for k in keys {
+            self.worlds.remove(k);
+        }
+        if self.worlds.len() != before {
+            self.save();
+        }
+    }
+
+    /// (v349) Tous les mondes, ouverts ou endormis.
+    pub fn all(&self) -> impl Iterator<Item = &World> {
+        self.worlds.values()
+    }
+
+    /// (v349) Ce que son entrée prend dans `mondes.bin` (octets).
+    pub fn bytes_of(&self, key: &str) -> u64 {
+        self.worlds
+            .get(key)
+            .and_then(|w| postcard::to_allocvec(w).ok())
+            .map_or(0, |b| b.len() as u64)
+    }
+
+    /// (v349) Essais : ce monde a eu son dernier joueur il y a `days` jours (`asleep` :
+    /// endormi depuis ; sinon noté ouvert).
+    #[cfg(test)]
+    pub fn age(&mut self, key: &str, days: u64, asleep: bool) {
+        if let Some(w) = self.worlds.get_mut(key) {
+            w.active = now().saturating_sub(days * 86_400);
+            w.asleep = asleep.then_some(w.active);
+        }
+    }
+
     pub fn get(&self, key: &str) -> Option<&World> {
         self.worlds.get(key)
     }

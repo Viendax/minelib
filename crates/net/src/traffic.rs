@@ -198,7 +198,11 @@ mod tests {
             ),
             "Skin"
         );
-        assert_eq!(s.last(), Some(&"Moved"));
+        assert_eq!(s.last(), Some(&"WorldsForgotten"));
+        assert_eq!(
+            name_of(s, &resp(Response::WorldsForgotten { worlds: vec![] })),
+            "WorldsForgotten"
+        );
         assert_eq!(
             name_of(
                 s,

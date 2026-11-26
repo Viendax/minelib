@@ -433,6 +433,9 @@ pub enum Event {
     /// ligne à mettre dans la commande d'installation d'un passeur sans joueur
     /// (`minelib_p2p::invitation`), ou le secret seul si le relais n'a pas de nœud iroh.
     PasseurInvitation(String),
+    /// (v349) Mondes endormis que le relais a oubliés pour faire de la place, dont ce compte
+    /// est le créateur ou garde le dernier état : sa copie peut devenir un monde solo.
+    WorldsForgotten(Vec<proto::ForgottenWorld>),
     /// (v344) Réponse à `SERVER_RESPAWN` : un placement (`BuildSpawn`) suit, ou non (point
     /// d'apparition du monde : tout de suite). Rien au tchat.
     RespawnReply {
@@ -1615,6 +1618,10 @@ impl Worker {
             }
             Response::NetLogWanted { on } => {
                 self.relay_logs = on;
+                return;
+            }
+            Response::WorldsForgotten { worlds } => {
+                self.emit(Event::WorldsForgotten(worlds));
                 return;
             }
             Response::PasseursKnown { n } => {

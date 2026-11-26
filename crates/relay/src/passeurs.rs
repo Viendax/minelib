@@ -979,6 +979,8 @@ pub(crate) fn greet(st: &mut State, id: u64) {
             }
         }
         super::journaux::tell(st, id);
+        // (v349) Ses mondes oubliés pour faire de la place.
+        super::place::tell(st, id);
     }
 }
 
