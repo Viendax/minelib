@@ -93,7 +93,14 @@ use serde::{Deserialize, Serialize};
 /// recopie alors le compte comme avant, sans sa double authentification).
 /// (v349, toujours 75) `Response::WorldsForgotten` (poussé seulement aux jeux de la v349 ou
 /// après).
+/// (v350, toujours 75) `Response::RelayLevel` (poussé aux jeux de la v350 ou après) et
+/// `Request::WakeKept` (envoyé seulement à un relais qui a dit son niveau).
 pub const PROTOCOL: u32 = 75;
+
+/// (v350) Ce que sait faire un relais, dit aux jeux (`Response::RelayLevel`) : 350, il garde
+/// les mondes endormis et les rouvre sans le PC de personne (`Request::WakeKept`). Un relais
+/// qui ne dit rien est d'avant.
+pub const RELAY_LEVEL: u32 = 350;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
 /// monde ne s'ouvre qu'en supprimant son plus ancien monde endormi, ce que le joueur
@@ -1117,6 +1124,12 @@ pub enum Request {
         totp: Vec<u8>,
         code: u32,
         devices: Vec<[u8; 32]>,
+    },
+    /// (v350) Réveille un monde endormi depuis la copie qu'en garde le relais
+    /// (`RELAY_LEVEL`), sans copie sur ce PC : `Response::Joined`, comme pour le rejoindre.
+    /// Seulement à un relais qui a dit son niveau (un relais d'avant fermerait la connexion).
+    WakeKept {
+        world: String,
     },
 }
 
@@ -2149,6 +2162,11 @@ pub enum Response {
     /// 30 jours), dont ce compte est le créateur ou garde le dernier état.
     WorldsForgotten {
         worlds: Vec<ForgottenWorld>,
+    },
+    /// (v350) Poussé à l'entrée d'un jeu de la v350 ou après : ce que sait faire ce relais
+    /// (`RELAY_LEVEL`).
+    RelayLevel {
+        level: u32,
     },
 }
 

@@ -46,11 +46,14 @@ Il est joignable sans port ouvert (iroh). Options :
 - `--no-dht` : ne pas s'inscrire dans le DHT ;
 - (v345) `--admin <pseudo>` : ce compte administre le relais (bannir pour triche). L'option
   peut être donnée plusieurs fois.
-- (v349) `--place-mondes <Mo>` : la place des mondes (256 Mo par défaut). Le relais ne garde
-  pas leurs blocs : leur entrée dans la liste, leurs réglages et les sacs des joueurs, de
-  l'ordre de 100 octets à quelques Ko par monde. Au-delà, il oublie des mondes endormis où
-  personne n'a joué depuis au moins 30 jours, le moins récemment actif d'abord ; leur
-  créateur et celui qui en garde le dernier état gardent leur copie, en monde solo.
+- (v349) `--place-mondes <Mo>` : la place des mondes (1 000 Mo par défaut) : leur entrée dans
+  la liste, leurs réglages, les sacs des joueurs, et (v350) la copie des mondes endormis (leur
+  carte et ce qui y a été fait), qui permet à tout joueur de les réveiller sans le PC de
+  personne. Au-delà, il lâche d'abord les copies des mondes endormis où personne n'a joué
+  depuis au moins 30 jours, le moins récemment actif d'abord, puis, s'il le faut, ces mondes
+  eux-mêmes ; leur créateur et celui qui en garde le dernier état gardent leur copie, en
+  monde solo. Les cartes d'avant (une par ouverture d'un monde) que plus rien ne demande sont
+  effacées.
 
 **Un passeur sans joueur :**
 

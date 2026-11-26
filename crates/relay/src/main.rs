@@ -20,10 +20,11 @@
 //! `--admin <pseudo>` (relais) : ce compte administre le relais (`admins.txt`, plusieurs fois
 //! possible) : bannir pour triche.
 //!
-//! (v349) `--place-mondes <Mo>` (relais, 256 par défaut) : la place des mondes (registre,
-//! réglages, sacs ; le relais ne garde pas leurs blocs). Au-delà, des mondes endormis depuis
-//! au moins 30 jours sont oubliés, le moins récemment actif d'abord ; leur créateur et leur
-//! gardien l'apprennent à leur prochaine connexion et gardent leur copie, en monde solo.
+//! (v349) `--place-mondes <Mo>` (relais, 1 000 par défaut) : la place des mondes (registre,
+//! réglages, sacs, et (v350) copies des mondes endormis avec leur carte). Au-delà, les copies
+//! des mondes endormis depuis au moins 30 jours partent d'abord, le moins récemment actif
+//! d'abord, puis ces mondes eux-mêmes ; leur créateur et leur gardien l'apprennent à leur
+//! prochaine connexion et gardent leur copie, en monde solo.
 //!
 //! (v347) Un passeur envoie ses lignes de journal réseau aux relais qui les demandent
 //! (`minelib_net::netlog` : ni pseudo, ni adresse, ni nœud), comme un jeu dont le joueur l'a
@@ -80,7 +81,7 @@ fn main() -> Result<()> {
             "--name" => cfg.name = v,
             // (v345) Administrateur du relais (`admins.txt`).
             "--admin" => admins.push(v),
-            // (v349) Place des mondes, en Mo (256 par défaut) : au-delà, des mondes endormis
+            // (v349) Place des mondes, en Mo (1 000 par défaut) : au-delà, des mondes endormis
             // depuis au moins 30 jours sont oubliés, le moins récemment actif d'abord.
             "--place-mondes" => match v.parse::<u64>() {
                 Ok(mb) if mb > 0 => minelib_relay::set_world_space(mb * 1_000_000),

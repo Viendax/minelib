@@ -370,6 +370,50 @@ impl Store {
             .collect()
     }
 
+    /// (v350) Taille de cette carte sur le disque (0 : pas ici).
+    pub fn size_of(&self, sig: &[u8; 32]) -> u64 {
+        self.index.get(sig).map_or(0, |m| m.size)
+    }
+
+    /// (v350) Les cartes qui ne servent plus : ni carte FPS, ni carte d'une partie ou d'un
+    /// monde ouverts, ni celle d'un monde gardé (`keep`), et reçues il y a plus de `age`. Ce
+    /// sont les cartes d'avant des mondes de construction : chaque ouverture en envoie une
+    /// nouvelle. Supprimées ; rend combien et leurs octets.
+    pub fn sweep(
+        &mut self,
+        keep: &std::collections::HashSet<[u8; 32]>,
+        age: std::time::Duration,
+    ) -> (usize, u64) {
+        let old = |sig: &[u8; 32]| {
+            std::fs::metadata(self.dir.join(file(sig)))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|e| e >= age)
+        };
+        let gone: Vec<[u8; 32]> = self
+            .index
+            .keys()
+            .filter(|s| {
+                !self.fps.contains(*s) && !keep.contains(*s) && !self.uploads.contains_key(*s)
+            })
+            .filter(|s| old(s))
+            .copied()
+            .collect();
+        let mut bytes = 0;
+        for sig in &gone {
+            if let Some(m) = self.index.remove(sig) {
+                bytes += m.size;
+            }
+            let _ = std::fs::remove_file(self.dir.join(file(sig)));
+            self.notes.remove(sig);
+        }
+        if !gone.is_empty() {
+            self.save_index();
+        }
+        (gone.len(), bytes)
+    }
+
     /// Un jeu se déconnecte : ses envois en cours sont abandonnés.
     pub fn forget(&mut self, from: u64) {
         self.uploads.retain(|_, u| u.0 != from);

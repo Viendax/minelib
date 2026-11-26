@@ -163,6 +163,9 @@ pub enum Cmd {
     RoomStarted(bool),
     RoomPaused(bool),
     Join(u64),
+    /// (v350) Réveille un monde endormi depuis la copie du relais (sa clé) : seulement si le
+    /// relais a dit son niveau (`Event::RelayLevel`, `proto::RELAY_LEVEL`).
+    WakeKept(String),
     Leave,
     /// Cherche une partie FPS sur cette carte (ou en ouvre une).
     Search {
@@ -436,6 +439,8 @@ pub enum Event {
     /// (v349) Mondes endormis que le relais a oubliés pour faire de la place, dont ce compte
     /// est le créateur ou garde le dernier état : sa copie peut devenir un monde solo.
     WorldsForgotten(Vec<proto::ForgottenWorld>),
+    /// (v350) Ce que sait faire le relais connecté (`proto::RELAY_LEVEL`).
+    RelayLevel(u32),
     /// (v344) Réponse à `SERVER_RESPAWN` : un placement (`BuildSpawn`) suit, ou non (point
     /// d'apparition du monde : tout de suite). Rien au tchat.
     RespawnReply {
@@ -1624,6 +1629,10 @@ impl Worker {
                 self.emit(Event::WorldsForgotten(worlds));
                 return;
             }
+            Response::RelayLevel { level } => {
+                self.emit(Event::RelayLevel(level));
+                return;
+            }
             Response::PasseursKnown { n } => {
                 self.relay_passeurs = n > 0;
                 if n > 0 {
@@ -2049,7 +2058,7 @@ impl Worker {
         // On change de partie : la voie rapide de la précédente se ferme.
         if matches!(
             cmd,
-            Cmd::Host { .. } | Cmd::Join(_) | Cmd::Search { .. } | Cmd::Leave
+            Cmd::Host { .. } | Cmd::Join(_) | Cmd::WakeKept(_) | Cmd::Search { .. } | Cmd::Leave
         ) {
             self.close_fast();
         }
@@ -2631,6 +2640,29 @@ impl Worker {
             },
             Cmd::RoomPaused(paused) => match self.request(&Request::RoomPaused { paused })? {
                 Response::Done => Ok(()),
+                r => self.unexpected(r),
+            },
+            // (v350) Comme rejoindre : le relais rouvre le monde avec sa copie, on en est
+            // l'hôte, et le jeu télécharge la carte.
+            Cmd::WakeKept(world) => match self.request(&Request::WakeKept { world })? {
+                Response::Joined {
+                    room,
+                    host,
+                    map,
+                    map_sig,
+                    world,
+                    terrain,
+                } => {
+                    self.emit_world(world);
+                    self.emit(Event::WorldTerrain(terrain));
+                    self.emit(Event::Joined {
+                        room,
+                        host,
+                        map,
+                        map_sig,
+                    });
+                    Ok(())
+                }
                 r => self.unexpected(r),
             },
             Cmd::Join(room) => match self.request(&Request::Join { room })? {

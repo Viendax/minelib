@@ -160,8 +160,8 @@ pub struct Options {
     /// partagent, dans `journaux_reseau.txt` (paramètres avancés). `recevoir_journaux=true`.
     pub receive_netlogs: bool,
     /// (v349) Quand ce PC est le relais : la place de ses mondes, en Mo (registre, réglages,
-    /// sacs ; il ne garde pas leurs blocs). Au-delà, des mondes endormis depuis au moins
-    /// 30 jours sont oubliés. `place_mondes_mo=256`.
+    /// sacs, et (v350) copies des mondes endormis). Au-delà, des mondes endormis depuis au moins
+    /// 30 jours sont oubliés. `place_mondes_mo=1000` (v350 ; 256 en v349).
     pub world_space_mb: u32,
     /// (v308) Ce jeu sert-il de passeur (il porte des paquets chiffrés d'autres joueurs, et
     /// montre son adresse IP à ceux à qui il les remet) ? Rien : pas encore demandé (la
@@ -218,7 +218,7 @@ impl Default for Options {
             invitation: String::new(),
             share_netlog: None,
             receive_netlogs: false,
-            world_space_mb: 256,
+            world_space_mb: 1000,
             passeur: None,
             relay_key: String::new(),
             pseudo: String::new(),

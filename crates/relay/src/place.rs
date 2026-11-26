@@ -1,17 +1,20 @@
 //! (v349) La place des mondes sur ce relais.
 //!
-//! Le relais ne garde pas les blocs d'un monde : le jeu de celui qui en garde le dernier état
-//! les a. Il garde, pour chaque monde ouvert ou endormi, son entrée au registre (`mondes`),
+//! Le relais garde, pour chaque monde ouvert ou endormi, son entrée au registre (`mondes`),
 //! ses réglages (`servers` : OP, bannis, liste blanche, heure, météo, point d'apparition,
-//! positions des joueurs, graine et clé de terrain) et les sacs de ses joueurs en survie
-//! (`bags`). Tout cela tient dans `place()` : `minelib-relay --place-mondes <Mo>`, ou
-//! `place_mondes_mo=` dans les options du jeu qui tient le relais ; 256 Mo par défaut.
+//! positions des joueurs, graine et clé de terrain), les sacs de ses joueurs en survie
+//! (`bags`) et, (v350) endormi, sa copie (`gardes` : sa carte et tout ce qui y a été fait).
+//! Tout cela tient dans `place()` : `minelib-relay --place-mondes <Mo>`, ou `place_mondes_mo=`
+//! dans les options du jeu qui tient le relais ; (v350) 1 Go par défaut (256 Mo en v349).
 //!
-//! Quand ça dépasse, le relais oublie des mondes endormis où personne n'a joué depuis au moins
-//! `IDLE_MIN_DAYS` jours, le moins récemment actif d'abord, jusqu'à ce que ça tienne. Tant
-//! qu'il y a de la place, ils restent, aussi longtemps qu'il faut : seuls les nouveaux mondes
-//! qui arrivent en poussent dehors. Un monde joué depuis moins longtemps n'est jamais oublié ;
-//! si ces mondes-là ne tiennent pas, le journal le dit.
+//! Quand ça dépasse, le relais lâche d'abord les copies de mondes endormis où personne n'a
+//! joué depuis au moins `IDLE_MIN_DAYS` jours, le moins récemment actif d'abord, jusqu'à ce que
+//! ça tienne : ces mondes-là ne se réveillent plus que depuis le PC de celui qui en garde le
+//! dernier état. S'il le faut encore, il oublie ces mondes eux-mêmes. Tant qu'il y a de la
+//! place, tout reste, aussi longtemps qu'il faut : seuls les nouveaux mondes qui arrivent
+//! poussent les anciens dehors. Un monde joué depuis moins longtemps n'est jamais touché ; si
+//! ces mondes-là ne tiennent pas, le journal le dit. (v350) Les cartes d'avant des mondes (une
+//! par ouverture) que plus rien ne demande sont effacées à chaque fois.
 //!
 //! Un monde oublié ne disparaît pas pour ceux qui y ont joué : son créateur et celui qui en
 //! garde le dernier état l'apprennent à leur prochaine connexion (`Response::WorldsForgotten`,
@@ -28,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::{mondes, transport, State};
 
 /// Place donnée aux mondes par défaut (octets).
-pub const DEFAULT_PLACE: u64 = 256 * 1_000_000;
+pub const DEFAULT_PLACE: u64 = 1_000 * 1_000_000;
 /// Un monde endormi n'est oublié qu'après tant de jours sans joueurs.
 pub const IDLE_MIN_DAYS: u64 = 30;
 /// La place est regardée au plus toutes les…
@@ -137,7 +140,37 @@ impl Store {
 
 /// Ce que le monde `key` prend chez ce relais (octets, à peu près : comme écrit sur le disque).
 pub(crate) fn bytes_of(st: &State, key: &str) -> u64 {
-    st.worlds.bytes_of(key) + st.servers.bytes_of(key) + st.bags.bytes_of(key)
+    st.worlds.bytes_of(key) + st.servers.bytes_of(key) + st.bags.bytes_of(key) + kept_bytes(st, key)
+}
+
+/// (v350) Ce que prend la copie gardée du monde `key` : elle-même, et sa carte.
+fn kept_bytes(st: &State, key: &str) -> u64 {
+    st.kept
+        .meta(key)
+        .map_or(0, |m| m.size + st.maps.size_of(&m.map_sig))
+}
+
+/// (v350) Une carte reçue il y a moins de ce temps n'est jamais effacée (un monde est peut-être
+/// en train de s'ouvrir avec elle).
+const MAP_GRACE: Duration = Duration::from_secs(24 * 3600);
+
+/// (v350) Efface les cartes que plus rien ne demande : ni carte FPS, ni celle d'une partie ou
+/// d'un monde ouverts, ni celle d'un monde gardé.
+pub(crate) fn sweep_maps(st: &mut State) -> (usize, u64) {
+    let keep: std::collections::HashSet<[u8; 32]> = st
+        .rooms
+        .values()
+        .map(|r| r.map_sig)
+        .chain(st.kept.map_sigs())
+        .collect();
+    let (n, bytes) = st.maps.sweep(&keep, MAP_GRACE);
+    if n > 0 {
+        log::info!(
+            "place des mondes : {n} cartes d'avant effacées ({:.1} Mo), plus rien ne les demandait",
+            bytes as f64 / 1e6
+        );
+    }
+    (n, bytes)
 }
 
 /// À chaque entretien : une fois par heure, la place.
@@ -146,6 +179,7 @@ pub(crate) fn upkeep(st: &mut State) {
         return;
     }
     st.place_checked = Instant::now();
+    sweep_maps(st);
     free(st, mondes::now());
 }
 
@@ -173,30 +207,50 @@ pub(crate) fn free_to(st: &mut State, now: u64, budget: u64) -> Vec<String> {
     if used <= budget {
         return Vec::new();
     }
-    let open: std::collections::HashSet<&str> = st
+    let open: std::collections::HashSet<String> = st
         .rooms
         .values()
         .filter(|r| r.kind == 1)
-        .map(|r| r.server.as_str())
+        .map(|r| r.server.clone())
         .collect();
     let mut old: Vec<&(String, u64, bool, u64)> = sizes
         .iter()
         .filter(|(k, active, asleep, _)| {
-            *asleep
-                && !open.contains(k.as_str())
-                && now.saturating_sub(*active) >= IDLE_MIN_DAYS * 86_400
+            *asleep && !open.contains(k) && now.saturating_sub(*active) >= IDLE_MIN_DAYS * 86_400
         })
         .collect();
     old.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    // (v350) D'abord les copies gardées : le monde reste dans la liste, et celui qui en garde
+    // le dernier état peut toujours le réveiller depuis son PC.
+    let mut lighter = 0usize;
+    for (k, _, _, _) in &old {
+        if used <= budget {
+            break;
+        }
+        let b = kept_bytes(st, k);
+        if b > 0 {
+            used = used.saturating_sub(b);
+            st.kept.drop(k);
+            lighter += 1;
+        }
+    }
+    if lighter > 0 {
+        log::info!(
+            "place des mondes : copies de {lighter} mondes endormis lâchées (personne n'y avait \
+             joué depuis {IDLE_MIN_DAYS} jours ou plus) ; ils se réveillent encore depuis le PC \
+             de leur gardien"
+        );
+        sweep_maps(st);
+    }
     let mut gone = Vec::new();
     for (k, _, _, b) in old {
         if used <= budget {
             break;
         }
-        used = used.saturating_sub(*b);
+        let b = b.saturating_sub(kept_bytes(st, k));
+        used = used.saturating_sub(b);
         gone.push(k.clone());
     }
-    drop(open);
     forget(st, &gone, now);
     if used > budget {
         log::warn!(
@@ -241,6 +295,7 @@ fn forget(st: &mut State, keys: &[String], now: u64) {
     st.servers.forget_many(keys);
     for k in keys {
         st.bags.forget(k);
+        st.kept.drop(k);
     }
     log::info!(
         "place des mondes : {} mondes endormis oubliés (personne n'y avait joué depuis {} à {} \
@@ -252,11 +307,20 @@ fn forget(st: &mut State, keys: &[String], now: u64) {
 }
 
 /// Une connexion vient d'entrer : les mondes oubliés dont son compte est le créateur ou le
-/// gardien lui sont dits (une fois), si son jeu sait les lire.
+/// gardien lui sont dits (une fois), si son jeu sait les lire. (v350) Et ce que sait faire ce
+/// relais (`proto::RELAY_LEVEL`), à un jeu qui sait le lire.
 pub(crate) fn tell(st: &mut State, id: u64) {
     let Some(c) = st.conns.get(&id) else {
         return;
     };
+    if c.version >= proto::RELAY_LEVEL {
+        transport::push(
+            &c.tx,
+            &Response::RelayLevel {
+                level: proto::RELAY_LEVEL,
+            },
+        );
+    }
     if c.version < TOLD_FROM_VERSION || c.garant_only {
         return;
     }

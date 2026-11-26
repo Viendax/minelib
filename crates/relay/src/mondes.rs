@@ -3,11 +3,11 @@
 //! Un monde ne disparaît plus de la liste quand son dernier joueur s'en va : il
 //! **s'endort**. Le relais garde, dans `mondes.bin`, son nom, son créateur, son record de
 //! joueurs, la date de sa dernière activité, et le pseudo de celui qui en garde le dernier
-//! état : le dernier propriétaire, dont le jeu a enregistré le monde en partant (le relais,
-//! lui, ne garde pas les blocs d'un monde). Quand ce joueur, ou le créateur, rouvre le
-//! monde, il se réveille sous la même identité (mêmes OP, mêmes bannis, même liste
-//! blanche). Tant qu'aucun des deux n'est revenu, personne ne peut y entrer : il n'y a
-//! nulle part d'où prendre ses blocs.
+//! état : le dernier propriétaire, dont le jeu a enregistré le monde en partant. Quand ce
+//! joueur, ou le créateur, rouvre le monde, il se réveille sous la même identité (mêmes OP,
+//! mêmes bannis, même liste blanche). Avant la v350, le relais ne gardait pas ses blocs : tant
+//! qu'aucun des deux n'était revenu, personne ne pouvait y entrer. (v350) Le relais en garde
+//! maintenant une copie (`gardes`), d'où tout joueur qui peut y entrer le réveille.
 //!
 //! Le registre sert aussi à la liste des mondes (record, dernière activité), et à ne pas
 //! laisser un compte ouvrir des mondes en rafale (`Store::may_open`).

@@ -10,6 +10,7 @@ mod accounts;
 mod bags;
 mod confiance;
 mod contacts;
+mod gardes;
 mod guards;
 mod hardware;
 mod invites;
@@ -1517,6 +1518,8 @@ struct State {
     /// gardien ; et la dernière fois que la place a été regardée (`place`).
     forgotten: place::Store,
     place_checked: Instant,
+    /// (v350) Mondes endormis gardés ici, à rouvrir sans le PC de personne (`gardes`).
+    kept: gardes::Store,
     servers: servers::Store,
     /// (v311) Mondes de construction connus de ce relais, ouverts ou endormis (`mondes`).
     worlds: mondes::Store,
@@ -1679,6 +1682,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         skin_no_ip: (SKIN_NO_IP_BURST, Instant::now()),
         skin_later: (0, 0, Instant::now()),
         forgotten: place::Store::open(cfg_dir.join("mondes_oublies.bin")),
+        kept: gardes::Store::open(cfg_dir.join("mondes_gardes")),
         // (Regardée une première fois une minute après le démarrage.)
         place_checked: Instant::now()
             .checked_sub(Duration::from_secs(3540))
@@ -2324,6 +2328,23 @@ fn leave_room(st: &mut State, id: u64) {
         // province : son monde ne dort pas, il vit au relais de son pays.
         if room.kind == 1 && room.province.is_none() {
             st.worlds.asleep(&room.server, &room.host_pseudo);
+            // (v350) Le relais en garde de quoi le rouvrir sans le PC de personne : sa carte
+            // (ici depuis son ouverture) et tout ce qui y a été fait.
+            if st.maps.has(&room.map_sig) {
+                let info = gardes::Info {
+                    name: room.name.clone(),
+                    map: room.map.clone(),
+                    map_sig: room.map_sig,
+                    max_players: room.max_players,
+                    creator: room.creator.clone(),
+                    server: room.server.clone(),
+                };
+                let entries = room.build.export_entries();
+                let n = entries.len();
+                if st.kept.save(info, entries, mondes::now()) {
+                    log::info!("monde endormi gardé par le relais ({n} entrées)");
+                }
+            }
         }
         settle_absences(st, &mut room, &[]);
         for m in room.members {
@@ -4724,8 +4745,9 @@ fn delete_world(st: &mut State, rid: u64, creator: u64, key: &str) {
     }
     st.worlds.delete(key);
     st.servers.forget(key);
-    // (v349) Ses sacs aussi.
+    // (v349) Ses sacs aussi. (v350) Et la copie qu'en gardait le relais.
     st.bags.forget(key);
+    st.kept.drop(key);
 }
 
 /// (v311) Le registre des mondes suit ce qui s'y passe : joueurs présents (record,
@@ -7065,6 +7087,103 @@ fn skin_path(dir: &Path, pseudo: &str) -> PathBuf {
         .join(format!("{}.png", crypto::hex(&h[..12])))
 }
 
+/// (v350) Réveil d'un monde endormi depuis la copie qu'en garde le relais (`gardes`), par
+/// n'importe quel joueur qui peut y entrer : il en devient l'hôte, comme le premier joueur
+/// d'un monde repris par un relais de secours, et son jeu télécharge la carte. Déjà réveillé
+/// par un autre : on le rejoint.
+fn wake_kept(st: &mut State, id: u64, pseudo: &str, key: &str) -> Response {
+    let open = st
+        .rooms
+        .iter()
+        .find(|(_, r)| r.kind == 1 && r.province.is_none() && r.server == key)
+        .map(|(&rid, _)| rid);
+    if let Some(rid) = open {
+        return join_room(st, id, pseudo, rid);
+    }
+    let Some(w) = st.worlds.get(key).filter(|w| w.asleep.is_some()).cloned() else {
+        return err(
+            ErrorCode::Refused,
+            "Ce monde n'est plus dans la liste (supprimé, ou oublié pour faire de la place).",
+        );
+    };
+    let sig = st.kept.meta(key).map(|m| m.map_sig);
+    if !sig.is_some_and(|s| st.maps.has(&s)) {
+        let who = if w.keeper.is_empty() || w.keeper.eq_ignore_ascii_case(&w.creator) {
+            w.creator.clone()
+        } else {
+            format!("{} ou {}", w.keeper, w.creator)
+        };
+        return err(
+            ErrorCode::Refused,
+            format!(
+                "Ce relais n'a pas gardé ce monde : {who} peut le réveiller depuis son PC \
+                 (son créateur : « Réveiller » encore, avec sa copie)."
+            ),
+        );
+    }
+    if st.servers.whitelisted_out(key, &w.creator, pseudo) {
+        return err(
+            ErrorCode::Refused,
+            "Ce serveur est sur liste blanche : demande à un OP de t'y ajouter.",
+        );
+    }
+    if let Some(why) = st.servers.banned(key, pseudo) {
+        let why = if why.is_empty() {
+            String::new()
+        } else {
+            format!(" ({why})")
+        };
+        return err(
+            ErrorCode::Refused,
+            format!("Tu es banni de ce serveur{why}."),
+        );
+    }
+    if let Some(wait) = st.worlds.open_wait(pseudo) {
+        return err(
+            ErrorCode::Refused,
+            format!("Trop de parties ouvertes coup sur coup : réessaie dans {wait} s."),
+        );
+    }
+    let Some((info, entries)) = st.kept.take(key) else {
+        return err(ErrorCode::Internal, "La copie de ce monde est illisible.");
+    };
+    st.worlds.note_open(pseudo);
+    let rid = open_room(
+        st,
+        id,
+        pseudo,
+        1,
+        info.name.clone(),
+        info.map.clone(),
+        info.map_sig,
+        u16::try_from(info.max_players).unwrap_or(u16::MAX),
+        Some((info.creator.clone(), info.server.clone())),
+    );
+    if let Some(room) = st.rooms.get_mut(&rid) {
+        for (zone, seq, data) in &entries {
+            room.build.mirror_at(*zone, data, Some(*seq), &[]);
+            // Objets au sol et coffres : retrouvés à partir des états publiés.
+            if let Some(m) = game::decode::<game::BuildMsg>(data) {
+                room.build.items.absorb(&m);
+            }
+        }
+    }
+    log::info!(
+        "monde « {} » réveillé depuis la copie du relais ({} entrées, partie {rid})",
+        info.name,
+        entries.len()
+    );
+    let terrain = st.servers.world_seed(&info.server).terrain;
+    Response::Joined {
+        room: rid,
+        host: pseudo.to_string(),
+        map: info.map,
+        map_sig: info.map_sig,
+        world: info.server,
+        terrain,
+    }
+}
+
 /// (v347) Skins qu'une connexion peut demander par seconde (v348 : le jeu en demande 16 au
 /// plus, 16 d'un coup) ; au-delà : « plus tard » (`proto::SKIN_LATER`).
 const SKIN_RATE: u32 = 64;
@@ -7544,7 +7663,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // chaque monde en ligne a sa propre copie, qui ne suit plus le monde solo.
             let ident = if kind == 1 && !wake.is_empty() {
                 match st.worlds.wake(&wake, pseudo) {
-                    Some(creator) => Some((creator, wake)),
+                    // (v350) Rouvert depuis la copie de son PC : celle du relais ne sert plus.
+                    Some(creator) => {
+                        st.kept.drop(&wake);
+                        Some((creator, wake))
+                    }
                     None => {
                         return Some(err(
                             ErrorCode::Refused,
@@ -7582,6 +7705,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 st.worlds.delete(&old);
                 st.servers.forget(&old);
                 st.bags.forget(&old);
+                st.kept.drop(&old);
                 log::info!("monde endormi supprimé par son créateur pour en ouvrir un autre");
             }
             st.worlds.note_open(pseudo);
@@ -7831,6 +7955,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             Response::Done
         }
         Request::SkinGet { pseudo: who } => skin_get(st, id, who),
+        Request::WakeKept { world } => wake_kept(st, id, pseudo, &world),
         Request::Report { pseudo: target } => {
             let Some(room) = my_room.and_then(|r| st.rooms.get(&r)) else {
                 return Some(err(
@@ -9984,6 +10109,7 @@ fn handle_locked(
             | Request::Party { .. }
             | Request::SkinPut { .. }
             | Request::SkinGet { .. }
+            | Request::WakeKept { .. }
             | Request::Maps
             | Request::MapPut { .. }
             | Request::MapGet { .. }
@@ -11896,6 +12022,175 @@ mod tests {
             assert!(seen.iter().all(|w| w.seed == 0 && w.terrain >= 2000));
             // Les deux le savent : plus rien n'est gardé d'eux.
             assert!(st.forgotten.list().is_empty());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v350) « Que je puisse quand même le rejoindre sans que mon PC ou celui d'Haumax ait la
+    /// carte » : quand son dernier joueur s'en va, le relais garde le monde (sa carte et tout
+    /// ce qui y a été fait). N'importe quel joueur qui peut y entrer le réveille alors depuis
+    /// la liste, sans copie sur son PC : il en devient l'hôte, avec tout l'historique ; un
+    /// autre qui arrive le rejoint. La liste blanche et un monde que le relais n'a pas gardé
+    /// disent non. La copie compte dans la place des mondes, et part la première quand il en
+    /// faut ; la carte qu'elle demandait aussi, une fois que plus rien ne la demande.
+    #[test]
+    fn the_relay_keeps_sleeping_worlds_so_anyone_can_wake_them() {
+        let (h, dir) = crowd_world("mondes_gardes");
+        {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            // La carte du monde, envoyée à son ouverture.
+            let package = game::MapPackage {
+                seed: 0,
+                generator: "procedural2".into(),
+                edits: vec![1; 140],
+                chunks: Vec::new(),
+                torches: Vec::new(),
+                fps: Default::default(),
+            };
+            let bytes = package.to_bytes();
+            let sig = game::signature(&bytes);
+            assert!(matches!(
+                st.maps
+                    .put(0, "Proprio", sig, "monde", 0, bytes.len() as u64, &bytes),
+                maps::Put::Complete
+            ));
+            let owner = crowd.conn(st, "Proprio", false);
+            let rid = match crowd.ask(
+                st,
+                owner,
+                Request::Host {
+                    kind: 1,
+                    name: "Monde gardé".into(),
+                    map: "monde".into(),
+                    map_sig: sig,
+                    max_players: 0,
+                    wake: String::new(),
+                    replace: String::new(),
+                    code: None,
+                    seed: 0,
+                    terrain: 77,
+                },
+            ) {
+                Some(Response::Hosted { room, .. }) => room,
+                r => panic!("{r:?}"),
+            };
+            let key = st.rooms[&rid].server.clone();
+            // Ce qui y est construit.
+            let built: Vec<zones::Entry> = (0..6u8)
+                .map(|i| ([i32::from(i % 2), 0], 0, vec![i, 7, 7]))
+                .collect();
+            for (zone, _, data) in &built {
+                st.rooms
+                    .get_mut(&rid)
+                    .unwrap()
+                    .build
+                    .mirror_to(*zone, data, &[]);
+            }
+            let sorted = |mut v: Vec<zones::Entry>| {
+                v.sort();
+                v.into_iter().map(|(z, _, d)| (z, d)).collect::<Vec<_>>()
+            };
+            let before = sorted(st.rooms[&rid].build.export_entries());
+            assert_eq!(before.len(), 6);
+            leave_room(st, owner);
+            assert!(st.worlds.get(&key).is_some_and(|w| w.asleep.is_some()));
+            assert!(st.kept.meta(&key).is_some(), "gardé par le relais");
+            assert!(place::bytes_of(st, &key) > bytes.len() as u64);
+            // Un joueur qui n'en est ni le créateur ni le gardien le réveille.
+            let visitor = crowd.conn(st, "Visiteur", false);
+            let room = match crowd.ask(st, visitor, Request::WakeKept { world: key.clone() }) {
+                Some(Response::Joined {
+                    room,
+                    host,
+                    map_sig,
+                    world,
+                    terrain,
+                    ..
+                }) => {
+                    assert_eq!(
+                        (host.as_str(), map_sig, world.as_str()),
+                        ("Visiteur", sig, key.as_str())
+                    );
+                    assert_eq!(terrain, 77);
+                    room
+                }
+                r => panic!("{r:?}"),
+            };
+            assert_eq!(sorted(st.rooms[&room].build.export_entries()), before);
+            assert!(st.kept.meta(&key).is_none(), "rouvert : la copie a servi");
+            assert!(st.worlds.get(&key).is_some_and(|w| w.asleep.is_none()));
+            // Un autre arrive pendant qu'il est ouvert : il le rejoint.
+            let late = crowd.conn(st, "Tardif", false);
+            assert!(matches!(
+                crowd.ask(st, late, Request::WakeKept { world: key.clone() }),
+                Some(Response::Joined { room: r, .. }) if r == room
+            ));
+            leave_room(st, late);
+            leave_room(st, visitor);
+            assert!(st.kept.meta(&key).is_some(), "gardé de nouveau");
+            // Liste blanche : seuls ceux qui y sont.
+            assert!(st.servers.whitelist_first(&key));
+            let out = crowd.conn(st, "Inconnu", false);
+            assert!(matches!(
+                crowd.ask(st, out, Request::WakeKept { world: key.clone() }),
+                Some(Response::Error { .. })
+            ));
+            // Pas gardé : on le dit, et qui peut le réveiller depuis son PC.
+            st.kept.drop(&key);
+            let creator = crowd.conn(st, "Proprio", false);
+            match crowd.ask(st, creator, Request::WakeKept { world: key.clone() }) {
+                Some(Response::Error { message, .. }) => {
+                    assert!(
+                        message.starts_with("Ce relais n'a pas gardé ce monde"),
+                        "{message}"
+                    )
+                }
+                r => panic!("{r:?}"),
+            }
+            // La place : la copie part la première, puis sa carte, que plus rien ne demande.
+            leave_room(st, creator);
+            st.kept.save(
+                gardes::Info {
+                    name: "Monde gardé".into(),
+                    map: "monde".into(),
+                    map_sig: sig,
+                    max_players: 0,
+                    creator: "Proprio".into(),
+                    server: key.clone(),
+                },
+                built.clone(),
+                mondes::now(),
+            );
+            st.worlds.age(&key, 40, true);
+            let registry = st.worlds.bytes_of(&key);
+            assert!(
+                place::free_to(st, mondes::now(), registry + 64).is_empty(),
+                "pas oublié"
+            );
+            assert!(st.kept.meta(&key).is_none(), "sa copie est lâchée");
+            assert!(
+                st.worlds.get(&key).is_some(),
+                "le monde reste dans la liste"
+            );
+            // (Plus rien ne demande sa carte ; reçue il y a moins d'un jour, elle reste encore.)
+            assert!(st.maps.has(&sig));
+            assert_eq!(st.maps.sweep(&Default::default(), Duration::ZERO).0, 1);
+            assert!(!st.maps.has(&sig), "sa carte aussi");
+            // Un jeu de la v350 apprend ce que sait faire ce relais ; un jeu d'avant non.
+            let new = crowd.conn(st, "Récent", false);
+            st.conns.get_mut(&new).unwrap().version = 350;
+            place::tell(st, new);
+            assert!(crowd.got(new).0.iter().any(|r| matches!(
+                r,
+                Response::RelayLevel { level } if *level == proto::RELAY_LEVEL
+            )));
+            let old = crowd.conn(st, "Ancien", false);
+            st.conns.get_mut(&old).unwrap().version = 349;
+            place::tell(st, old);
+            assert!(crowd.got(old).0.is_empty());
         }
         drop(h);
         let _ = std::fs::remove_dir_all(dir);

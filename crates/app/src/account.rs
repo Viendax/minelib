@@ -510,6 +510,9 @@ pub struct Accounts {
     /// Relais joint (adresse, clé) et identifiants de la session : une deuxième connexion
     /// du compte peut y servir de garant pendant qu'on joue.
     relay_at: Option<(String, [u8; 32])>,
+    /// (v350) Ce que sait faire le relais connecté (`proto::RELAY_LEVEL` ; 0 : un relais
+    /// d'avant, ou qui ne l'a pas encore dit).
+    relay_level: u32,
     login_secret: Option<(String, String)>,
     /// Événements de partie (hôte, invité) à transmettre au jeu.
     pub game_events: Vec<Event>,
@@ -637,6 +640,7 @@ impl Accounts {
             link: None,
             identity: None,
             relay_at: None,
+            relay_level: 0,
             login_secret: None,
             game_events: Vec::new(),
             leaderboard: None,
@@ -1334,7 +1338,11 @@ impl Accounts {
                     self.game_events.push(Event::Error(m));
                 }
                 Event::Link(l) => self.link = Some(l),
-                Event::Relay { addr, key } => self.relay_at = Some((addr, key)),
+                Event::Relay { addr, key } => {
+                    self.relay_at = Some((addr, key));
+                    self.relay_level = 0;
+                }
+                Event::RelayLevel(level) => self.relay_level = level,
                 Event::AccountBackup { pseudo, vault } => {
                     let p = self.backup_path(&pseudo);
                     if let Some(d) = p.parent() {
@@ -1997,6 +2005,11 @@ impl Accounts {
     /// (v325) Le relais du monde où l'on est (le relais de secours qui l'a repris, sinon
     /// celui du compte), en hexadécimal : avec la clé du monde, ce qui désigne une copie en
     /// ligne (`online_copies`). Vide s'il n'est pas connu.
+    /// (v350) Le relais connecté garde-t-il les mondes endormis (`Cmd::WakeKept`) ?
+    pub fn relay_keeps_worlds(&self) -> bool {
+        self.relay_level >= minelib_net::proto::RELAY_LEVEL
+    }
+
     pub fn relay_hex(&self) -> String {
         self.world_at
             .as_ref()

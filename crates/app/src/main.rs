@@ -3340,6 +3340,28 @@ impl Game {
             self.notify("Ce monde dort sur un autre relais : réveille-le depuis ce relais.");
             return;
         }
+        // (v350) Le relais garde les mondes endormis : tout joueur qui peut y entrer le
+        // réveille depuis sa copie, sans copie sur ce PC (il en devient l'hôte, et le jeu
+        // télécharge la carte). Celui qui en garde le dernier état et en a la copie ici la
+        // prend, comme avant (c'est la même). Son créateur qui n'en a qu'une plus ancienne
+        // essaie d'abord celle du relais ; un deuxième clic prend la sienne.
+        let mine = keeper
+            .then(|| online_copies::find(&self.paths.root, &self.accounts.relay_hex(), &e.world))
+            .flatten();
+        let again = self
+            .wake_confirm
+            .as_ref()
+            .is_some_and(|(k, t)| *k == e.world && self.time - t < 8.0);
+        if self.accounts.relay_keeps_worlds() && mine.is_none() && !again {
+            if creator {
+                self.wake_confirm = Some((e.world.clone(), self.time));
+            }
+            log::info!("réveil du monde {} depuis la copie du relais", e.world);
+            self.notify(format!("Réveil de « {} »…", e.name));
+            self.accounts
+                .room(minelib_net::client::Cmd::WakeKept(e.world.clone()));
+            return;
+        }
         if !creator && !keeper {
             let who = if e.keeper.is_empty() || e.keeper.eq_ignore_ascii_case(&e.host) {
                 e.host.clone()
@@ -3658,8 +3680,11 @@ impl Game {
                 keeper: e.keeper.clone(),
                 can_wake: {
                     let me = self.accounts.pseudo();
+                    // (v350) Un relais qui garde les mondes endormis : tout joueur le
+                    // réveille (le relais dit non s'il n'y entre pas ou n'en a pas la copie).
                     !me.is_empty()
-                        && (e.creator.eq_ignore_ascii_case(&me)
+                        && (self.accounts.relay_keeps_worlds()
+                            || e.creator.eq_ignore_ascii_case(&me)
                             || e.host.eq_ignore_ascii_case(&me)
                             || e.keeper.eq_ignore_ascii_case(&me))
                 },
