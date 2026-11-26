@@ -2328,22 +2328,16 @@ fn leave_room(st: &mut State, id: u64) {
         // province : son monde ne dort pas, il vit au relais de son pays.
         if room.kind == 1 && room.province.is_none() {
             st.worlds.asleep(&room.server, &room.host_pseudo);
-            // (v350) Le relais en garde de quoi le rouvrir sans le PC de personne : sa carte
-            // (ici depuis son ouverture) et tout ce qui y a été fait.
+            // (v350) Sa copie gardée par le relais (sa carte est ici depuis son ouverture, et
+            // tout ce qui y a été fait, écrit au fil de l'eau) : close. Sans sa carte ici, elle
+            // ne servirait à rien.
+            let last = room.build.take_journal();
+            st.kept.append(&room.server, &last);
             if st.maps.has(&room.map_sig) {
-                let info = gardes::Info {
-                    name: room.name.clone(),
-                    map: room.map.clone(),
-                    map_sig: room.map_sig,
-                    max_players: room.max_players,
-                    creator: room.creator.clone(),
-                    server: room.server.clone(),
-                };
-                let entries = room.build.export_entries();
-                let n = entries.len();
-                if st.kept.save(info, entries, mondes::now()) {
-                    log::info!("monde endormi gardé par le relais ({n} entrées)");
-                }
+                st.kept.close(&room.server, mondes::now());
+                log::info!("monde endormi gardé par le relais");
+            } else {
+                st.kept.drop(&room.server);
             }
         }
         settle_absences(st, &mut room, &[]);
@@ -4481,6 +4475,7 @@ fn upkeep(st: &mut State) {
     upkeep_contacts(st);
     upkeep_build(st);
     upkeep_zeus(st);
+    flush_kept(st);
     place::upkeep(st);
     let rooms: Vec<u64> = st
         .rooms
@@ -5154,6 +5149,11 @@ fn take_over_join(st: &mut State, id: u64, pseudo: &str, key: [u8; 32]) -> Respo
             }
         }
         room.build = b;
+        // (v350) Le monde repris ici : ce relais en tient la copie à son tour.
+        room.build.set_journaling(true);
+        let entries = room.build.export_entries();
+        let info = kept_info(room);
+        st.kept.begin(&info, &entries, mondes::now());
     }
     log::info!(
         "relais de secours : monde « {} » repris (partie {rid})",
@@ -6806,10 +6806,44 @@ fn open_room(
         if !pseudo.is_empty() {
             let name = st.rooms.get(&rid).map(|r| r.name.clone()).unwrap_or_default();
             st.worlds.opened(&server, &name, &map, &creator, pseudo);
+            // (v350) Le relais en tient une copie au fil de l'eau (`gardes`).
+            if let Some(room) = st.rooms.get_mut(&rid) {
+                room.build.set_journaling(true);
+                let info = kept_info(room);
+                st.kept.begin(&info, &[], mondes::now());
+            }
         }
     }
     log::info!("partie {rid} ouverte par « {pseudo} »");
     rid
+}
+
+/// (v350) De quoi rouvrir ce monde (`gardes`).
+fn kept_info(room: &Room) -> gardes::Info {
+    gardes::Info {
+        name: room.name.clone(),
+        map: room.map.clone(),
+        map_sig: room.map_sig,
+        max_players: room.max_players,
+        creator: room.creator.clone(),
+        server: room.server.clone(),
+    }
+}
+
+/// (v350) À chaque entretien : ce qui vient d'être fait dans les mondes ouverts part dans leur
+/// copie gardée (`gardes`). Si le relais s'arrête d'un coup, il n'en manque que les dernières
+/// secondes.
+fn flush_kept(st: &mut State) {
+    let fresh: Vec<(String, Vec<zones::Entry>)> = st
+        .rooms
+        .values_mut()
+        .filter(|r| r.kind == 1 && r.province.is_none())
+        .map(|r| (r.server.clone(), r.build.take_journal()))
+        .filter(|(_, e)| !e.is_empty())
+        .collect();
+    for (key, entries) in fresh {
+        st.kept.append(&key, &entries);
+    }
 }
 
 /// Une seule partie FPS à la fois par machine (coupé pour les essais où tous les joueurs
@@ -7144,7 +7178,7 @@ fn wake_kept(st: &mut State, id: u64, pseudo: &str, key: &str) -> Response {
             format!("Trop de parties ouvertes coup sur coup : réessaie dans {wait} s."),
         );
     }
-    let Some((info, entries)) = st.kept.take(key) else {
+    let Some((info, entries)) = st.kept.read(key) else {
         return err(ErrorCode::Internal, "La copie de ce monde est illisible.");
     };
     st.worlds.note_open(pseudo);
@@ -7167,6 +7201,11 @@ fn wake_kept(st: &mut State, id: u64, pseudo: &str, key: &str) -> Response {
                 room.build.items.absorb(&m);
             }
         }
+        // Sa copie repart de ce qu'il a maintenant (d'un coup : rien n'est perdu entre les
+        // deux, même si le relais s'arrête juste après).
+        room.build.take_journal();
+        let compact = room.build.export_entries();
+        st.kept.begin(&info, &compact, mondes::now());
     }
     log::info!(
         "monde « {} » réveillé depuis la copie du relais ({} entrées, partie {rid})",
@@ -12027,6 +12066,188 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// (v350) « Si le relais s'arrête pendant qu'un monde est ouvert, fais qu'il soit gardé » :
+    /// ce qui y est fait part dans sa copie à chaque entretien. Le relais arrêté d'un coup
+    /// (rien n'est fermé) et relancé sur le même dossier : le monde dort, avec tout ce qui avait
+    /// été écrit, et un joueur le réveille de là.
+    #[test]
+    fn a_world_open_when_the_relay_stops_is_kept() {
+        let (h, dir) = crowd_world("mondes_arret");
+        let package = game::MapPackage {
+            seed: 0,
+            generator: "procedural2".into(),
+            edits: vec![2; 140],
+            chunks: Vec::new(),
+            torches: Vec::new(),
+            fps: Default::default(),
+        };
+        let bytes = package.to_bytes();
+        let sig = game::signature(&bytes);
+        let (key, written) = {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            assert!(matches!(
+                st.maps
+                    .put(0, "Proprio", sig, "monde", 0, bytes.len() as u64, &bytes),
+                maps::Put::Complete
+            ));
+            let owner = crowd.conn(st, "Proprio", false);
+            let rid = match crowd.ask(
+                st,
+                owner,
+                Request::Host {
+                    kind: 1,
+                    name: "Ouvert".into(),
+                    map: "monde".into(),
+                    map_sig: sig,
+                    max_players: 0,
+                    wake: String::new(),
+                    replace: String::new(),
+                    code: None,
+                    seed: 0,
+                    terrain: 5,
+                },
+            ) {
+                Some(Response::Hosted { room, .. }) => room,
+                r => panic!("{r:?}"),
+            };
+            for i in 0..40u8 {
+                st.rooms.get_mut(&rid).unwrap().build.mirror_to(
+                    [i32::from(i % 4), 1],
+                    &[i, 1],
+                    &[],
+                );
+            }
+            // Un entretien passe ; puis encore deux entrées, jamais écrites.
+            flush_kept(st);
+            let mut written: Vec<([i32; 2], Vec<u8>)> = st.rooms[&rid]
+                .build
+                .export_entries()
+                .into_iter()
+                .map(|(z, _, d)| (z, d))
+                .collect();
+            written.sort();
+            for i in 40..42u8 {
+                st.rooms
+                    .get_mut(&rid)
+                    .unwrap()
+                    .build
+                    .mirror_to([0, 1], &[i, 1], &[]);
+            }
+            (st.rooms[&rid].server.clone(), written)
+        };
+        // Le relais s'arrête d'un coup : rien n'est fermé. Un autre démarre sur son dossier.
+        let h2 = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        {
+            let mut guard = h2.state.lock().unwrap();
+            let st = &mut *guard;
+            assert!(
+                st.worlds.get(&key).is_some_and(|w| w.asleep.is_some()),
+                "il dort"
+            );
+            assert!(st.kept.meta(&key).is_some_and(|m| !m.open));
+            let mut crowd = Crowd::new();
+            let visitor = crowd.conn(st, "Visiteur", false);
+            let room = match crowd.ask(st, visitor, Request::WakeKept { world: key.clone() }) {
+                Some(Response::Joined { room, terrain, .. }) => {
+                    assert_eq!(terrain, 5);
+                    room
+                }
+                r => panic!("{r:?}"),
+            };
+            let mut back: Vec<([i32; 2], Vec<u8>)> = st.rooms[&room]
+                .build
+                .export_entries()
+                .into_iter()
+                .map(|(z, _, d)| (z, d))
+                .collect();
+            back.sort();
+            assert_eq!(back, written, "tout ce qui avait été écrit, pas plus");
+        }
+        drop((h, h2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v350) Le pire cas mesuré : un monde d'un million d'entrées gardé par le relais. Ce que
+    /// coûte son réveil (lire la copie, refaire l'historique, réécrire la copie), le relais
+    /// tenu pendant ce temps. `cargo test -p minelib-relay --lib -- --ignored --nocapture
+    /// a_huge_kept_world`.
+    #[test]
+    #[ignore]
+    fn a_huge_kept_world_wakes_in_reasonable_time() {
+        let (h, dir) = crowd_world("mondes_enorme");
+        {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let package = game::MapPackage {
+                seed: 0,
+                generator: "procedural2".into(),
+                edits: vec![3; 140],
+                chunks: Vec::new(),
+                torches: Vec::new(),
+                fps: Default::default(),
+            };
+            let bytes = package.to_bytes();
+            let sig = game::signature(&bytes);
+            assert!(matches!(
+                st.maps
+                    .put(0, "Proprio", sig, "monde", 0, bytes.len() as u64, &bytes),
+                maps::Put::Complete
+            ));
+            let key = "proprio/enorme".to_string();
+            st.worlds
+                .opened(&key, "Énorme", "monde", "Proprio", "Proprio");
+            st.worlds.asleep(&key, "Proprio");
+            let info = gardes::Info {
+                name: "Énorme".into(),
+                map: "monde".into(),
+                map_sig: sig,
+                max_players: 0,
+                creator: "Proprio".into(),
+                server: key.clone(),
+            };
+            // Un million de blocs posés, 14 octets chacun, sur 400 zones.
+            let n = 1_000_000u32;
+            let entries: Vec<zones::Entry> = (0..n)
+                .map(|i| {
+                    let zone = [(i % 20) as i32, ((i / 20) % 20) as i32];
+                    (
+                        zone,
+                        u64::from(i) + 1,
+                        i.to_le_bytes().repeat(4)[..14].to_vec(),
+                    )
+                })
+                .collect();
+            let t = Instant::now();
+            st.kept.begin(&info, &entries, mondes::now());
+            st.kept.close(&key, mondes::now());
+            let write = t.elapsed();
+            let size = st.kept.meta(&key).unwrap().size;
+            let mut crowd = Crowd::new();
+            let visitor = crowd.conn(st, "Visiteur", false);
+            let t = Instant::now();
+            let r = crowd.ask(st, visitor, Request::WakeKept { world: key.clone() });
+            let wake = t.elapsed();
+            assert!(matches!(r, Some(Response::Joined { .. })), "{r:?}");
+            eprintln!(
+                "MONDE ÉNORME : {n} entrées, copie de {:.1} Mo écrite en {:.2} s ; réveil (lire, \
+                 refaire l'historique, réécrire) en {:.2} s",
+                size as f64 / 1e6,
+                write.as_secs_f64(),
+                wake.as_secs_f64()
+            );
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// (v350) « Que je puisse quand même le rejoindre sans que mon PC ou celui d'Haumax ait la
     /// carte » : quand son dernier joueur s'en va, le relais garde le monde (sa carte et tout
     /// ce qui y a été fait). N'importe quel joueur qui peut y entrer le réveille alors depuis
@@ -12120,7 +12341,10 @@ mod tests {
                 r => panic!("{r:?}"),
             };
             assert_eq!(sorted(st.rooms[&room].build.export_entries()), before);
-            assert!(st.kept.meta(&key).is_none(), "rouvert : la copie a servi");
+            assert!(
+                st.kept.meta(&key).is_some_and(|m| m.open),
+                "rouvert : sa copie repart de ce qu'il a, et grandit de nouveau"
+            );
             assert!(st.worlds.get(&key).is_some_and(|w| w.asleep.is_none()));
             // Un autre arrive pendant qu'il est ouvert : il le rejoint.
             let late = crowd.conn(st, "Tardif", false);
@@ -12152,18 +12376,16 @@ mod tests {
             }
             // La place : la copie part la première, puis sa carte, que plus rien ne demande.
             leave_room(st, creator);
-            st.kept.save(
-                gardes::Info {
-                    name: "Monde gardé".into(),
-                    map: "monde".into(),
-                    map_sig: sig,
-                    max_players: 0,
-                    creator: "Proprio".into(),
-                    server: key.clone(),
-                },
-                built.clone(),
-                mondes::now(),
-            );
+            let info = gardes::Info {
+                name: "Monde gardé".into(),
+                map: "monde".into(),
+                map_sig: sig,
+                max_players: 0,
+                creator: "Proprio".into(),
+                server: key.clone(),
+            };
+            st.kept.begin(&info, &built, mondes::now());
+            st.kept.close(&key, mondes::now());
             st.worlds.age(&key, 40, true);
             let registry = st.worlds.bytes_of(&key);
             assert!(

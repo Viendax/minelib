@@ -3469,6 +3469,277 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// (v350) « Fais des essais » : de bout en bout (vrai relais, vraies connexions, le monde
+    /// de chaque joueur). Un joueur ouvre un monde, y construit et s'en va : il dort. Un autre,
+    /// qui n'en a aucune copie, le réveille depuis la liste des mondes, en devient l'hôte et
+    /// retrouve, case par case, tout ce qui avait été construit.
+    #[test]
+    fn a_world_the_relay_kept_wakes_with_everything_built_for_anyone() {
+        let dir = std::env::temp_dir().join(format!("minelib-garde-{}", rand_u32()));
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let mut a = Bot::new(&addr, h.public, "Batisseur", false);
+        // La carte du monde, envoyée au relais à son ouverture (comme le jeu).
+        let package = game::MapPackage {
+            seed: 0,
+            generator: "procedural2".into(),
+            edits: Vec::new(),
+            chunks: Vec::new(),
+            torches: Vec::new(),
+            fps: Default::default(),
+        };
+        let bytes = package.to_bytes();
+        let sig = game::signature(&bytes);
+        a.c.send(Cmd::UploadMap {
+            sig,
+            name: "monde".into(),
+            bytes,
+            fps: false,
+        });
+        a.wait(|e| matches!(e, Event::MapUploaded(_)));
+        a.c.send(Cmd::Host {
+            kind: 1,
+            name: "Gardé".into(),
+            map: "monde".into(),
+            map_sig: sig,
+            max_players: 0,
+            seed: 0,
+            terrain: 0,
+        });
+        a.wait(|e| matches!(e, Event::Hosted(_)));
+        a.start_net(true);
+        let dt = 1.0 / 20.0;
+        // Ce qu'il construit, à cheval sur les deux zones du terrain d'essai.
+        let built: Vec<([i32; 3], BlockId)> = (0..24)
+            .map(|i| {
+                let x = CHUNKS.start * 16 + (i * 5) % 64;
+                ([x, 11 + i % 3, (i * 7) % 32], BlockId(1 + (i % 6) as u16))
+            })
+            .collect();
+        // (Sous les 20 blocs par seconde au-delà desquels le relais refuse.)
+        for (p, b) in &built {
+            a.world.set(p[0], p[1], p[2], *b);
+            a.tick(dt);
+            std::thread::sleep(Duration::from_millis(70));
+        }
+        let t = Instant::now();
+        loop {
+            a.tick(dt);
+            if a.net.as_ref().unwrap().pending() == 0 && t.elapsed() > Duration::from_secs(1) {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(20), "toujours en attente");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(a.rejects, 0, "rien n'a été refusé");
+        a.c.send(Cmd::Leave);
+        a.net = None;
+        // Un autre joueur, sans copie : le monde est dans la liste, endormi.
+        let mut b = Bot::new(&addr, h.public, "Visiteur", false);
+        let t = Instant::now();
+        let world = loop {
+            b.c.send(Cmd::Servers(1));
+            let mut found = None;
+            b.wait(|e| matches!(e, Event::Servers(_)));
+            // (Lu de nouveau : l'événement est passé par `pump`.)
+            for _ in 0..50 {
+                while let Some(e) = b.c.poll() {
+                    if let Event::Servers(list) = e {
+                        found = list.into_iter().find(|s| s.asleep && s.name == "Gardé");
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+                b.c.send(Cmd::Servers(1));
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            if let Some(f) = found {
+                break f.world;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(20),
+                "le monde ne s'endort pas"
+            );
+        };
+        b.c.send(Cmd::WakeKept(world));
+        let t = Instant::now();
+        let mut host = None;
+        while host.is_none() {
+            while let Some(e) = b.c.poll() {
+                match e {
+                    Event::Joined {
+                        host: h, map_sig, ..
+                    } => {
+                        assert_eq!(map_sig, sig);
+                        host = Some(h);
+                    }
+                    Event::Link(l) => b.link = Some(l),
+                    Event::Error(m) => panic!("réveil refusé : {m}"),
+                    _ => {}
+                }
+            }
+            assert!(t.elapsed() < Duration::from_secs(20), "pas de réponse");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(host.as_deref(), Some("Visiteur"), "il en devient l'hôte");
+        b.start_net(false);
+        let t = Instant::now();
+        loop {
+            b.tick(dt);
+            let same = built
+                .iter()
+                .all(|(p, blk)| b.world.get(p[0], p[1], p[2]) == *blk);
+            if same {
+                break;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(20),
+                "le monde réveillé n'a pas tout ce qui avait été construit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop((a, b));
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v351) De bout en bout aussi : le relais tombe pendant que le monde est ouvert (rien
+    /// n'est fermé, son joueur y est encore). Un autre relais repart de son dossier : le monde
+    /// y dort, et un joueur sans copie le réveille avec tout ce qui avait été construit jusqu'à
+    /// quelques secondes avant.
+    #[test]
+    fn a_world_open_when_its_relay_falls_wakes_with_what_was_built() {
+        let dir = std::env::temp_dir().join(format!("minelib-garde-chute-{}", rand_u32()));
+        let config = || minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        };
+        let h = minelib_relay::start(config()).unwrap();
+        let addr = h.addr.to_string();
+        let mut a = Bot::new(&addr, h.public, "Batisseur", false);
+        let package = game::MapPackage {
+            seed: 0,
+            generator: "procedural2".into(),
+            edits: Vec::new(),
+            chunks: Vec::new(),
+            torches: Vec::new(),
+            fps: Default::default(),
+        };
+        let bytes = package.to_bytes();
+        let sig = game::signature(&bytes);
+        a.c.send(Cmd::UploadMap {
+            sig,
+            name: "monde".into(),
+            bytes,
+            fps: false,
+        });
+        a.wait(|e| matches!(e, Event::MapUploaded(_)));
+        a.c.send(Cmd::Host {
+            kind: 1,
+            name: "Ouvert".into(),
+            map: "monde".into(),
+            map_sig: sig,
+            max_players: 0,
+            seed: 0,
+            terrain: 0,
+        });
+        a.wait(|e| matches!(e, Event::Hosted(_)));
+        a.start_net(true);
+        let dt = 1.0 / 20.0;
+        let built: Vec<([i32; 3], BlockId)> = (0..16)
+            .map(|i| {
+                (
+                    [CHUNKS.start * 16 + 3 + i * 3, 12, 4 + i],
+                    BlockId(2 + (i % 5) as u16),
+                )
+            })
+            .collect();
+        for (p, b) in &built {
+            a.world.set(p[0], p[1], p[2], *b);
+            a.tick(dt);
+            std::thread::sleep(Duration::from_millis(70));
+        }
+        // Tout est confirmé, puis quelques entretiens du relais passent (le monde reste ouvert).
+        let t = Instant::now();
+        while a.net.as_ref().unwrap().pending() > 0 || t.elapsed() < Duration::from_secs(5) {
+            a.tick(dt);
+            assert!(t.elapsed() < Duration::from_secs(20), "toujours en attente");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(a.rejects, 0);
+        // Le relais tombe d'un coup : un autre repart de son dossier (le premier n'y écrit
+        // plus : plus rien ne bouge).
+        let h2 = minelib_relay::start(config()).unwrap();
+        let mut b = Bot::new(&h2.addr.to_string(), h2.public, "Visiteur", false);
+        let t = Instant::now();
+        let world = loop {
+            b.c.send(Cmd::Servers(1));
+            let mut found = None;
+            let t2 = Instant::now();
+            while found.is_none() && t2.elapsed() < Duration::from_secs(2) {
+                while let Some(e) = b.c.poll() {
+                    if let Event::Servers(list) = e {
+                        found = list.into_iter().find(|s| s.asleep && s.name == "Ouvert");
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if let Some(f) = found {
+                break f.world;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(20),
+                "le monde n'est pas dans la liste"
+            );
+        };
+        b.c.send(Cmd::WakeKept(world));
+        let t = Instant::now();
+        loop {
+            let mut joined = false;
+            while let Some(e) = b.c.poll() {
+                match e {
+                    Event::Joined { .. } => joined = true,
+                    Event::Link(l) => b.link = Some(l),
+                    Event::Error(m) => panic!("réveil refusé : {m}"),
+                    _ => {}
+                }
+            }
+            if joined {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(20), "pas de réponse");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        b.start_net(false);
+        let t = Instant::now();
+        loop {
+            b.tick(dt);
+            if built
+                .iter()
+                .all(|(p, blk)| b.world.get(p[0], p[1], p[2]) == *blk)
+            {
+                break;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(20),
+                "le monde repris après la chute n'a pas tout ce qui avait été construit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop((a, b));
+        drop((h, h2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Un joueur simulé : sa connexion, son monde, ce qu'il a changé.
     struct Bot {
         name: String,

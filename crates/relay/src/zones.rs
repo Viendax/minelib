@@ -251,6 +251,9 @@ pub struct Build {
     /// Monde qui a un relais de secours : chaque nouvelle entrée lui part aussi (voir
     /// `take_replica`).
     replica: Option<Vec<Entry>>,
+    /// (v350) Monde gardé par le relais (`gardes`) : chaque nouvelle entrée lui part aussi,
+    /// écrite sur le disque à chaque entretien (voir `take_journal`).
+    journal: Option<Vec<Entry>>,
 }
 
 /// Le monde fermé, ses zones endormies partent avec lui.
@@ -468,6 +471,19 @@ impl Build {
     /// Avec un relais de secours (ou sans) : chaque nouvelle entrée lui est gardée.
     pub fn set_replicating(&mut self, on: bool) {
         self.replica = on.then(Vec::new);
+    }
+
+    /// (v350) Chaque nouvelle entrée est (ou n'est plus) gardée pour le disque (`gardes`).
+    pub fn set_journaling(&mut self, on: bool) {
+        self.journal = on.then(Vec::new);
+    }
+
+    /// (v350) Nouvelles entrées à écrire dans la copie gardée du monde.
+    pub fn take_journal(&mut self) -> Vec<Entry> {
+        self.journal
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Nouvelles entrées pour le relais de secours.
@@ -837,6 +853,9 @@ impl Build {
         }
         if let Some(r) = &mut self.replica {
             r.push((zone, seq, data.to_vec()));
+        }
+        if let Some(j) = &mut self.journal {
+            j.push((zone, seq, data.to_vec()));
         }
         let (kind, before) = (!blocks as usize, before[!blocks as usize]);
         // Archivée en retard (rang plus petit que le dernier de la zone : passation en fin
