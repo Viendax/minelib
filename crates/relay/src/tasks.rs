@@ -396,7 +396,7 @@ async fn serve_loop(link: &mut Link, state: &Arc<Mutex<State>>, peer: &str, id: 
         } else {
             // L'inscription d'un pseudo demande aux autres relais s'il est pris : sur un
             // fil à part (réseau), sans bloquer les autres connexions.
-            let taken = if matches!(req, Request::Register { .. }) {
+            let taken = if matches!(req, Request::Register { .. } | Request::AccountMove { .. }) {
                 let (st, r) = (state.clone(), req.clone());
                 tokio::task::spawn_blocking(move || taken_elsewhere(&r, &st))
                     .await
@@ -410,16 +410,20 @@ async fn serve_loop(link: &mut Link, state: &Arc<Mutex<State>>, peer: &str, id: 
                 None => {
                     // (v276) Le mot de passe d'une connexion ou d'une inscription est
                     // vérifié ou haché ici, sur un fil à part : le relais n'attend pas.
-                    let prepared =
-                        if matches!(req, Request::Login { .. } | Request::Register { .. }) {
-                            let (st, r, p) = (state.clone(), req.clone(), peer.to_string());
-                            tokio::task::spawn_blocking(move || crate::prepare(&r, &st, &p))
-                                .await
-                                .ok()
-                                .flatten()
-                        } else {
-                            None
-                        };
+                    let prepared = if matches!(
+                        req,
+                        Request::Login { .. }
+                            | Request::Register { .. }
+                            | Request::AccountMove { .. }
+                    ) {
+                        let (st, r, p) = (state.clone(), req.clone(), peer.to_string());
+                        tokio::task::spawn_blocking(move || crate::prepare(&r, &st, &p))
+                            .await
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
                     crate::handle_prepared(req, prepared, state, &mut session, peer, id)
                 }
             }

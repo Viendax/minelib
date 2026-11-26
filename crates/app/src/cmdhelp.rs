@@ -230,6 +230,18 @@ pub const HELP: &[Help] = &[
         forms: &[("/reportmap", "")],
     },
     Help {
+        names: &["passeurs", "passeur"],
+        what: "Passeurs de confiance de ce relais (ses administrateurs)",
+        forms: &[
+            (
+                "/passeurs inviter [n]",
+                "invitation pour n passeurs sans joueur (4), valable 7 jours : copiée",
+            ),
+            ("/passeurs liste", "les passeurs de confiance, et les invitations ouvertes"),
+            ("/passeurs retirer <pseudo>", "lui retire sa confiance"),
+        ],
+    },
+    Help {
         names: &["help", "aide", "?"],
         what: "Toutes les commandes",
         forms: &[("/help", "")],

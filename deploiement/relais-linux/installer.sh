@@ -2,9 +2,15 @@
 # Minelib (v342) : le relais Minelib sur une machine Linux (x86_64, systemd), qui se met à
 # jour tout seul à chaque nouvelle version publiée sur GitHub (celle des joueurs).
 #
-#   sudo sh installer.sh relais  [options de minelib-relay : --name <nom>, --journaux…]
+#   sudo sh installer.sh relais  [options de minelib-relay : --name <nom>, --journaux,
+#                                --admin <pseudo>…]
 #   sudo sh installer.sh passeur [--ip <adresse publique>] [--port <premier port UDP>]
-#                                [--relais "<nœud> <clé> <nom>"]
+#                                [--relais "<nœud> <clé> <nom>"] [--invitation "<…>"]
+#
+# (v345) Les deux sur une même machine : chacun a son service (minelib-relay, minelib-passeur).
+# `--invitation` : celle donnée par un administrateur du relais (/passeurs inviter dans le
+# jeu) ; le passeur y devient de confiance et porte aussi les parties FPS. Rien à refaire
+# ensuite. `--admin <pseudo>` : ce compte administre le relais.
 #
 # Ce qu'il met en place :
 # - un compte système `minelib`, sans connexion possible ;
@@ -37,10 +43,12 @@ case "$mode" in
     relais)
         shift
         set -- --dir "$DATA/relay_data" "$@"
+        unit=minelib-relay
         ;;
     passeur)
         shift
         set -- --passeur --dir "$DATA/passeur_data" "$@"
+        unit=minelib-passeur
         ;;
     *)
         echo "Usage : sudo sh installer.sh relais|passeur [options]"
@@ -101,14 +109,25 @@ fi
 cp "$tmp/bin" "$DIR/minelib-relay.new"
 mv -f "$DIR/minelib-relay.new" "$DIR/minelib-relay"
 echo "$tag" > "$DIR/version"
-systemctl restart minelib-relay
+# (v345) Le relais et le passeur de cette machine, ceux qui y sont installés.
+for u in minelib-relay minelib-passeur; do
+    if [ -f "/etc/systemd/system/$u.service" ]; then
+        systemctl restart "$u"
+    fi
+done
 echo "relais Minelib : v$tag"
 MAJ
 chmod 755 "$DIR/maj.sh"
 
-cat > /etc/systemd/system/minelib-relay.service <<UNIT
+# (v345) Avant, un passeur s'installait sous le nom du relais : il prend le sien.
+if [ "$unit" = minelib-passeur ] && grep -q -- '--passeur' /etc/systemd/system/minelib-relay.service 2>/dev/null; then
+    systemctl disable -q --now minelib-relay 2>/dev/null || true
+    rm -f /etc/systemd/system/minelib-relay.service
+fi
+
+cat > /etc/systemd/system/$unit.service <<UNIT
 [Unit]
-Description=Minelib : relais ($mode)
+Description=Minelib : $mode
 After=network-online.target
 Wants=network-online.target
 # (Pas encore téléchargé : la minuterie le démarre quand il est là.)
@@ -154,14 +173,14 @@ WantedBy=timers.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable -q minelib-relay minelib-relay-maj.timer
+systemctl enable -q "$unit" minelib-relay-maj.timer
 systemctl start minelib-relay-maj.timer
 "$DIR/maj.sh" || true
 if [ -x "$DIR/minelib-relay" ]; then
-    systemctl restart minelib-relay
-    echo "Relais Minelib v$(cat "$DIR/version") en route ($mode)."
+    systemctl restart "$unit"
+    echo "Minelib v$(cat "$DIR/version") en route ($mode)."
 else
     echo "Pas encore de version pour Linux sur GitHub : la minuterie l'installera dès qu'elle"
     echo "y sera (dans les dix minutes qui suivent sa publication)."
 fi
-echo "État : systemctl status minelib-relay ; journal : journalctl -u minelib-relay -f"
+echo "État : systemctl status $unit ; journal : journalctl -u $unit -f"

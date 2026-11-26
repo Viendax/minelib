@@ -46,11 +46,18 @@ struct Slot {
     fails: u32,
     /// Connexions ratées avec le compte gardé, de suite (au-delà, il est refait).
     refused: u32,
+    /// (v345) Invitation de ce relais à lui redonner à chaque connexion (`--invitation`) :
+    /// son compte y devient un passeur de confiance, qui porte aussi les parties FPS.
+    invite: Option<[u8; 16]>,
+    /// (v345) Invitation donnée, réponse attendue avant de s'annoncer.
+    claiming: bool,
 }
 
 pub struct Headless {
     opts: Options,
     slots: Vec<Slot>,
+    /// (v345) Invitations, par clé de relais (`invite`).
+    invites: Vec<([u8; 32], [u8; 16])>,
 }
 
 /// Comptes de passeur, un par relais (clé du relais, pseudo, mot de passe).
@@ -101,6 +108,17 @@ impl Headless {
         Self {
             opts,
             slots: Vec::new(),
+            invites: Vec::new(),
+        }
+    }
+
+    /// (v345) Invitation du relais de clé `key` (`minelib_p2p::parse_invitation`) : donnée à
+    /// chaque connexion à ce relais, avant de s'y annoncer.
+    pub fn invite(&mut self, key: [u8; 32], secret: [u8; 16]) {
+        self.invites.retain(|(k, _)| *k != key);
+        self.invites.push((key, secret));
+        for s in self.slots.iter_mut().filter(|s| s.key == key) {
+            s.invite = Some(secret);
         }
     }
 
@@ -124,6 +142,12 @@ impl Headless {
             next: Instant::now(),
             fails: 0,
             refused: 0,
+            invite: self
+                .invites
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, s)| *s),
+            claiming: false,
         });
     }
 
@@ -186,11 +210,38 @@ impl Slot {
                         list.push((self.key, p, w));
                         write_accounts(dir, &list);
                     }
-                    c.send(Cmd::Passeur(true));
+                    // (v345) Son invitation d'abord : s'annoncer ensuite, une fois la réponse
+                    // venue (de confiance ou non, il porte au moins les tunnels).
+                    match self.invite {
+                        Some(secret) => {
+                            c.send(Cmd::ServerAdmin {
+                                action: minelib_net::proto::SERVER_PASSEUR_CLAIM,
+                                pseudo: String::new(),
+                                reason: minelib_net::crypto::hex(&secret),
+                            });
+                            self.claiming = true;
+                        }
+                        None => c.send(Cmd::Passeur(true)),
+                    }
                     self.joined = true;
                     self.fails = 0;
                     self.refused = 0;
                     log::info!("passeur : entré au relais « {} » ({pseudo})", self.name);
+                }
+                Event::ServerAdmin(text) if self.claiming => {
+                    self.claiming = false;
+                    if text == minelib_net::proto::PASSEUR_TRUSTED {
+                        log::info!("passeur : de confiance au relais « {} »", self.name);
+                    } else {
+                        log::warn!("passeur : invitation du relais « {} » : {text}", self.name);
+                    }
+                    c.send(Cmd::Passeur(true));
+                }
+                // Un relais d'avant la v345 ne connaît pas les invitations : passeur quand même.
+                Event::Error(m) if self.claiming => {
+                    self.claiming = false;
+                    log::warn!("passeur : invitation du relais « {} » : {m}", self.name);
+                    c.send(Cmd::Passeur(true));
                 }
                 Event::Error(m) | Event::Offline(m) => failed = Some(m),
                 Event::NeedTotp => failed = Some("code 2FA demandé".into()),
@@ -215,6 +266,7 @@ impl Slot {
             self.making = None;
             self.client = None;
             self.joined = false;
+            self.claiming = false;
             self.fails += 1;
             let wait = backoff(self.fails);
             self.next = now + wait;
@@ -282,6 +334,89 @@ mod tests {
         assert_eq!(read_accounts(&mine), kept);
         let st = h.state.lock().unwrap();
         assert!(st.fast.offered_at(port), "annoncé sur le port voulu");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v345) Un passeur sans joueur installé avec une invitation (`--invitation`) la donne
+    /// au relais qui l'a faite : son compte y devient de confiance, puis il s'annonce comme
+    /// d'habitude. Relancé, il la redonne sans rien user de plus.
+    #[test]
+    fn a_headless_passeur_with_an_invitation_becomes_trusted() {
+        let dir =
+            std::env::temp_dir().join(format!("minelib-passeur-invite-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(dir.join("relais")).unwrap();
+        std::fs::write(dir.join("relais").join("admins.txt"), "Chef\n").unwrap();
+        let h = start(Config {
+            dir: dir.join("relais"),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let chef = Client::spawn(addr.clone(), Some(h.public));
+        chef.send(Cmd::Register {
+            pseudo: "Chef".into(),
+            password: "motdepasse".into(),
+        });
+        let t = Instant::now();
+        let mut secret = None;
+        let mut asked = false;
+        while secret.is_none() {
+            match chef.poll() {
+                Some(Event::LoggedIn { .. }) if !asked => {
+                    asked = true;
+                    chef.send(Cmd::ServerAdmin {
+                        action: minelib_net::proto::SERVER_PASSEUR_INVITE,
+                        pseudo: String::new(),
+                        reason: "1".into(),
+                    });
+                }
+                // (L'invitation a son événement à elle, que le jeu copie et enregistre.)
+                Some(Event::PasseurInvitation(text)) => secret = Some(text),
+                Some(Event::Error(m)) => panic!("{m}"),
+                _ => std::thread::sleep(Duration::from_millis(2)),
+            }
+            assert!(t.elapsed() < Duration::from_secs(30), "pas d'invitation");
+        }
+        let bytes: [u8; 16] = minelib_net::crypto::unhex(&secret.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mine = dir.join("passeur");
+        let run = || {
+            let mut p = Headless::new(Options {
+                dir: mine.clone(),
+                ip: Ipv4Addr::LOCALHOST,
+                port: 0,
+            });
+            p.invite(h.public, bytes);
+            let a = addr.clone();
+            p.add("essai", h.public, Arc::new(move || Ok(a.clone())));
+            let t = Instant::now();
+            while p.joined() < 1 || h.state.lock().unwrap().fast.verified() < 1 {
+                p.tend();
+                assert!(t.elapsed() < Duration::from_secs(30), "passeur pas vérifié");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            p
+        };
+        let first = run();
+        let pseudo = read_accounts(&mine)[0].1.clone();
+        assert!(h.state.lock().unwrap().passeurs_ok.trusts(&pseudo));
+        drop(first);
+        let t = Instant::now();
+        while h.state.lock().unwrap().fast.verified() != 0 {
+            assert!(t.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Relancé : la même invitation (épuisée pour tout autre) ne lui retire rien.
+        let _second = run();
+        let st = h.state.lock().unwrap();
+        assert!(st.passeurs_ok.trusts(&pseudo));
+        assert_eq!(st.passeurs_ok.list().len(), 1);
+        drop(st);
+        drop(chef);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,6 +8,7 @@
 
 mod accounts;
 mod bags;
+mod confiance;
 mod contacts;
 mod guards;
 mod hardware;
@@ -912,6 +913,32 @@ pub fn federated_servers(node: &'static minelib_p2p::Node, me: [u8; 32]) -> Serv
     })
 }
 
+/// (v345) Ce que le relais de ce dossier garde d'un compte, pour qu'il déménage entier vers
+/// un relais officiel : le secret de sa double authentification (déchiffré avec la clé de ce
+/// relais) et ses appareils de confiance. `None` : ce relais n'a pas ce compte. Lu sur le PC
+/// qui tient ce relais (le jeu, qui a ses fichiers), et donné seulement à un relais officiel
+/// (voir `minelib_net::client::MoveHome`).
+pub struct AccountExport {
+    pub totp: Option<Vec<u8>>,
+    pub devices: Vec<[u8; 32]>,
+}
+
+pub fn export_account(dir: &Path, pseudo: &str) -> Option<AccountExport> {
+    let bytes = std::fs::read(dir.join("relay.key")).ok()?;
+    let id: Identity = postcard::from_bytes(&bytes).ok()?;
+    let record = accounts::Store::new(dir.join("accounts"))
+        .ok()?
+        .load(pseudo)?;
+    let totp = match &record.totp {
+        Some(sealed) => Some(crypto::open(&id.vault_key, sealed).ok()?),
+        None => None,
+    };
+    Some(AccountExport {
+        totp,
+        devices: record.devices,
+    })
+}
+
 /// Clé publique du relais de ce dossier, s'il en a déjà été un (sans le lancer).
 pub fn public_key(dir: &Path) -> Option<[u8; 32]> {
     let bytes = std::fs::read(dir.join("relay.key")).ok()?;
@@ -1466,6 +1493,8 @@ struct State {
     contacts: contacts::Contacts,
     maps: maps::Store,
     hardware: hardware::Store,
+    /// (v345) Passeurs de confiance par invitation (`confiance`).
+    passeurs_ok: confiance::Store,
     servers: servers::Store,
     /// (v311) Mondes de construction connus de ce relais, ouverts ou endormis (`mondes`).
     worlds: mondes::Store,
@@ -1624,6 +1653,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         contacts: contacts::Contacts::open(cfg_dir.join("frequentation.bin")),
         maps,
         hardware: hardware::Store::open(cfg_dir.join("hardware.bin")),
+        passeurs_ok: confiance::Store::open(cfg_dir.join("passeurs_confiance.bin")),
         servers: servers::Store::open(cfg_dir.join("serveurs.bin")),
         worlds: mondes::Store::open(cfg_dir.join("mondes.bin")),
         bags: bags::Store::open(cfg_dir.join("sacs.bin")),
@@ -1945,7 +1975,9 @@ fn err(code: ErrorCode, message: impl Into<String>) -> Response {
 /// refusée (les pseudos sont uniques entre relais). Même clé : c'est le compte qui
 /// arrive d'un autre relais, il passe. La question est posée sans bloquer le relais.
 fn taken_elsewhere(req: &Request, state: &Mutex<State>) -> Option<Response> {
-    let Request::Register { pseudo, pubkey, .. } = req else {
+    let (Request::Register { pseudo, pubkey, .. } | Request::AccountMove { pseudo, pubkey, .. }) =
+        req
+    else {
         return None;
     };
     let ask = {
@@ -7222,6 +7254,34 @@ fn handle_party(st: &mut State, id: u64, pseudo: &str, action: u8, who: &str) ->
     }
 }
 
+/// (v345) Ajoute ces comptes aux administrateurs du relais (`admins.txt` du dossier `dir`),
+/// sans doublon : `minelib-relay --admin`, et le jeu pour le relais qu'il tient lui-même (le
+/// compte connecté sur ce PC l'administre).
+pub fn add_admins(dir: &Path, pseudos: &[String]) -> std::io::Result<()> {
+    let path = dir.join("admins.txt");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut changed = false;
+    for p in pseudos {
+        let p = p.trim();
+        if !proto::valid_pseudo(p)
+            || is_admin(dir, p)
+            || text.lines().any(|l| l.trim().eq_ignore_ascii_case(p))
+        {
+            continue;
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(p);
+        text.push('\n');
+        changed = true;
+    }
+    if changed {
+        std::fs::write(&path, text)?;
+    }
+    Ok(())
+}
+
 /// Administrateurs : pseudos listés dans `admins.txt` (un par ligne) dans le dossier du
 /// relais.
 fn is_admin(dir: &Path, pseudo: &str) -> bool {
@@ -7229,6 +7289,96 @@ fn is_admin(dir: &Path, pseudo: &str) -> bool {
         .unwrap_or_default()
         .lines()
         .any(|l| l.trim().eq_ignore_ascii_case(pseudo))
+}
+
+/// (v345) Passeurs de confiance (`confiance`) : l'invitation donnée par un passeur, et pour
+/// les administrateurs du relais, inviter, la liste, retirer.
+fn passeur_trust(st: &mut State, pseudo: &str, action: u8, target: &str, arg: &str) -> Response {
+    let now = unix_now();
+    let text = |t: String| Response::ServerAdmin { text: t };
+    if action == proto::SERVER_PASSEUR_CLAIM {
+        // Le secret seul, ou toute la ligne de l'invitation (le secret d'abord).
+        let first = arg.split_whitespace().next().unwrap_or("");
+        let secret = minelib_net::crypto::unhex(first).and_then(|b| <[u8; 16]>::try_from(b).ok());
+        let Some(secret) = secret else {
+            return text("Invitation illisible.".into());
+        };
+        return match st.passeurs_ok.claim(&secret, pseudo, now) {
+            confiance::Claim::Trusted => {
+                log::info!("passeur « {pseudo} » de confiance (invitation)");
+                text(proto::PASSEUR_TRUSTED.into())
+            }
+            confiance::Claim::Already => text(proto::PASSEUR_TRUSTED.into()),
+            confiance::Claim::Unknown => {
+                text("Invitation inconnue, ou déjà utilisée par assez de passeurs.".into())
+            }
+            confiance::Claim::Expired => text(format!(
+                "Invitation trop vieille (plus de {} jours).",
+                proto::PASSEUR_INVITE_DAYS
+            )),
+        };
+    }
+    if !is_admin(&st.cfg.dir, pseudo) {
+        return err(
+            ErrorCode::Refused,
+            "Réservé aux administrateurs du relais (admins.txt).",
+        );
+    }
+    match action {
+        proto::SERVER_PASSEUR_INVITE => {
+            let uses = arg.trim().parse::<u32>().map_or(4, |n| n.min(255) as u8);
+            let secret = st.passeurs_ok.invite(pseudo, uses, now);
+            log::info!("invitation de passeurs donnée par « {pseudo} »");
+            // Avec la ligne de ce relais quand il a un nœud iroh : c'est elle que l'hébergeur
+            // d'un passeur met dans sa commande d'installation (`minelib_p2p::invitation`).
+            match st.fast.own_node() {
+                Some(node) => text(minelib_p2p::invitation(
+                    &secret,
+                    &minelib_p2p::Ad {
+                        node,
+                        noise: st.id.noise_public,
+                        name: st.cfg.name.clone(),
+                        since: 0,
+                        seen: 0,
+                    },
+                )),
+                None => text(minelib_net::crypto::hex(&secret)),
+            }
+        }
+        proto::SERVER_PASSEUR_LIST => {
+            let days = |since: u64| now.saturating_sub(since) / 86_400;
+            let list: Vec<String> = st
+                .passeurs_ok
+                .list()
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{} (invité par {}, il y a {} j)",
+                        t.pseudo,
+                        t.by,
+                        days(t.since)
+                    )
+                })
+                .collect();
+            let (open, seats) = st.passeurs_ok.open_invitations(now);
+            text(format!(
+                "Passeurs de confiance : {}. Invitations ouvertes : {open} ({seats} passeur(s)).",
+                if list.is_empty() {
+                    "aucun".to_string()
+                } else {
+                    list.join(", ")
+                }
+            ))
+        }
+        _ => {
+            if st.passeurs_ok.remove(target) {
+                log::info!("passeur « {target} » : plus de confiance (retirée par « {pseudo} »)");
+                text(format!("« {target} » n'est plus un passeur de confiance."))
+            } else {
+                text(format!("« {target} » n'était pas un passeur de confiance."))
+            }
+        }
+    }
 }
 
 /// Écart de confiance accepté entre un joueur et une partie : large au milieu, serré
@@ -7649,6 +7799,10 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             pseudo: target,
             reason,
         } => {
+            // (v345) Passeurs de confiance : hors de tout monde (voir `confiance`).
+            if (proto::SERVER_PASSEUR_INVITE..=proto::SERVER_PASSEUR_CLAIM).contains(&action) {
+                return Some(passeur_trust(st, pseudo, action, &target, &reason));
+            }
             let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1)) else {
                 return Some(err(
                     ErrorCode::Refused,
@@ -9560,6 +9714,25 @@ pub(crate) fn prepare(req: &Request, state: &Mutex<State>, peer: &str) -> Option
             let hash = accounts::hash_auth(auth).ok()?;
             Some(Prepared::Register { auth: *auth, hash })
         }
+        // (v345) Un compte qui déménage s'inscrit comme `Register`.
+        Request::AccountMove {
+            pseudo,
+            pubkey,
+            auth,
+            vault,
+            pow,
+            ..
+        } => prepare(
+            &Request::Register {
+                pseudo: pseudo.clone(),
+                pubkey: *pubkey,
+                auth: *auth,
+                vault: vault.clone(),
+                pow: *pow,
+            },
+            state,
+            peer,
+        ),
         _ => None,
     }
 }
@@ -9918,6 +10091,100 @@ fn handle_account(
                     err(ErrorCode::Internal, format!("{e:#}"))
                 }
             }
+        }
+        // (v345) Un compte qui déménage ici avec sa double authentification (le jeu ne
+        // l'envoie qu'à un relais officiel) : inscrit comme `Register`, puis sa 2FA et ses
+        // appareils de confiance. Le code est vérifié d'abord : aucun compte n'est créé
+        // avec une 2FA à laquelle son propriétaire ne sait pas répondre.
+        Request::AccountMove {
+            pseudo,
+            pubkey,
+            auth,
+            vault,
+            pow,
+            totp: secret,
+            code,
+            devices,
+        } => {
+            if secret.is_empty() || secret.len() > 64 {
+                return err(
+                    ErrorCode::Refused,
+                    "secret de double authentification illisible",
+                );
+            }
+            let Some(step) = totp::check(&secret, code, totp::now_step()) else {
+                return err(ErrorCode::WrongTotp, "");
+            };
+            let register = Request::Register {
+                pseudo: pseudo.clone(),
+                pubkey,
+                auth,
+                vault,
+                pow,
+            };
+            let index = match handle_account(register, st, session, peer, id) {
+                Response::Registered { index } => index,
+                r => return r,
+            };
+            let Some(mut record) = st.accounts.load(&pseudo) else {
+                return err(
+                    ErrorCode::Internal,
+                    "compte introuvable après l'inscription",
+                );
+            };
+            record.totp = Some(crypto::seal(&st.id.vault_key, &secret));
+            record.last_totp_step = step;
+            record.devices = devices.into_iter().rev().take(7).rev().collect();
+            let device = record.trust_new_device();
+            if let Err(e) = st.accounts.save(&record) {
+                return err(ErrorCode::Internal, format!("{e:#}"));
+            }
+            log::info!("compte « {pseudo} » déménagé ici avec sa double authentification");
+            Response::Moved { index, device }
+        }
+        // (v345) Compte connecté, arrivé ici sans sa double authentification (recopié avec
+        // son coffre) : elle lui est rendue, avec ses appareils de confiance.
+        Request::AccountTotp {
+            totp: secret,
+            code,
+            devices,
+        } => {
+            let Session::LoggedIn { pseudo } = &*session else {
+                return err(ErrorCode::NotLoggedIn, "");
+            };
+            let Some(mut record) = st.accounts.load(pseudo) else {
+                return err(ErrorCode::NotLoggedIn, "");
+            };
+            if record.totp.is_some() {
+                return Response::TotpOn;
+            }
+            if secret.is_empty() || secret.len() > 64 {
+                return err(
+                    ErrorCode::Refused,
+                    "secret de double authentification illisible",
+                );
+            }
+            let Some(step) = totp::check(&secret, code, totp::now_step()) else {
+                return err(ErrorCode::WrongTotp, "");
+            };
+            record.totp = Some(crypto::seal(&st.id.vault_key, &secret));
+            record.totp_pending = None;
+            record.last_totp_step = step;
+            for d in devices {
+                if !record.devices.contains(&d) {
+                    record.devices.push(d);
+                }
+            }
+            let extra = record.devices.len().saturating_sub(8);
+            record.devices.drain(..extra);
+            if let Err(e) = st.accounts.save(&record) {
+                return err(ErrorCode::Internal, format!("{e:#}"));
+            }
+            log::info!(
+                "compte « {} » : double authentification reprise du relais d'où il vient",
+                record.pseudo
+            );
+            Response::TotpOn
         }
         Request::Login {
             pseudo,
@@ -12355,6 +12622,158 @@ mod tests {
             _ => unreachable!(),
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v345) « Mon compte doit être trouvé à coup sûr » : un compte qui a la double
+    /// authentification sur le relais de son PC déménage entier vers un relais officiel.
+    /// Le code est demandé d'abord ; un code faux ne crée rien ; avec le bon, le compte y est
+    /// avec sa 2FA (une connexion sans jeton la demande), et ce PC y devient un appareil de
+    /// confiance. Vers un relais qui n'est pas officiel, rien ne part : copié comme avant,
+    /// sans la 2FA. Et un compte arrivé sur un relais officiel sans sa 2FA (recopié par un
+    /// autre PC) la retrouve.
+    #[test]
+    fn an_account_moves_to_an_official_relay_with_its_two_factor() {
+        let mk = |n: &str| {
+            let dir = std::env::temp_dir().join(format!("minelib-{n}-{}", rand::random::<u32>()));
+            let h = start(Config {
+                dir: dir.clone(),
+                bind: "127.0.0.1:0".into(),
+                pow_bits: 4,
+                name: n.into(),
+            })
+            .unwrap();
+            (dir, h)
+        };
+        let login = |pseudo: &str, totp: Option<u32>, backup: Option<Vec<u8>>, device| Cmd::Login {
+            pseudo: pseudo.into(),
+            password: "motdepasse".into(),
+            totp,
+            backup,
+            device,
+        };
+        // Le relais de son PC : le compte, puis sa double authentification.
+        let (d1, h1) = mk("maison");
+        let c = Client::spawn(h1.addr.to_string(), Some(h1.public));
+        c.send(Cmd::Register {
+            pseudo: "Voyageur".into(),
+            password: "motdepasse".into(),
+        });
+        let vault = match wait(&c, |e| matches!(e, Event::AccountBackup { .. })) {
+            Event::AccountBackup { vault, .. } => vault,
+            _ => unreachable!(),
+        };
+        wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+        c.send(Cmd::TotpBegin);
+        let secret = match wait(&c, |e| matches!(e, Event::TotpSecret { .. })) {
+            Event::TotpSecret { secret, .. } => secret,
+            _ => unreachable!(),
+        };
+        let code = || totp::code(&secret, totp::now_step());
+        c.send(Cmd::TotpConfirm(code()));
+        wait(&c, |e| matches!(e, Event::TotpOn));
+        let export = export_account(&d1, "voyageur").unwrap();
+        assert_eq!(export.totp.as_deref(), Some(&secret[..]));
+        assert!(export_account(&d1, "Personne").is_none());
+        let home = |official: [u8; 32]| {
+            Cmd::MoveHome(Some(minelib_net::client::MoveHome {
+                totp: export.totp.clone().unwrap(),
+                devices: export.devices.clone(),
+                official: vec![official],
+            }))
+        };
+        // Le relais officiel, qui ne le connaît pas.
+        let (d2, h2) = mk("officiel");
+        let c2 = Client::spawn(h2.addr.to_string(), Some(h2.public));
+        c2.send(home(h2.public));
+        c2.send(login("Voyageur", None, Some(vault.clone()), None));
+        wait(&c2, |e| matches!(e, Event::NeedTotp));
+        assert!(h2.state.lock().unwrap().accounts.load("Voyageur").is_none());
+        // Un code faux : rien n'est créé.
+        c2.send(home(h2.public));
+        c2.send(login(
+            "Voyageur",
+            Some((code() + 1) % 1_000_000),
+            Some(vault.clone()),
+            None,
+        ));
+        let e = wait_error(&c2);
+        assert!(e.to_lowercase().contains("code"), "{e}");
+        assert!(h2.state.lock().unwrap().accounts.load("Voyageur").is_none());
+        // Le bon : le compte y est avec sa double authentification, et ce PC y est de
+        // confiance.
+        c2.send(home(h2.public));
+        c2.send(login("Voyageur", Some(code()), Some(vault.clone()), None));
+        let token = match wait(&c2, |e| matches!(e, Event::DeviceTrusted { .. })) {
+            Event::DeviceTrusted { token, .. } => token,
+            _ => unreachable!(),
+        };
+        match wait(&c2, |e| matches!(e, Event::AccountMoved { .. })) {
+            Event::AccountMoved { key, relay, .. } => {
+                assert_eq!((key, relay.as_str()), (h2.public, "officiel"))
+            }
+            _ => unreachable!(),
+        }
+        match wait(&c2, |e| matches!(e, Event::LoggedIn { .. })) {
+            Event::LoggedIn { totp, .. } => assert!(totp),
+            _ => unreachable!(),
+        }
+        assert!(h2
+            .state
+            .lock()
+            .unwrap()
+            .accounts
+            .load("Voyageur")
+            .unwrap()
+            .totp
+            .is_some());
+        // Depuis un autre PC (sans coffre ni jeton) : la double authentification est demandée.
+        let c3 = Client::spawn(h2.addr.to_string(), Some(h2.public));
+        c3.send(login("Voyageur", None, None, None));
+        wait(&c3, |e| matches!(e, Event::NeedTotp));
+        // Avec le jeton de ce PC : sans code.
+        let c4 = Client::spawn(h2.addr.to_string(), Some(h2.public));
+        c4.send(login("Voyageur", None, None, Some(token)));
+        match wait(&c4, |e| matches!(e, Event::LoggedIn { .. })) {
+            Event::LoggedIn { totp, .. } => assert!(totp),
+            _ => unreachable!(),
+        }
+        // Un relais qui n'est pas officiel ne reçoit rien : recopié comme avant, sans la 2FA.
+        let (d3, h3) = mk("ailleurs");
+        let c5 = Client::spawn(h3.addr.to_string(), Some(h3.public));
+        c5.send(home([9; 32]));
+        c5.send(login("Voyageur", None, Some(vault.clone()), None));
+        wait(&c5, |e| matches!(e, Event::AccountCopied { .. }));
+        match wait(&c5, |e| matches!(e, Event::LoggedIn { .. })) {
+            Event::LoggedIn { totp, .. } => assert!(!totp),
+            _ => unreachable!(),
+        }
+        assert!(h3
+            .state
+            .lock()
+            .unwrap()
+            .accounts
+            .load("Voyageur")
+            .unwrap()
+            .totp
+            .is_none());
+        // Ce même relais, devenu officiel : le compte, qu'il a déjà, retrouve sa 2FA.
+        let c6 = Client::spawn(h3.addr.to_string(), Some(h3.public));
+        c6.send(home(h3.public));
+        c6.send(login("Voyageur", Some(code()), Some(vault.clone()), None));
+        wait(&c6, |e| matches!(e, Event::TotpOn));
+        wait(&c6, |e| matches!(e, Event::AccountMoved { .. }));
+        assert!(h3
+            .state
+            .lock()
+            .unwrap()
+            .accounts
+            .load("Voyageur")
+            .unwrap()
+            .totp
+            .is_some());
+        for d in [d1, d2, d3] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

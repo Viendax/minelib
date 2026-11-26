@@ -12,6 +12,12 @@
 //! publique>` (sinon celle que voient les serveurs d'iroh), `--port <premier port UDP>` (un
 //! par relais servi ; par défaut n'importe lesquels), `--relais "<nœud> <clé> <nom>"` (en
 //! plus des relais officiels et de ceux du DHT ; plusieurs fois possible).
+//!
+//! (v345) `--invitation "<secret> <nœud> <clé> <nom>"` (passeur) : l'invitation donnée par
+//! un administrateur de ce relais (`/passeurs inviter` dans le jeu). Le passeur la lui donne
+//! à chaque connexion, et y devient de confiance : il porte aussi les parties FPS.
+//! `--admin <pseudo>` (relais) : ce compte administre le relais (`admins.txt`, plusieurs fois
+//! possible) : bannir pour triche, inviter des passeurs.
 
 use anyhow::Result;
 
@@ -39,6 +45,7 @@ fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     let dht = !args.iter().any(|a| a == "--no-dht");
     args.retain(|a| a != "--no-dht");
+    let mut admins: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         let v = args.get(i + 1).cloned().unwrap_or_default();
@@ -47,12 +54,18 @@ fn main() -> Result<()> {
             "--dir" => cfg.dir = v.into(),
             "--pow" => cfg.pow_bits = v.parse().unwrap_or(20),
             "--name" => cfg.name = v,
+            // (v345) Administrateur du relais (`admins.txt`).
+            "--admin" => admins.push(v),
             other => {
                 eprintln!("option inconnue : {other}");
                 std::process::exit(2);
             }
         }
         i += 2;
+    }
+    if !admins.is_empty() {
+        std::fs::create_dir_all(&cfg.dir)?;
+        minelib_relay::add_admins(&cfg.dir, &admins)?;
     }
     let key_path = cfg.dir.with_file_name("noeud.key");
     let h = minelib_relay::start(cfg)?;
@@ -160,6 +173,7 @@ fn passeur_main() -> Result<()> {
     let mut ip: Option<std::net::Ipv4Addr> = None;
     let mut port: u16 = 0;
     let mut extra: Vec<minelib_p2p::Ad> = Vec::new();
+    let mut invites: Vec<([u8; 32], [u8; 16])> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         let v = args.get(i + 1).cloned().unwrap_or_default();
@@ -178,6 +192,19 @@ fn passeur_main() -> Result<()> {
             },
             "--port" => port = v.parse().unwrap_or(0),
             "--relais" => extra.extend(minelib_p2p::parse_relays(&v)),
+            "--invitation" => match minelib_p2p::parse_invitation(&v) {
+                Some((secret, ad)) => {
+                    invites.push((ad.noise, secret));
+                    extra.push(ad);
+                }
+                None => {
+                    eprintln!(
+                        "--invitation : illisible (attendu : « <secret> <nœud> <clé> <nom> », \
+                         donnée par /passeurs inviter)"
+                    );
+                    std::process::exit(2);
+                }
+            },
             other => {
                 eprintln!("option inconnue : {other}");
                 std::process::exit(2);
@@ -222,6 +249,9 @@ fn passeur_main() -> Result<()> {
         ip,
         port,
     });
+    for (key, secret) in invites {
+        p.invite(key, secret);
+    }
     let mut next_find = Instant::now();
     let mut next_say = Instant::now() + Duration::from_secs(60);
     loop {

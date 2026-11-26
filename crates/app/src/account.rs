@@ -114,6 +114,10 @@ static CHOSEN: std::sync::Mutex<Option<minelib_p2p::Ad>> = std::sync::Mutex::new
 /// (v298) Le relais que ce PC est devenu, faute d'en trouver un (pour l'invitation).
 static OWN: std::sync::Mutex<Option<minelib_p2p::Ad>> = std::sync::Mutex::new(None);
 
+/// (v345) La dernière recherche de relais a fait de ce PC le relais : le compte qui s'y
+/// connecte depuis ce PC l'administre (`minelib_relay::add_admins`).
+static OWN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// (v298) Relais des invitations reçues (`invitation=` dans `options.txt`).
 static INVITED: std::sync::Mutex<Vec<minelib_p2p::Ad>> = std::sync::Mutex::new(Vec::new());
 
@@ -276,6 +280,7 @@ fn auto_relay(
 ) -> anyhow::Result<(String, Option<[u8; 32]>)> {
     let t0 = std::time::Instant::now();
     *CHOSEN.lock().unwrap() = None;
+    OWN_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
     let port = minelib_net::DEFAULT_PORT;
     let local = SocketAddr::from(([127, 0, 0, 1], port));
     if TcpStream::connect_timeout(&local, Duration::from_millis(300)).is_ok() {
@@ -410,6 +415,7 @@ fn auto_relay(
         h.addr,
         t0.elapsed().as_secs_f32()
     );
+    OWN_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     minelib_net::lan::announce(h.addr.port(), h.public);
     let mine = SocketAddr::from(([127, 0, 0, 1], h.addr.port()));
     let public = h.public;
@@ -801,6 +807,36 @@ impl Accounts {
         self.totp_path(pseudo).exists()
     }
 
+    /// (v345) Relais officiels (leurs clés) où ce compte a déjà déménagé avec sa double
+    /// authentification, ou où il l'avait déjà : rien à y refaire.
+    fn moved_path(&self, pseudo: &str) -> PathBuf {
+        self.relay_dir
+            .with_file_name("comptes")
+            .join(format!("{}.demenage", pseudo.to_lowercase()))
+    }
+
+    /// (v345) Ce que le relais de ce PC garde de ce compte, pour qu'il déménage entier
+    /// (2FA comprise) vers un relais officiel. Seulement s'il y a des relais officiels où il
+    /// n'a pas déjà déménagé, et que ce PC tient le compte avec sa double authentification.
+    /// Le client ne l'envoie qu'à l'un d'eux (`minelib_net::client::MoveHome`).
+    fn move_home_for(&self, pseudo: &str) -> Option<minelib_net::client::MoveHome> {
+        let done = std::fs::read_to_string(self.moved_path(pseudo)).unwrap_or_default();
+        let official: Vec<[u8; 32]> = minelib_p2p::official()
+            .iter()
+            .map(|a| a.noise)
+            .filter(|k| !done.lines().any(|l| l.trim() == crypto::hex(k)))
+            .collect();
+        if official.is_empty() {
+            return None;
+        }
+        let export = minelib_relay::export_account(&self.relay_dir, pseudo)?;
+        Some(minelib_net::client::MoveHome {
+            totp: export.totp?,
+            devices: export.devices,
+            official,
+        })
+    }
+
     pub fn logged_in(&self) -> bool {
         self.account.is_some()
     }
@@ -874,6 +910,12 @@ impl Accounts {
         self.error = None;
         self.info = None;
         self.busy = Some("Connexion au relais…".into());
+        // (v345) Avant chaque connexion : de quoi faire déménager le compte, 2FA comprise,
+        // si le relais joint est officiel et ne l'a pas encore entier (sinon rien).
+        if let Cmd::Login { pseudo, .. } = &cmd {
+            let home = self.move_home_for(pseudo);
+            self.client().send(Cmd::MoveHome(home));
+        }
         self.client().send(cmd);
     }
 
@@ -1059,6 +1101,18 @@ impl Accounts {
                     remember_relay(&self.relay_dir);
                     // (v298) Et la ligne à donner à un ami pour qu'il le rejoigne.
                     write_invitation(&self.relay_dir);
+                    // (v345) Le relais que ce PC tient lui-même : le compte connecté ici
+                    // l'administre (bannir pour triche, inviter des passeurs sans joueur).
+                    if self.embedded.is_some()
+                        || (self.link_auto && OWN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        if let Err(e) = minelib_relay::add_admins(
+                            &self.relay_dir,
+                            std::slice::from_ref(&pseudo),
+                        ) {
+                            log::warn!("administrateurs du relais de ce PC : {e}");
+                        }
+                    }
                     // Compte gardé sur ce PC : connexion automatique au prochain lancement.
                     if let Some((p, w)) = self.sent.take() {
                         self.login_secret = Some((p.clone(), w.clone()));
@@ -1140,6 +1194,26 @@ impl Accounts {
                 // (v344) Le compte vient d'être copié sur ce relais (il ne l'avait pas), sans
                 // sa double authentification : elle ne se copie pas d'un relais à l'autre. Si
                 // ce PC la lui connaît, le joueur le sait tout de suite.
+                // (v345) Le compte est entier sur ce relais officiel : plus rien à y faire
+                // déménager depuis ce PC.
+                Event::AccountMoved { pseudo, relay, key } => {
+                    let path = self.moved_path(&pseudo);
+                    let mut done = std::fs::read_to_string(&path).unwrap_or_default();
+                    let hex = crypto::hex(&key);
+                    if !done.lines().any(|l| l.trim() == hex) {
+                        done.push_str(&hex);
+                        done.push('\n');
+                        if let Some(d) = path.parent() {
+                            let _ = std::fs::create_dir_all(d);
+                        }
+                        let _ = std::fs::write(&path, done);
+                    }
+                    self.copied_without_totp = None;
+                    self.info = Some(format!(
+                        "Ton compte est sur le relais officiel « {relay} », avec sa double \
+                         authentification : il y sera trouvé depuis n'importe quel PC."
+                    ));
+                }
                 Event::AccountCopied { pseudo, relay } => {
                     if self.had_totp(&pseudo) {
                         log::warn!(
@@ -1403,6 +1477,7 @@ impl Accounts {
                 | Event::Zeus { .. }
                 | Event::BuildSpawn { .. }
                 | Event::RespawnReply { .. }
+                | Event::PasseurInvitation(_)
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)
                 | Event::MapCertified { .. }
@@ -2735,6 +2810,37 @@ mod relay_tests {
 /// jusqu'à `scroll`, suite déjà demandée quand on en avait `asked`.
 fn rank_more(have: usize, scroll: usize, asked: usize) -> bool {
     have > 0 && have.is_multiple_of(proto::RANK_PAGE) && asked != have && scroll + 60 >= have
+}
+
+#[cfg(test)]
+mod move_tests {
+    /// (v345) Avant chaque connexion, le jeu donne au client de quoi faire déménager le
+    /// compte (2FA comprise) vers un relais officiel, ou rien (`MoveHome(None)`, par exemple
+    /// sans relais officiel) : jamais le reste d'une demande d'avant. Le compte déménagé, ce
+    /// PC le retient (`AccountMoved`).
+    #[test]
+    fn every_login_says_first_what_the_account_takes_if_it_moves() {
+        let src = include_str!("account.rs");
+        let f = &src[src.find("    fn send(&mut self, cmd: Cmd) {").unwrap()..];
+        let f = &f[..f.find("\n    }\n").unwrap()];
+        let (home, send) = (
+            f.find("Cmd::MoveHome(home)").unwrap(),
+            f.rfind("self.client().send(cmd)").unwrap(),
+        );
+        assert!(home < send, "{f}");
+        assert!(f.contains("if let Cmd::Login { pseudo, .. } = &cmd"));
+        let moved = &src[src
+            .find("Event::AccountMoved { pseudo, relay, key } => {")
+            .unwrap()..];
+        let moved = &moved[..moved.find("Event::AccountCopied").unwrap()];
+        assert!(moved.contains("self.moved_path(&pseudo)") && moved.contains("crypto::hex(&key)"));
+        let f = &src[src.find("    fn move_home_for(").unwrap()..];
+        let f = &f[..f.find("\n    }\n").unwrap()];
+        assert!(
+            f.contains("minelib_p2p::official()") && f.contains("export.totp?"),
+            "{f}"
+        );
+    }
 }
 
 #[cfg(test)]

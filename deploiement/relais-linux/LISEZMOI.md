@@ -43,7 +43,9 @@ Il est joignable sans port ouvert (iroh). Options :
 - `--name <nom>` : le nom du relais ;
 - `--journaux` : recevoir les journaux réseau des joueurs qui les partagent ;
 - `--pow <bits>` : la preuve de travail demandée aux inscriptions ;
-- `--no-dht` : ne pas s'inscrire dans le DHT.
+- `--no-dht` : ne pas s'inscrire dans le DHT ;
+- (v345) `--admin <pseudo>` : ce compte administre le relais (bannir pour triche, inviter
+  des passeurs). L'option peut être donnée plusieurs fois.
 
 **Un passeur sans joueur :**
 
@@ -59,6 +61,15 @@ Options :
 - `--port <n>` : le premier port UDP (sinon, n'importe lesquels, à ouvrir tous) ;
 - `--relais "<nœud> <clé> <nom>"` : un relais à servir en plus des relais officiels et de
   ceux du DHT (la ligne d'une invitation). L'option peut être donnée plusieurs fois.
+- (v345) `--invitation "<invitation>"` : l'invitation donnée par un administrateur du
+  relais, dans le jeu : `/passeurs inviter` (valable 7 jours, pour 4 passeurs par défaut,
+  `/passeurs inviter 8` pour 8). Le passeur la donne à ce relais à chaque connexion et y
+  devient de confiance : il porte alors aussi les parties FPS, à 256 tick. Il n'y a plus rien
+  à faire ensuite (mises à jour, redémarrages, nouvelle adresse IP). L'administrateur retire
+  sa confiance à un passeur avec `/passeurs retirer <pseudo>` ; `/passeurs liste` les montre.
+
+**Les deux sur la même machine** (v345) : relancer le script avec l'autre mode. Le relais a
+le service `minelib-relay`, le passeur `minelib-passeur`.
 
 Si aucune version pour Linux n'est encore publiée, l'installation attend : la minuterie
 installe le relais dans les dix minutes qui suivent sa publication.
@@ -69,23 +80,24 @@ installe le relais dans les dix minutes qui suivent sa publication.
 | --- | --- |
 | Le programme et sa version | `/opt/minelib-relay` (`version` : le numéro en place) |
 | Les données (comptes, clé du nœud) | `/var/lib/minelib-relay` |
-| Le service | `minelib-relay` |
+| Les services | `minelib-relay` (relais), `minelib-passeur` (passeur) |
 | La minuterie de mise à jour | `minelib-relay-maj` |
 
 Le service tourne sous le compte système `minelib`, sans connexion possible.
 
 ## Suivre et changer
 
-- **État :** `systemctl status minelib-relay`
-- **Journal :** `journalctl -u minelib-relay -f`
+- **État :** `systemctl status minelib-relay` (ou `minelib-passeur`)
+- **Journal :** `journalctl -u minelib-relay -f` (ou `minelib-passeur`)
 - **Vérifier tout de suite s'il y a une mise à jour :** `sudo systemctl start minelib-relay-maj`
 - **Changer les options :** relancer `installer.sh` avec les nouvelles (les données
   restent).
 - **Tout retirer :**
 
   ```sh
-  sudo systemctl disable --now minelib-relay minelib-relay-maj.timer
-  sudo rm -r /opt/minelib-relay /var/lib/minelib-relay /etc/systemd/system/minelib-relay*
+  sudo systemctl disable --now minelib-relay minelib-passeur minelib-relay-maj.timer
+  sudo rm -r /opt/minelib-relay /var/lib/minelib-relay /etc/systemd/system/minelib-relay* \
+      /etc/systemd/system/minelib-passeur.service
   ```
 
 ## Ce que voit cette machine
@@ -101,7 +113,10 @@ bouts.
 ## À savoir
 
 - Les passeurs sans joueur servent aux liens avec les relais (construction, régions). Les
-  parties FPS ne prennent que des passeurs de confiance : au moins 3 parties jouées, et peu
-  de signalements. Un passeur sans joueur n'y sert donc pas.
+  parties FPS ne prennent que des passeurs de confiance : au moins 3 parties jouées et peu
+  de signalements, ou (v345) invités par un administrateur du relais (`--invitation`). Sans
+  invitation, un passeur sans joueur n'y sert donc pas. Quand il y a des passeurs de joueurs
+  et des passeurs invités, chaque chaîne prend un de chaque : des machines tenues par les
+  mêmes personnes ne voient jamais les deux bouts d'une route.
 - La mise à jour fait confiance aux Releases du dépôt, comme les jeux des joueurs.
   L'empreinte vérifie que le fichier téléchargé est bien celui qui a été publié.

@@ -2015,6 +2015,37 @@ impl Game {
                         );
                     }
                 }
+                // (v345) `/passeurs inviter` : l'invitation, copiée dans le presse-papier et
+                // écrite dans le dossier du jeu (elle est longue à recopier du tchat).
+                Event::PasseurInvitation(text) => {
+                    let path = self.paths.root.join("invitation_passeurs.txt");
+                    let saved = std::fs::write(&path, format!("{text}\n")).is_ok();
+                    let copied = arboard::Clipboard::new()
+                        .and_then(|mut c| c.set_text(text.clone()))
+                        .is_ok();
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(
+                            format!(
+                                "Invitation de passeurs, valable {} jours{}{}. L'hébergeur la met \
+                                 dans sa commande d'installation : installer.sh passeur \
+                                 --invitation \"…\".",
+                                minelib_net::proto::PASSEUR_INVITE_DAYS,
+                                if copied {
+                                    ", copiée dans le presse-papier"
+                                } else {
+                                    ""
+                                },
+                                if saved {
+                                    ", et écrite dans invitation_passeurs.txt (dossier du jeu)"
+                                } else {
+                                    ""
+                                },
+                            ),
+                            chat::YELLOW,
+                        );
+                        s.chat.say(text, chat::GREY);
+                    }
+                }
                 Event::ServerAdmin(text) => {
                     if let Some(s) = self.session.as_mut().filter(|_| !text.is_empty()) {
                         // Liste des OP demandée pour ouvrir l'éditeur de lumières : elle

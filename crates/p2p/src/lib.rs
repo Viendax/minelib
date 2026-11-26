@@ -147,6 +147,32 @@ pub fn format_relays(list: &[Ad]) -> String {
         .collect()
 }
 
+/// (v345) Invitation de passeurs : le secret donné par le relais (16 octets en
+/// hexadécimal), puis la ligne de ce relais (format de `parse_relays`). C'est ce que
+/// l'hébergeur d'un passeur sans joueur met dans sa commande d'installation
+/// (`minelib-relay --passeur --invitation "…"`).
+pub fn invitation(secret: &[u8; 16], relay: &Ad) -> String {
+    let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{hex} {}",
+        format_relays(std::slice::from_ref(relay)).trim_end()
+    )
+}
+
+/// (v345) Le secret et le relais d'une invitation de passeurs (`invitation`).
+pub fn parse_invitation(text: &str) -> Option<([u8; 16], Ad)> {
+    let (hex, rest) = text.trim().split_once(char::is_whitespace)?;
+    if hex.len() != 32 || !hex.is_ascii() {
+        return None;
+    }
+    let mut secret = [0u8; 16];
+    for (i, b) in secret.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    let ad = parse_relays(rest).into_iter().next()?;
+    Some((secret, ad))
+}
+
 /// Client du DHT, créé une fois et gardé (le rejoindre prend une à deux secondes).
 fn dht() -> Result<mainline::Dht> {
     static DHT: std::sync::Mutex<Option<mainline::Dht>> = std::sync::Mutex::new(None);
@@ -967,6 +993,27 @@ mod tests {
         for a in official() {
             assert_ne!(a.node, a.noise);
         }
+    }
+
+    /// (v345) Une invitation de passeurs se relit : le secret et le relais qui l'a donnée.
+    #[test]
+    fn a_passeur_invitation_reads_back() {
+        let relay = Ad {
+            node: [4; 32],
+            noise: [9; 32],
+            name: "Relais de Viendax".into(),
+            since: 0,
+            seen: 0,
+        };
+        let secret = [0xa5u8; 16];
+        let text = invitation(&secret, &relay);
+        assert_eq!(text.lines().count(), 1, "une seule ligne : {text}");
+        let (s, ad) = parse_invitation(&format!("  {text}\n")).unwrap();
+        assert_eq!(s, secret);
+        assert_eq!((ad.node, ad.noise), ([4; 32], [9; 32]));
+        assert_eq!(ad.name, "Relais de Viendax");
+        assert!(parse_invitation("abc 0101").is_none());
+        assert!(parse_invitation(&text[..40]).is_none(), "relais manquant");
     }
 
     #[test]

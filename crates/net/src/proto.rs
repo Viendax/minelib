@@ -88,6 +88,9 @@ use serde::{Deserialize, Serialize};
 /// (v331, toujours 75) `FastGuest::turn` et `FastWay::turn` (`FastTurn`).
 /// (v333, toujours 75) `Request::LinkTurn` et `Response::NearWay`.
 /// (v340, toujours 75) `Request::MapCertify`, `MapEntry::certified`.
+/// (v345, toujours 75) `Request::AccountMove`, `Request::AccountTotp` et `Response::Moved`
+/// (envoyés seulement à un relais officiel : un relais d'avant ferme la connexion, le jeu
+/// recopie alors le compte comme avant, sans sa double authentification).
 pub const PROTOCOL: u32 = 75;
 
 /// (v326) Mondes (ouverts ou endormis) d'un même créateur sur un relais. Au-delà, un nouveau
@@ -189,6 +192,26 @@ pub const SERVER_SEED: u8 = 21;
 pub const SERVER_RESPAWN: u8 = 22;
 /// (v344) Réponse à `SERVER_RESPAWN` : un `BuildSpawn` suit.
 pub const RESPAWN_FOLLOWS: &str = "spawn";
+/// (v345) Passeurs de confiance par invitation : un passeur sans joueur (machine toujours
+/// allumée) ne joue jamais, il n'avait donc jamais les 3 parties qu'il faut pour porter la
+/// voie rapide d'une partie FPS. Un administrateur du relais (`admins.txt`) l'invite.
+/// Ces actions valent hors de tout monde (un relais d'avant répond « Seulement sur un
+/// serveur de construction. », sans couper la connexion).
+/// `SERVER_PASSEUR_INVITE` : une invitation pour `reason` passeurs (4 si vide), valable
+/// `PASSEUR_INVITE_DAYS` jours ; réponse : son secret, en hexadécimal (32 caractères).
+pub const SERVER_PASSEUR_INVITE: u8 = 23;
+/// (v345) Administrateur : la liste des passeurs de confiance et des invitations ouvertes.
+pub const SERVER_PASSEUR_LIST: u8 = 24;
+/// (v345) Administrateur : retirer sa confiance au passeur `pseudo`.
+pub const SERVER_PASSEUR_REMOVE: u8 = 25;
+/// (v345) Un passeur donne son invitation (`reason` : le secret, en hexadécimal) ; réponse :
+/// `PASSEUR_TRUSTED` s'il est maintenant (ou déjà) de confiance, sinon pourquoi pas.
+pub const SERVER_PASSEUR_CLAIM: u8 = 26;
+/// (v345) Réponse à `SERVER_PASSEUR_CLAIM` : ce passeur est de confiance sur ce relais.
+pub const PASSEUR_TRUSTED: &str = "confiance";
+/// (v345) Durée d'une invitation de passeurs, et passeurs par invitation au plus.
+pub const PASSEUR_INVITE_DAYS: u64 = 7;
+pub const PASSEUR_INVITE_MAX: u8 = 16;
 
 /// (v229) Temps qu'il fait, dans `Response::SetWeather` : beau temps, pluie, orage ; ou
 /// aucun temps imposé (celui des horloges du monde, que chaque jeu calcule).
@@ -1053,6 +1076,30 @@ pub enum Request {
     MapCertify {
         sig: [u8; 32],
         on: bool,
+    },
+    /// (v345) Un compte qui déménage vers ce relais (un relais officiel), avec sa double
+    /// authentification : comme `Register` (même clé, même preuve de mot de passe, même
+    /// coffre, preuve de travail), plus le secret 2FA que garde le relais d'où il vient, un
+    /// code de ce secret (vérifié : pas de compte créé avec une 2FA à laquelle son
+    /// propriétaire ne sait pas répondre), et ses appareils de confiance. Le jeu ne l'envoie
+    /// qu'à un relais officiel. Réponse : `Moved`.
+    AccountMove {
+        pseudo: String,
+        pubkey: [u8; 32],
+        auth: [u8; 32],
+        vault: Vec<u8>,
+        pow: u64,
+        totp: Vec<u8>,
+        code: u32,
+        devices: Vec<[u8; 32]>,
+    },
+    /// (v345) Compte connecté, arrivé ici sans sa double authentification (recopié avec son
+    /// coffre) : la lui rendre, avec le secret du relais d'où il vient et un code de ce
+    /// secret, et ses appareils de confiance. Réponse : `TotpOn` (aussi s'il l'avait déjà).
+    AccountTotp {
+        totp: Vec<u8>,
+        code: u32,
+        devices: Vec<[u8; 32]>,
     },
 }
 
@@ -2065,6 +2112,12 @@ pub enum Response {
         dir: u8,
         send: bool,
         turn: Option<FastTurn>,
+    },
+    /// (v345) Compte déménagé (`AccountMove`) : sa ligne au registre, et le jeton de cet
+    /// appareil, désormais de confiance (le code 2FA vient d'être donné).
+    Moved {
+        index: u64,
+        device: [u8; 32],
     },
 }
 

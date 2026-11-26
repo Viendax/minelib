@@ -186,6 +186,9 @@ pub enum Cmd {
     /// (v320) Silence complet du relais au-delà duquel on le tient pour perdu (lien par
     /// des passeurs : plus long).
     Patience(Duration),
+    /// (v345) Pour la prochaine connexion (`Login`) : ce que le relais de ce PC garde du
+    /// compte, à faire déménager entier (2FA comprise) si le relais joint est officiel.
+    MoveHome(Option<MoveHome>),
     /// (v326) Nouveau monde de construction qui fait place en supprimant le monde `replace`
     /// (celui que dit `Event::WorldLimit`), avec le code de double authentification si le
     /// compte en a une.
@@ -348,6 +351,13 @@ pub enum Event {
         pseudo: String,
         relay: String,
     },
+    /// (v345) Le compte est sur ce relais officiel avec sa double authentification : il y a
+    /// déménagé (`MoveHome`), ou il l'y avait déjà. `key` : la clé du relais.
+    AccountMoved {
+        pseudo: String,
+        relay: String,
+        key: [u8; 32],
+    },
     LoggedIn {
         pseudo: String,
         fingerprint: String,
@@ -419,6 +429,10 @@ pub enum Event {
     },
     /// Réponse d'une commande d'OP (texte à afficher).
     ServerAdmin(String),
+    /// (v345) Invitation de passeurs donnée par le relais (`SERVER_PASSEUR_INVITE`) : la
+    /// ligne à mettre dans la commande d'installation d'un passeur sans joueur
+    /// (`minelib_p2p::invitation`), ou le secret seul si le relais n'a pas de nœud iroh.
+    PasseurInvitation(String),
     /// (v344) Réponse à `SERVER_RESPAWN` : un placement (`BuildSpawn`) suit, ou non (point
     /// d'apparition du monde : tout de suite). Rien au tchat.
     RespawnReply {
@@ -759,6 +773,18 @@ pub enum Event {
     },
 }
 
+/// (v345) Ce qu'un compte emporte en déménageant vers un relais officiel (`Cmd::MoveHome`) :
+/// le secret de sa double authentification et ses appareils de confiance, tels que les garde
+/// le relais de ce PC (`minelib_relay::export_account`), et les clés des relais officiels
+/// (ceux du jeu : `minelib_p2p::official`), seuls à les recevoir. Le relais joint doit avoir
+/// l'une d'elles (la connexion le vérifie) ; un autre relais ne reçoit rien.
+#[derive(Clone, Debug)]
+pub struct MoveHome {
+    pub totp: Vec<u8>,
+    pub devices: Vec<[u8; 32]>,
+    pub official: Vec<[u8; 32]>,
+}
+
 pub struct Client {
     tx: Sender<Cmd>,
     rx: Receiver<Event>,
@@ -971,6 +997,12 @@ struct Worker {
     pow_bits: u8,
     /// (v344) Nom du relais (son bonjour), pour le dire au joueur.
     relay_name: String,
+    /// (v345) Déménagement demandé pour la prochaine connexion (`Cmd::MoveHome`).
+    move_home: Option<MoveHome>,
+    /// (v345) Relais officiels qui n'ont pas su le faire (version d'avant) : plus essayé.
+    no_move: Vec<[u8; 32]>,
+    /// (v345) Le compte de la dernière connexion a-t-il la 2FA sur ce relais (`Welcome`) ?
+    welcome_totp: Option<bool>,
     /// Pseudo de la session ouverte.
     pseudo: String,
     /// Clé du relais connecté (sel de l'empreinte matérielle).
@@ -1052,6 +1084,9 @@ impl Worker {
             unreadable_said: false,
             pow_bits: 20,
             relay_name: String::new(),
+            move_home: None,
+            no_move: Vec::new(),
+            welcome_totp: None,
             pseudo: String::new(),
             relay_pub: [0; 32],
             garant: false,
@@ -2268,6 +2303,7 @@ impl Worker {
                 device,
             } => {
                 self.chan = None;
+                let home = self.move_home.take();
                 // Les clés du compte se calculent (une seconde environ) pendant qu'on
                 // cherche le relais et qu'on s'y connecte.
                 let (p, w) = (pseudo.clone(), password.clone());
@@ -2282,6 +2318,21 @@ impl Worker {
                 let keys = deriving
                     .join()
                     .map_err(|_| anyhow!("calcul des clés du compte interrompu"))??;
+                // (v345) Déménagement : seulement vers un relais officiel (clé vérifiée par la
+                // connexion), et il faut un code de la 2FA qui part avec le compte. Sans code,
+                // il est demandé d'abord ; la connexion suivante le donnera.
+                let home = home.filter(|h| {
+                    h.official.contains(&self.relay_pub) && !self.no_move.contains(&self.relay_pub)
+                });
+                // (Un mot de passe faux, que le coffre de ce PC refuse : il est dit d'abord.)
+                let vault_opens = backup
+                    .as_ref()
+                    .is_none_or(|v| crypto::open_identity(&keys, v).is_ok());
+                if home.is_some() && totp.is_none() && vault_opens {
+                    self.move_home = home;
+                    self.emit(Event::NeedTotp);
+                    return Ok(());
+                }
                 let wrong = error_text(ErrorCode::WrongCredentials, "");
                 match self.login(&pseudo, &keys, totp, device) {
                     // (v344) Sans copie du compte sur ce PC : peut-être un compte qu'un autre
@@ -2299,8 +2350,54 @@ impl Worker {
                         let vault = backup.unwrap_or_default();
                         let id = crypto::open_identity(&keys, &vault).map_err(|_| e)?;
                         let pubkey = id.verifying_key().to_bytes();
-                        self.emit(Event::Progress("Compte transféré sur ce relais…"));
                         let pow = crypto::pow_solve(&pseudo, &pubkey, self.pow_bits);
+                        // (v345) Vers un relais officiel : le compte entier, 2FA comprise.
+                        if let (Some(h), Some(code)) = (&home, totp) {
+                            self.emit(Event::Progress(
+                                "Déménagement du compte sur le relais officiel…",
+                            ));
+                            match self.request(&Request::AccountMove {
+                                pseudo: pseudo.clone(),
+                                pubkey,
+                                auth: keys.auth,
+                                vault: vault.clone(),
+                                pow,
+                                totp: h.totp.clone(),
+                                code,
+                                devices: h.devices.clone(),
+                            }) {
+                                Ok(Response::Moved { device: token, .. }) => {
+                                    log::info!(
+                                        "compte déménagé sur le relais « {} », avec sa double \
+                                         authentification",
+                                        self.relay_name
+                                    );
+                                    self.emit(Event::DeviceTrusted {
+                                        pseudo: pseudo.clone(),
+                                        token,
+                                    });
+                                    self.emit(Event::AccountMoved {
+                                        pseudo: pseudo.clone(),
+                                        relay: self.relay_name.clone(),
+                                        key: self.relay_pub,
+                                    });
+                                    return self.login(&pseudo, &keys, None, Some(token));
+                                }
+                                Ok(r) => return self.unexpected(r),
+                                // Relais officiel d'une version d'avant : il ne connaît pas la
+                                // demande et ferme la connexion. Le compte y est recopié comme
+                                // avant, sans sa double authentification.
+                                Err(err) => {
+                                    log::warn!(
+                                        "déménagement du compte : {err:#} — recopié sans sa \
+                                         double authentification"
+                                    );
+                                    self.no_move.push(self.relay_pub);
+                                    self.connect()?;
+                                }
+                            }
+                        }
+                        self.emit(Event::Progress("Compte transféré sur ce relais…"));
                         match self.request(&Request::Register {
                             pseudo: pseudo.clone(),
                             pubkey,
@@ -2321,6 +2418,57 @@ impl Worker {
                         });
                         self.login(&pseudo, &keys, totp, device)
                     }
+                    // (v345) Le relais officiel avait déjà le compte : recopié sans sa 2FA
+                    // (avec son coffre, par un autre PC), elle lui est rendue ; avec, rien à
+                    // faire.
+                    Ok(()) => match (&home, totp, self.welcome_totp) {
+                        (Some(h), Some(code), Some(false)) => {
+                            match self.request(&Request::AccountTotp {
+                                totp: h.totp.clone(),
+                                code,
+                                devices: h.devices.clone(),
+                            }) {
+                                Ok(Response::TotpOn) => {
+                                    log::info!(
+                                        "double authentification rendue au compte sur le relais « {} »",
+                                        self.relay_name
+                                    );
+                                    self.emit(Event::TotpOn);
+                                    self.emit(Event::AccountMoved {
+                                        pseudo: pseudo.clone(),
+                                        relay: self.relay_name.clone(),
+                                        key: self.relay_pub,
+                                    });
+                                    Ok(())
+                                }
+                                Ok(Response::Error { code, message }) => {
+                                    self.emit(Event::Error(format!(
+                                        "La double authentification n'a pas été reprise sur ce \
+                                         relais : {}",
+                                        error_text(code, &message)
+                                    )));
+                                    Ok(())
+                                }
+                                Ok(r) => {
+                                    log::warn!("double authentification rendue : réponse {r:?}");
+                                    Ok(())
+                                }
+                                Err(err) => {
+                                    self.no_move.push(self.relay_pub);
+                                    Err(err)
+                                }
+                            }
+                        }
+                        (Some(_), Some(_), Some(true)) => {
+                            self.emit(Event::AccountMoved {
+                                pseudo: pseudo.clone(),
+                                relay: self.relay_name.clone(),
+                                key: self.relay_pub,
+                            });
+                            Ok(())
+                        }
+                        _ => Ok(()),
+                    },
                     r => r,
                 }
             }
@@ -2591,6 +2739,21 @@ impl Worker {
                 Ok(())
             }
             Cmd::ServerAdmin {
+                action: proto::SERVER_PASSEUR_INVITE,
+                pseudo,
+                reason,
+            } => match self.request(&Request::ServerAdmin {
+                action: proto::SERVER_PASSEUR_INVITE,
+                pseudo,
+                reason,
+            })? {
+                Response::ServerAdmin { text } => {
+                    self.emit(Event::PasseurInvitation(text));
+                    Ok(())
+                }
+                r => self.unexpected(r),
+            },
+            Cmd::ServerAdmin {
                 action,
                 pseudo,
                 reason,
@@ -2618,6 +2781,10 @@ impl Worker {
             Cmd::Passeur(on) => self.set_passeur(on),
             Cmd::Patience(d) => {
                 self.patience = d;
+                Ok(())
+            }
+            Cmd::MoveHome(h) => {
+                self.move_home = h;
                 Ok(())
             }
             Cmd::PasseurAt { ip, port } => {
@@ -3039,6 +3206,7 @@ impl Worker {
         totp: Option<u32>,
         device: Option<[u8; 32]>,
     ) -> Result<()> {
+        self.welcome_totp = None;
         let hw = crate::hw::fingerprints_for(&self.relay_pub);
         let r = self.request(&Request::Login {
             pseudo: pseudo.to_string(),
@@ -3076,6 +3244,7 @@ impl Worker {
         match self.request(&Request::Prove { signature })? {
             Response::Welcome { pseudo, totp } => {
                 self.pseudo = pseudo.clone();
+                self.welcome_totp = Some(totp);
                 self.emit(Event::Identity(id.clone()));
                 if let Some(c) = &self.chan {
                     self.emit(Event::Link(c.pusher()));
@@ -3176,7 +3345,10 @@ mod silence_tests {
         let s = Duration::from_secs;
         assert!(!silent(s(9), true, s(4)), "pas encore dix secondes");
         assert!(silent(s(11), true, s(4)));
-        assert!(!silent(s(11), false, s(4)), "aucun ping depuis : sortie de veille");
+        assert!(
+            !silent(s(11), false, s(4)),
+            "aucun ping depuis : sortie de veille"
+        );
         assert!(!silent(s(40), true, s(1)), "le ping vient de partir");
         assert!(silent(s(40), true, s(4)));
     }

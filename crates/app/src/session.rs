@@ -10263,6 +10263,43 @@ impl Session {
                 });
                 true
             }
+            // (v345) Passeurs de confiance du relais (ses administrateurs : `admins.txt`, et
+            // le compte connecté sur le PC qui tient le relais) : une invitation pour des
+            // passeurs sans joueur, la liste, retirer sa confiance à l'un d'eux.
+            "passeurs" | "passeur" => {
+                let sub = words.get(1).map(|w| w.to_lowercase()).unwrap_or_default();
+                let (action, pseudo, reason) = match sub.as_str() {
+                    "inviter" | "invite" | "invitation" => (
+                        minelib_net::proto::SERVER_PASSEUR_INVITE,
+                        String::new(),
+                        words.get(2).map_or("4".to_string(), |n| n.to_string()),
+                    ),
+                    "liste" | "list" | "" => (
+                        minelib_net::proto::SERVER_PASSEUR_LIST,
+                        String::new(),
+                        String::new(),
+                    ),
+                    "retirer" | "remove" | "del" if words.len() > 2 => (
+                        minelib_net::proto::SERVER_PASSEUR_REMOVE,
+                        words[2].to_string(),
+                        String::new(),
+                    ),
+                    _ => {
+                        self.chat.say(
+                            "Usage : /passeurs inviter [n] | liste | retirer <pseudo> \
+                             (administrateurs du relais).",
+                            chat::GREY,
+                        );
+                        return true;
+                    }
+                };
+                self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                    action,
+                    pseudo,
+                    reason,
+                });
+                true
+            }
             "unreport" | "designaler" => {
                 let Some(target) = words.get(1) else {
                     self.chat.say("Usage : /unreport <pseudo>.", chat::GREY);

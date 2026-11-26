@@ -936,6 +936,13 @@ fn reassign(st: &mut State, id: u64) {
 /// (v320) Le nœud iroh `node` sert ce relais (`Node::serve`) : ses joueurs, entrés par les
 /// serveurs d'iroh, peuvent lui demander une route par des passeurs vers lui-même (leur
 /// lien avec lui : comptes, mondes, cartes, parties FPS), et il en tient le bout hôte.
+impl Fast {
+    /// (v345) Le nœud iroh de ce relais (le premier donné), s'il en a un.
+    pub(crate) fn own_node(&self) -> Option<[u8; 32]> {
+        self.own_nodes.first().copied()
+    }
+}
+
 pub(crate) fn set_own_node(st: &mut State, node: [u8; 32]) {
     if !st.fast.own_nodes.contains(&node) {
         st.fast.own_nodes.push(node);
@@ -1913,7 +1920,7 @@ fn choose(
     skip: &[u64],
     apart: bool,
 ) -> (Vec<(u64, SocketAddrV4)>, usize) {
-    let mut cands: Vec<(usize, f32, u64, SocketAddrV4)> = st
+    let mut cands: Vec<(usize, f32, u64, SocketAddrV4, bool)> = st
         .fast
         .offers
         .iter()
@@ -1934,7 +1941,10 @@ fn choose(
             {
                 return None;
             }
-            if !super::unrelated(st, name, names) || !super::trusted(st, name) {
+            // (v345) Un passeur invité par un administrateur du relais (`confiance`) n'a pas
+            // besoin d'avoir joué : c'est une machine toujours allumée, il ne joue jamais.
+            let ours = st.passeurs_ok.trusts(name);
+            if !super::unrelated(st, name, names) || !(ours || super::trusted(st, name)) {
                 return None;
             }
             let load = st.fast.load(p);
@@ -1942,7 +1952,7 @@ fn choose(
             // dit qu'un passeur n'est pas à l'autre bout du monde.
             let ms = super::link_ms(c).unwrap_or(999.0);
             let tier = (ms / 20.0) as usize;
-            (load < LOAD_MAX).then(|| (tier * 1000 + load, ms, p, o.addr))
+            (load < LOAD_MAX).then(|| (tier * 1000 + load, ms, p, o.addr, ours))
         })
         .collect();
     // Les mieux connectés d'abord (par tranches), puis les moins chargés (le numéro
@@ -1953,10 +1963,10 @@ fn choose(
             .then(a.2.cmp(&b.2))
     });
     // Jamais deux passeurs d'une même partie à la même adresse (une seule box).
-    let mut picked: Vec<(u64, SocketAddrV4)> = Vec::new();
-    for (_, _, p, addr) in cands {
-        if !apart || picked.iter().all(|(_, a)| a.ip() != addr.ip()) {
-            picked.push((p, addr));
+    let mut picked: Vec<(u64, SocketAddrV4, bool)> = Vec::new();
+    for (_, _, p, addr, ours) in cands {
+        if !apart || picked.iter().all(|(_, a, _)| a.ip() != addr.ip()) {
+            picked.push((p, addr, ours));
         }
     }
     // (v308) Deux passeurs par voie (une chaîne).
@@ -1965,7 +1975,32 @@ fn choose(
     } else {
         (picked.len() / (2 * groups.len())).min(PER_GROUP)
     };
-    (picked, per)
+    (mix_chains(picked, per * 2 * groups.len()), per)
+}
+
+/// (v345) Les passeurs invités (`ours`) tournent sur des machines tenues par les mêmes
+/// personnes : deux dans une même chaîne verraient les deux bouts d'une route (l'adresse IP
+/// du joueur et celle de l'hôte). Tant qu'il y a des passeurs des deux sortes, chaque chaîne
+/// prend donc un passeur de joueur (premier, du côté du joueur) et un invité (second, du côté
+/// de l'hôte) ; le reste des `need` premiers garde l'ordre (les mieux placés d'abord). Ceux
+/// d'après ne servent pas.
+fn mix_chains(picked: Vec<(u64, SocketAddrV4, bool)>, need: usize) -> Vec<(u64, SocketAddrV4)> {
+    let theirs: Vec<(u64, SocketAddrV4)> =
+        picked.iter().filter(|p| !p.2).map(|p| (p.0, p.1)).collect();
+    let ours: Vec<(u64, SocketAddrV4)> =
+        picked.iter().filter(|p| p.2).map(|p| (p.0, p.1)).collect();
+    let mixed = theirs.len().min(ours.len()).min(need / 2);
+    let mut out: Vec<(u64, SocketAddrV4)> = Vec::with_capacity(picked.len());
+    for i in 0..mixed {
+        out.push(theirs[i]);
+        out.push(ours[i]);
+    }
+    for (p, addr, _) in picked {
+        if !out.iter().any(|(q, _)| *q == p) {
+            out.push((p, addr));
+        }
+    }
+    out
 }
 
 /// Voie rapide fermée pour ces joueurs et leur hôte (pas assez de passeurs).
@@ -1994,6 +2029,7 @@ mod tests {
     use crate::{start, stats, Config};
     use minelib_net::client::{Client, Cmd, Event};
     use minelib_net::fast::Endpoint;
+    use minelib_net::proto;
     use std::time::Duration;
 
     fn wait(c: &Client, pred: impl Fn(&Event) -> bool) -> Event {
@@ -3320,6 +3356,143 @@ mod tests {
         assert_ne!(ea.vias(0), eb.vias(0));
         assert_eq!(eh.ways(), 2);
         drop(ps);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v345) Deux passeurs sans aucune partie jouée, invités par un administrateur du relais
+    /// (des machines toujours allumées), et deux passeurs de joueurs qui ont assez joué : la
+    /// partie FPS a sa voie rapide, et chaque chaîne prend un passeur de chaque sorte (les
+    /// machines invitées, tenues par les mêmes personnes, ne voient jamais les deux bouts
+    /// d'une route). Un troisième invité, l'invitation épuisée, ne sert pas. Un joueur qui
+    /// n'est pas administrateur ne peut pas inviter. La confiance retirée, le passeur ne l'a
+    /// plus.
+    #[test]
+    fn invited_passeurs_carry_fps_games_alongside_players_passeurs() {
+        let _turn = TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("minelib-invites-{}", rand::random::<u32>()));
+        {
+            let mut st = stats::Store::open(dir.join("stats")).unwrap();
+            for g in ["Vol1", "Vol2"] {
+                st.get_mut(g).games = 5;
+                st.save(g);
+            }
+        }
+        std::fs::write(dir.join("admins.txt"), "Chef\n").unwrap();
+        crate::ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let admin =
+            |c: &Client, action: u8, pseudo: &str, reason: &str| -> Result<String, String> {
+                c.send(Cmd::ServerAdmin {
+                    action,
+                    pseudo: pseudo.into(),
+                    reason: reason.into(),
+                });
+                let t = Instant::now();
+                loop {
+                    match c.poll() {
+                        Some(Event::ServerAdmin(text)) => return Ok(text),
+                        // (L'invitation a son événement à elle, que le jeu copie et enregistre.)
+                        Some(Event::PasseurInvitation(text)) => return Ok(text),
+                        Some(Event::Error(m)) => return Err(m),
+                        _ => {}
+                    }
+                    assert!(t.elapsed() < Duration::from_secs(30), "délai dépassé");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            };
+        let chef = login("Chef");
+        let secret = admin(&chef, proto::SERVER_PASSEUR_INVITE, "", "2").unwrap();
+        // (Ce relais d'essai n'a pas de nœud iroh : le secret seul, sans sa ligne.)
+        assert_eq!(secret.len(), 32, "{secret}");
+        let vols: Vec<Client> = ["Vol1", "Vol2"].iter().map(|p| login(p)).collect();
+        let refused = admin(&vols[0], proto::SERVER_PASSEUR_INVITE, "", "2").unwrap_err();
+        assert!(refused.contains("administrateurs"), "{refused}");
+        let invited: Vec<(Client, String)> = ["PsUn", "PsDeux", "PsTrois"]
+            .iter()
+            .map(|p| {
+                let c = login(p);
+                let said = admin(&c, proto::SERVER_PASSEUR_CLAIM, "", &secret).unwrap();
+                (c, said)
+            })
+            .collect();
+        assert_eq!(invited[0].1, proto::PASSEUR_TRUSTED);
+        assert_eq!(invited[1].1, proto::PASSEUR_TRUSTED);
+        assert_ne!(invited[2].1, proto::PASSEUR_TRUSTED, "invitation épuisée");
+        // Redonnée par un passeur déjà de confiance : elle ne compte pas.
+        let again = admin(&invited[0].0, proto::SERVER_PASSEUR_CLAIM, "", &secret).unwrap();
+        assert_eq!(again, proto::PASSEUR_TRUSTED);
+        for c in vols.iter().chain(invited.iter().map(|(c, _)| c)) {
+            c.send(Cmd::Passeur(true));
+        }
+        until(|| h.state.lock().unwrap().fast.verified() == 5);
+        let search = |c: &Client| {
+            c.send(Cmd::Search {
+                map_sig: [3; 32],
+                map: "carte".into(),
+                players: 10,
+            });
+            wait(c, |e| matches!(e, Event::Joined { .. } | Event::Hosted(_)));
+        };
+        let peer_of = |host: &Client| match wait(host, |e| matches!(e, Event::PeerJoined { .. })) {
+            Event::PeerJoined { peer, .. } => peer,
+            _ => unreachable!(),
+        };
+        let host = login("Hote");
+        search(&host);
+        let a = login("Alice");
+        search(&a);
+        let a_id = peer_of(&host);
+        let b = login("Bob");
+        search(&b);
+        let b_id = peer_of(&host);
+        host.send(Cmd::FastWant(vec![vec![a_id], vec![b_id]]));
+        let (eh, ea, eb) = (fast(&host).unwrap(), fast(&a).unwrap(), fast(&b).unwrap());
+        assert_eq!((ea.vias(0).len(), eb.vias(0).len()), (1, 1));
+        {
+            let st = h.state.lock().unwrap();
+            let rid = *st.fast.rooms.keys().next().unwrap();
+            let name = |id: &u64| st.conns[id].pseudo.clone().unwrap();
+            let chains = &st.fast.rooms[&rid].picked;
+            assert_eq!(chains.len(), 2);
+            for chain in chains {
+                let names: Vec<String> = chain.iter().map(name).collect();
+                assert_eq!(names.len(), 2, "{names:?}");
+                // Le premier (côté joueur) est un passeur de joueur, le second un invité.
+                assert!(names[0].starts_with("Vol"), "{names:?}");
+                assert!(names[1].starts_with("Ps"), "{names:?}");
+                assert!(!names.contains(&"PsTrois".to_string()));
+            }
+        }
+        until(|| eh.open(a_id) && eh.open(b_id) && ea.open(0) && eb.open(0));
+        // La liste, puis la confiance retirée à l'un d'eux.
+        let list = admin(&chef, proto::SERVER_PASSEUR_LIST, "", "").unwrap();
+        assert!(
+            list.contains("psun") && list.contains("psdeux") && !list.contains("pstrois"),
+            "{list}"
+        );
+        let said = admin(&chef, proto::SERVER_PASSEUR_REMOVE, "PsUn", "").unwrap();
+        assert!(said.contains("n'est plus"), "{said}");
+        assert!(!h.state.lock().unwrap().passeurs_ok.trusts("PsUn"));
+        let said = admin(&chef, proto::SERVER_PASSEUR_REMOVE, "PsUn", "").unwrap();
+        assert!(said.contains("n'était pas"), "{said}");
+        drop(invited);
+        drop(vols);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
