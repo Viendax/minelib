@@ -19,6 +19,10 @@
 //! et y devient de confiance : il porte aussi les parties FPS.
 //! `--admin <pseudo>` (relais) : ce compte administre le relais (`admins.txt`, plusieurs fois
 //! possible) : bannir pour triche.
+//!
+//! (v347) Un passeur envoie ses lignes de journal réseau aux relais qui les demandent
+//! (`minelib_net::netlog` : ni pseudo, ni adresse, ni nœud), comme un jeu dont le joueur l'a
+//! accepté, sans question : il n'y a pas de joueur. `--sans-journaux` : ne pas les envoyer.
 
 use anyhow::Result;
 
@@ -27,6 +31,20 @@ fn main() -> Result<()> {
         "info,mainline=error,iroh=warn,iroh_relay=warn,iroh_quinn=warn,iroh_quinn_proto=warn,\
          quinn=warn,quinn_proto=warn,tracing=warn,portmapper=warn,netwatch=warn,pkarr=warn",
     ))
+    // (v347) Chaque ligne est aussi proposée au journal réseau partagé : seules les lignes
+    // réseau connues y entrent, et seulement s'il est partagé (passeur).
+    .format(|buf, record| {
+        use std::io::Write;
+        let msg = record.args().to_string();
+        minelib_net::netlog::offer(&msg);
+        writeln!(
+            buf,
+            "[{} {:<5} {}] {msg}",
+            buf.timestamp(),
+            record.level(),
+            record.target()
+        )
+    })
     .init();
     // (v320) Passeur sans joueur.
     if std::env::args().any(|a| a == "--passeur") {
@@ -175,11 +193,18 @@ fn passeur_main() -> Result<()> {
     let mut port: u16 = 0;
     let mut extra: Vec<minelib_p2p::Ad> = Vec::new();
     let mut invites: Vec<([u8; 32], [u8; 16])> = Vec::new();
+    // (v347) Le journal réseau, envoyé aux relais qui le demandent, sauf `--sans-journaux`.
+    let mut share_logs = true;
     let mut i = 1;
     while i < args.len() {
         let v = args.get(i + 1).cloned().unwrap_or_default();
         match args[i].as_str() {
             "--passeur" => {
+                i += 1;
+                continue;
+            }
+            "--sans-journaux" => {
+                share_logs = false;
                 i += 1;
                 continue;
             }
@@ -213,6 +238,7 @@ fn passeur_main() -> Result<()> {
         }
         i += 2;
     }
+    minelib_net::netlog::set_share(share_logs);
     std::fs::create_dir_all(&dir)?;
     let key_path = dir.join("noeud.key");
     let secret: [u8; 32] = std::fs::read(&key_path)

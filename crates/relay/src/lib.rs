@@ -1022,6 +1022,12 @@ struct Conn {
     item_rate: (Instant, u32),
     /// (v224) Demandes de lumières de l'éditeur dans la seconde en cours (`LIGHT_RATE`).
     light_rate: (Instant, u32),
+    /// (v347) Demandes de skins dans la seconde en cours (`SKIN_RATE`).
+    skin_rate: (Instant, u32),
+    /// (v347) Venue par le tunnel sans adresse IP connue (« iroh:… ») : son lien passe par
+    /// un serveur relais d'iroh, ou des passeurs, ou TURN (le relais ne sait pas lequel).
+    /// Les skins qui lui partent sont comptés (`skin_get`).
+    no_ip: bool,
     /// (v229) Demandes de foudre dans la seconde en cours (`THOR_RATE`).
     thor_rate: (Instant, u32),
     /// (v244) Coups de la Foudre de Zeus déjà publiés ici (demande, fin de son
@@ -1090,6 +1096,8 @@ impl Conn {
             probe_dev: 0.0,
             talked: HashMap::new(),
             item_rate: (Instant::now(), 0),
+            skin_rate: (Instant::now(), 0),
+            no_ip: false,
             light_rate: (Instant::now(), 0),
             thor_rate: (Instant::now(), 0),
             zeus_seen: VecDeque::new(),
@@ -1495,6 +1503,12 @@ struct State {
     hardware: hardware::Store,
     /// (v345) Passeurs de confiance par invitation (`confiance`).
     passeurs_ok: confiance::Store,
+    /// (v347) Octets de skins qu'il reste à envoyer aux connexions sans adresse IP, et
+    /// dernier remplissage (`SKIN_NO_IP_PER_S`).
+    skin_no_ip: (f32, Instant),
+    /// (v347) « Plus tard » répondus depuis la dernière ligne du journal : par la part des
+    /// connexions sans adresse IP, par le rythme d'une connexion ; et quand.
+    skin_later: (u32, u32, Instant),
     servers: servers::Store,
     /// (v311) Mondes de construction connus de ce relais, ouverts ou endormis (`mondes`).
     worlds: mondes::Store,
@@ -1654,6 +1668,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
         maps,
         hardware: hardware::Store::open(cfg_dir.join("hardware.bin")),
         passeurs_ok: confiance::Store::open(cfg_dir.join("passeurs_confiance.bin")),
+        skin_no_ip: (SKIN_NO_IP_BURST, Instant::now()),
+        skin_later: (0, 0, Instant::now()),
         servers: servers::Store::open(cfg_dir.join("serveurs.bin")),
         worlds: mondes::Store::open(cfg_dir.join("mondes.bin")),
         bags: bags::Store::open(cfg_dir.join("sacs.bin")),
@@ -7033,6 +7049,78 @@ fn skin_path(dir: &Path, pseudo: &str) -> PathBuf {
         .join(format!("{}.png", crypto::hex(&h[..12])))
 }
 
+/// (v347) Skins qu'une connexion peut demander par seconde (le jeu en demande 4 au plus, 8
+/// d'un coup) ; au-delà : « plus tard » (`proto::SKIN_LATER`).
+const SKIN_RATE: u32 = 16;
+/// (v347) Skins envoyés en tout aux connexions sans adresse IP (`Conn::no_ip`) : octets par
+/// seconde, et d'un coup au plus. Leur lien passe sans doute par un serveur relais d'iroh,
+/// et tous ces liens passent alors par la seule connexion du relais à ce serveur (environ
+/// 120 Ko/s mesurés en v336, partagés avec tout le reste du jeu) : les skins n'en prennent
+/// pas plus d'un quart, même pour une foule.
+const SKIN_NO_IP_PER_S: f32 = 30.0 * 1024.0;
+const SKIN_NO_IP_BURST: f32 = 48.0 * 1024.0;
+
+/// (v347) Réponse à une demande de skin : le PNG (vide sans skin), ou « plus tard » quand
+/// cette connexion en a déjà trop demandé dans la seconde, ou que les connexions sans adresse
+/// IP en ont déjà reçu leur part. Le jeu redemande alors au bout de quelques secondes, le
+/// modèle par défaut en attendant.
+fn skin_get(st: &mut State, id: u64, who: String) -> Response {
+    // (Journal : de quoi savoir s'il faut alléger les skins, une ligne par 10 s au plus.)
+    let later = |st: &mut State, who: String, share: bool| {
+        let (by_share, by_rate, since) = &mut st.skin_later;
+        if share {
+            *by_share += 1;
+        } else {
+            *by_rate += 1;
+        }
+        if since.elapsed() >= Duration::from_secs(10) {
+            log::warn!(
+                "réseau (relais) : skins, « plus tard » répondu {} fois en {:.0} s : {} par la \
+                 part des connexions sans adresse IP ({:.0} Ko/s en tout), {} à des connexions \
+                 qui en demandaient plus de {} par seconde",
+                *by_share + *by_rate,
+                since.elapsed().as_secs_f32(),
+                *by_share,
+                SKIN_NO_IP_PER_S / 1024.0,
+                *by_rate,
+                SKIN_RATE
+            );
+            st.skin_later = (0, 0, Instant::now());
+        }
+        Response::Skin {
+            pseudo: who,
+            png: proto::SKIN_LATER.to_vec(),
+        }
+    };
+    let no_ip = match st.conns.get_mut(&id) {
+        Some(c) => {
+            if c.skin_rate.0.elapsed() >= Duration::from_secs(1) {
+                c.skin_rate = (Instant::now(), 0);
+            }
+            c.skin_rate.1 += 1;
+            if c.skin_rate.1 > SKIN_RATE {
+                return later(st, who, false);
+            }
+            c.no_ip
+        }
+        None => false,
+    };
+    let png = std::fs::read(skin_path(&st.cfg.dir, &who))
+        .ok()
+        .filter(|p| valid_skin(p))
+        .unwrap_or_default();
+    if no_ip && !png.is_empty() {
+        let (left, at) = &mut st.skin_no_ip;
+        *left = (*left + at.elapsed().as_secs_f32() * SKIN_NO_IP_PER_S).min(SKIN_NO_IP_BURST);
+        *at = Instant::now();
+        if *left < png.len() as f32 {
+            return later(st, who, true);
+        }
+        *left -= png.len() as f32;
+    }
+    Response::Skin { pseudo: who, png }
+}
+
 /// Un skin acceptable : PNG de 64 × 64 ou 64 × 32, 24 Ko au plus (en-tête vérifié ; le jeu
 /// qui l'affiche le décode et le revérifie).
 fn valid_skin(png: &[u8]) -> bool {
@@ -7719,13 +7807,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             Response::Done
         }
-        Request::SkinGet { pseudo: who } => {
-            let png = std::fs::read(skin_path(&st.cfg.dir, &who))
-                .ok()
-                .filter(|p| valid_skin(p))
-                .unwrap_or_default();
-            Response::Skin { pseudo: who, png }
-        }
+        Request::SkinGet { pseudo: who } => skin_get(st, id, who),
         Request::Report { pseudo: target } => {
             let Some(room) = my_room.and_then(|r| st.rooms.get(&r)) else {
                 return Some(err(
@@ -11629,6 +11711,57 @@ mod tests {
         assert!(wait_error(&c4).contains("Clé d'accès refusée"));
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v347) « Si y'avait vraiment 4000 joueurs » : un relais n'envoie pas plus de skins que
+    /// les serveurs relais d'iroh n'en portent. Aux connexions venues sans adresse IP, 30 Ko/s
+    /// en tout (48 Ko d'un coup) ; à chaque connexion, 16 demandes par seconde. Au-delà :
+    /// « plus tard », et le jeu redemande ensuite. Sans skin, la réponse vide ne compte pas.
+    #[test]
+    fn a_relay_sends_no_more_skins_than_iroh_servers_carry() {
+        let (h, dir) = crowd_world("skins_plus_tard");
+        {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            let far = crowd.conn(st, "Lointain", false);
+            st.conns.get_mut(&far).unwrap().no_ip = true;
+            let near = crowd.conn(st, "Voisin", false);
+            // Un skin de 20 Ko (en-tête valable).
+            let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+            png.extend_from_slice(b"IHDR");
+            png.extend_from_slice(&64u32.to_be_bytes());
+            png.extend_from_slice(&64u32.to_be_bytes());
+            png.resize(20 * 1024, 0);
+            let path = skin_path(&st.cfg.dir, "Peintre");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &png).unwrap();
+            let ask = |crowd: &Crowd, st: &mut State, id: u64, who: &str| -> Vec<u8> {
+                match crowd.ask(st, id, Request::SkinGet { pseudo: who.into() }) {
+                    Some(Response::Skin { png, .. }) => png,
+                    r => panic!("{r:?}"),
+                }
+            };
+            assert_eq!(ask(&crowd, st, far, "Peintre"), png);
+            assert_eq!(ask(&crowd, st, far, "Peintre"), png);
+            assert_eq!(ask(&crowd, st, far, "Peintre"), proto::SKIN_LATER);
+            // Sans skin : la réponse vide part quand même.
+            assert!(ask(&crowd, st, far, "Personne").is_empty());
+            // Une connexion avec son adresse (en direct) n'est pas comptée avec elles.
+            assert_eq!(ask(&crowd, st, near, "Peintre"), png);
+            // Une seconde plus tard : de nouveau un skin.
+            st.skin_no_ip.1 -= Duration::from_secs(1);
+            assert_eq!(ask(&crowd, st, far, "Peintre"), png);
+            // 16 demandes par seconde au plus par connexion.
+            for _ in 0..15 {
+                assert!(ask(&crowd, st, near, "Personne").is_empty());
+            }
+            assert_eq!(ask(&crowd, st, near, "Personne"), proto::SKIN_LATER);
+            st.conns.get_mut(&near).unwrap().skin_rate.0 -= Duration::from_secs(1);
+            assert!(ask(&crowd, st, near, "Personne").is_empty());
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

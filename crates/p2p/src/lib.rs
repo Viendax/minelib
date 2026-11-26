@@ -16,6 +16,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+mod debit;
 pub mod passeur;
 pub mod portmap;
 pub mod rendezvous;
@@ -553,16 +554,84 @@ async fn pipe(
     tcp: tokio::net::TcpStream,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
+    conn: iroh::endpoint::Connection,
 ) {
+    // (v347) La connexion TCP du jeu ou du relais, reconnue par `minelib_net::traffic`.
+    let key = match (tcp.local_addr(), tcp.peer_addr()) {
+        (Ok(a), Ok(b)) => minelib_net::traffic::key(a, b),
+        _ => None,
+    };
     let (mut r, mut w) = tcp.into_split();
     let up = async {
-        let _ = tokio::io::copy(&mut r, &mut send).await;
+        let _ = copy_up(
+            &mut r,
+            &mut send,
+            || on_iroh_servers(&conn),
+            |n| debit::note(n, key),
+        )
+        .await;
         let _ = send.finish();
     };
     let down = async {
         let _ = tokio::io::copy(&mut recv, &mut w).await;
     };
     tokio::join!(up, down);
+}
+
+/// (v347) Combien de temps le chemin d'une connexion reste tenu pour sûr (`on_iroh_servers`).
+const PATH_CHECK: Duration = Duration::from_millis(250);
+
+/// (v347) Ce que le jeu ou le relais écrit dans le tunnel, vers le nœud distant ; ce qui passe
+/// par les serveurs relais de l'équipe d'iroh (`slow`) est compté (`note`, voir `debit`).
+async fn copy_up<R, W>(
+    mut r: R,
+    mut w: W,
+    mut slow: impl FnMut() -> bool,
+    note: impl Fn(usize),
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut checked: Option<std::time::Instant> = None;
+    let mut on = false;
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            return w.flush().await;
+        }
+        if checked.is_none_or(|t| t.elapsed() >= PATH_CHECK) {
+            on = slow();
+            checked = Some(std::time::Instant::now());
+        }
+        if on {
+            note(n);
+        }
+        w.write_all(&buf[..n]).await?;
+    }
+}
+
+/// (v347) La connexion passe-t-elle en ce moment par un serveur relais de l'équipe d'iroh
+/// (pas par l'un des nôtres, `relais_iroh.txt`) ?
+fn on_iroh_servers(conn: &iroh::endpoint::Connection) -> bool {
+    static OURS: std::sync::OnceLock<Vec<iroh::RelayUrl>> = std::sync::OnceLock::new();
+    let ours = OURS.get_or_init(|| {
+        own_relay_urls()
+            .iter()
+            .filter_map(|u| u.parse().ok())
+            .collect()
+    });
+    let theirs = |a: &iroh::TransportAddr| match a {
+        iroh::TransportAddr::Relay(u) => !ours.contains(u),
+        _ => false,
+    };
+    let paths = conn.paths();
+    match paths.iter().find(|p| p.is_selected()) {
+        Some(p) => theirs(p.remote_addr()),
+        None => !paths.is_empty() && paths.iter().all(|p| theirs(p.remote_addr())),
+    }
 }
 
 /// (v329) Le nœud s'en va : son client TURN aussi (l'adresse relayée n'est plus dite aux
@@ -693,7 +762,7 @@ impl Node {
                 let Ok((send, recv)) = conn.open_bi().await else {
                     break;
                 };
-                tokio::spawn(pipe(tcp, send, recv));
+                tokio::spawn(pipe(tcp, send, recv, conn.clone()));
             }
         });
         Ok(local)
@@ -737,12 +806,13 @@ impl Node {
                     let Ok(conn) = incoming.await else { return };
                     while let Ok((send, recv)) = conn.accept_bi().await {
                         let who = remote_key(&conn, first);
+                        let conn = conn.clone();
                         tokio::spawn(async move {
                             match tokio::net::TcpStream::connect(local).await {
                                 Ok(mut tcp) => {
                                     use tokio::io::AsyncWriteExt;
                                     if tcp.write_all(&preamble(&who)).await.is_ok() {
-                                        pipe(tcp, send, recv).await
+                                        pipe(tcp, send, recv, conn).await
                                     }
                                 }
                                 Err(e) => log::warn!("tunnel vers le relais local : {e}"),
@@ -827,7 +897,7 @@ impl Node {
                 let Ok((send, recv)) = conn.open_bi().await else {
                     break;
                 };
-                tokio::spawn(pipe(tcp, send, recv));
+                tokio::spawn(pipe(tcp, send, recv, conn.clone()));
             }
         });
         Ok(local)
@@ -888,7 +958,7 @@ impl Node {
                 let Ok((send, recv)) = conn.open_bi().await else {
                     break;
                 };
-                tokio::spawn(pipe(tcp, send, recv));
+                tokio::spawn(pipe(tcp, send, recv, conn.clone()));
             }
         });
         Ok(addr)
@@ -898,6 +968,55 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v347) Ce que le tunnel écrit par les serveurs relais d'iroh est compté, tout et dans
+    /// l'ordre ; par un autre chemin, rien n'est compté.
+    #[test]
+    fn the_tunnel_counts_what_goes_by_iroh_servers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let data: Vec<u8> = (0..300_000u32).map(|i| i as u8).collect();
+        for slow in [false, true] {
+            let t0 = std::time::Instant::now();
+            let bucket = std::sync::Mutex::new(debit::Bucket::new(t0));
+            let got = rt.block_on(async {
+                let (mut game, tunnel_in) = tokio::io::duplex(1 << 20);
+                let (tunnel_out, mut far) = tokio::io::duplex(1 << 20);
+                let writer = async {
+                    game.write_all(&data).await.unwrap();
+                    drop(game);
+                };
+                let copier = copy_up(
+                    tunnel_in,
+                    tunnel_out,
+                    || slow,
+                    |n| {
+                        bucket.lock().unwrap().note(n, None, t0);
+                    },
+                );
+                let reader = async {
+                    let mut got = Vec::new();
+                    far.read_to_end(&mut got).await.unwrap();
+                    got
+                };
+                let (_, copied, got) = tokio::join!(writer, copier, reader);
+                copied.unwrap();
+                got
+            });
+            assert!(got == data, "tout arrive, dans l'ordre");
+            let report = bucket.lock().unwrap().report(t0 + Duration::from_secs(11));
+            if slow {
+                // 300 Ko d'un coup : bien au-delà de 100 Ko/s, sauf la réserve.
+                let r = report.expect("compté");
+                assert!(r.line(&[]).contains("Ko de trop"), "{r:?}");
+            } else {
+                assert!(report.is_none());
+            }
+        }
+    }
 
     fn ad(n: u8, since: u64) -> Ad {
         Ad {

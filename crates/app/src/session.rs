@@ -13367,7 +13367,10 @@ impl Session {
                     pitch: o.pitch,
                     crouch: o.crouch,
                     walk: None,
-                    skin: self.skins.of(&o.pseudo),
+                    // (v347) Les plus proches d'abord (le modèle par défaut en attendant).
+                    skin: self
+                        .skins
+                        .of_near(&o.pseudo, (o.pos - self.player.pos).length()),
                     covered: None,
                     held: o.held,
                     hurt: 0.0,

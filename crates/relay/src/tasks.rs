@@ -140,6 +140,8 @@ struct Link {
     out: Vec<u8>,
     group: Grouper,
     held: Option<Inbound>,
+    /// (v347) Ce qui part, par genre de message (`minelib_net::traffic`).
+    meter: minelib_net::traffic::Meter,
 }
 
 impl Link {
@@ -160,6 +162,7 @@ impl Link {
         let len = u16::try_from(n).map_err(|_| anyhow!("message trop long"))?;
         self.out.extend_from_slice(&len.to_be_bytes());
         self.out.extend_from_slice(&frame[..n]);
+        self.meter.sent(plain, n + 2);
         if self.out.len() >= transport::OUT_MAX {
             self.flush().await?;
         }
@@ -304,6 +307,9 @@ async fn handshake(
 pub(crate) async fn serve(stream: TcpStream, state: Arc<Mutex<State>>, peer: String) -> Result<()> {
     stream.set_nodelay(true)?;
     let private = state.lock().unwrap().id.noise_private;
+    // (v347) Par le tunnel : ce qui part se compte par genre (`minelib_net::traffic`).
+    let meter =
+        minelib_net::traffic::Meter::new(stream.local_addr().ok(), stream.peer_addr().ok(), true);
     let (rd, mut wr) = stream.into_split();
     // (Un joueur envoie au plus une centaine de petites trames par seconde : un petit
     // tampon suffit, et 60 000 connexions n'en prennent que 240 Mo de moins.)
@@ -323,6 +329,8 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<Mutex<State>>, peer: Str
         c.local = peer
             .parse::<std::net::IpAddr>()
             .is_ok_and(|a| a.is_loopback());
+        // (v347) Par le tunnel, sans adresse IP connue : voir `skin_get`.
+        c.no_ip = peer.starts_with("iroh:");
         st.conns.insert(id, c);
         id
     };
@@ -334,6 +342,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<Mutex<State>>, peer: Str
         out: Vec::new(),
         group: Grouper::new(),
         held: None,
+        meter,
     };
     let result = serve_loop(&mut link, &state, &peer, id).await;
     // (Un dernier message d'erreur, par exemple.)

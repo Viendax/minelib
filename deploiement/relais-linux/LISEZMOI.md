@@ -68,6 +68,7 @@ Options :
   FPS, à 256 tick. Il n'y a plus rien à faire ensuite (mises à jour, redémarrages, nouvelle
   adresse IP). `/forwarder remove <pseudo>` lui retire sa confiance ; `/forwarder list` les
   montre.
+- (v347) `--sans-journaux` : ne pas envoyer le journal réseau (voir plus bas).
 
 **Les deux sur la même machine** (v345) : relancer le script avec l'autre mode. Le relais a
 le service `minelib-relay`, le passeur `minelib-passeur`.
@@ -110,6 +111,11 @@ l'autre passeur de la chaîne. Il ne voit jamais le contenu : il est scellé de 
 
 **Deux passeurs tenus par la même personne** et mis dans la même chaîne verraient les deux
 bouts.
+
+**Le journal réseau** (v347) : un passeur envoie aux relais qui le demandent les mêmes lignes
+qu'un jeu dont le joueur a accepté de partager les siennes (« passeur (60 s) : … paquets
+portés », « tunnel : … », « réseau (…) »), sans la question : il n'y a pas de joueur. Elles
+ne contiennent ni pseudo, ni adresse, ni numéro de nœud. `--sans-journaux` les garde ici.
 
 ## À savoir
 

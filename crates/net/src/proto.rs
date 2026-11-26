@@ -214,6 +214,12 @@ pub const PASSEUR_TRUSTED: &str = "confiance";
 pub const PASSEUR_INVITE_DAYS: u64 = 7;
 pub const PASSEUR_INVITE_MAX: u8 = 16;
 
+/// (v347) Dans `Response::Skin`, à la place du PNG : « redemande plus tard ». Le relais a
+/// déjà envoyé ce qu'il s'est fixé de skins (par connexion, et en tout vers les joueurs venus
+/// sans adresse IP, dont le lien passe sans doute par un serveur relais d'iroh). Ce n'est pas
+/// un PNG : un jeu d'avant la v347 y voit un skin illisible et garde le modèle par défaut.
+pub const SKIN_LATER: &[u8] = b"plus tard";
+
 /// (v229) Temps qu'il fait, dans `Response::SetWeather` : beau temps, pluie, orage ; ou
 /// aucun temps imposé (celui des horloges du monde, que chaque jeu calcule).
 pub const WEATHER_CLEAR: u8 = 0;
@@ -1445,7 +1451,7 @@ pub enum Response {
         /// (v242) Invitations reçues, pas encore répondues (la plus récente d'abord).
         invites: Vec<WorldInvite>,
     },
-    /// Skin d'un joueur (vide : aucun).
+    /// Skin d'un joueur (vide : aucun ; (v347) `SKIN_LATER` : à redemander plus tard).
     Skin {
         pseudo: String,
         png: Vec<u8>,

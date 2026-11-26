@@ -288,7 +288,54 @@ mod tests {
         assert!(Skin::from_png(b"pas une image").is_err());
         assert!(Skin::from_png(&vec![0u8; MAX_BYTES + 1]).is_err());
     }
+
+    /// (v347) « Si y'avait vraiment 4000 joueurs » : les skins des plus proches sont demandés
+    /// d'abord, et seuls les `WANTED_MAX` plus proches attendent leur tour ; les autres
+    /// gardent le modèle par défaut jusqu'à ce qu'ils s'approchent.
+    #[test]
+    fn the_nearest_players_skins_are_asked_first_in_a_crowd() {
+        let mut skins = Skins::default();
+        // 4 000 joueurs vus, du plus loin au plus près.
+        for i in (0..4000).rev() {
+            assert!(skins.of_near(&format!("Joueur{i}"), i as f32).is_none());
+        }
+        assert_eq!(skins.wanted.borrow().len(), WANTED_MAX);
+        assert_eq!(
+            skins.take_wanted_max(4),
+            vec!["joueur0", "joueur1", "joueur2", "joueur3"]
+        );
+        // Un joueur lointain qui s'approche passe devant.
+        assert!(skins.of_near("Joueur3999", 0.5).is_none());
+        assert_eq!(skins.take_wanted_max(1), vec!["joueur3999"]);
+        // Déjà demandé : pas redemandé en attendant sa réponse.
+        assert!(skins.of_near("Joueur0", 0.0).is_none());
+        assert_eq!(skins.take_wanted_max(1), vec!["joueur4"]);
+        // Sans distance (liste des joueurs) : après ceux qu'on voit.
+        assert!(skins.of("Lointain").is_none());
+        let rest = skins.take_wanted_max(usize::MAX);
+        assert_eq!(rest.first().map(String::as_str), Some("joueur5"));
+        assert_eq!(rest.last().map(String::as_str), Some("lointain"));
+        assert!(skins.take_wanted_max(usize::MAX).is_empty());
+        // « Plus tard » : redemandé quand on le revoit ; un skin déjà connu reste.
+        assert!(skins.received("Joueur5", minelib_net::proto::SKIN_LATER));
+        assert!(skins.of_near("Joueur5", 3.0).is_none());
+        assert_eq!(skins.take_wanted_max(1), vec!["joueur5"]);
+        let png = {
+            let img = image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 10, 10, 255]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        assert!(!skins.received("Joueur6", &png));
+        assert!(skins.received("Joueur6", minelib_net::proto::SKIN_LATER));
+        assert!(skins.of_near("Joueur6", 1.0).is_some());
+        // Ni un skin illisible pour un jeu d'avant : le relais ne l'accepte pas comme skin.
+        assert!(Skin::from_png(minelib_net::proto::SKIN_LATER).is_err());
+    }
 }
+
+/// (v347) Pseudos à demander gardés au plus : les plus proches (`Skins::of_near`).
+const WANTED_MAX: usize = 64;
 
 /// Skins connus : le sien et ceux des autres (demandés au relais au besoin).
 #[derive(Default)]
@@ -296,8 +343,15 @@ pub struct Skins {
     mine: Option<Arc<Skin>>,
     /// Pseudo (minuscules) → skin (`None` : pas de skin, modèle par défaut).
     others: std::collections::HashMap<String, Option<Arc<Skin>>>,
-    /// Pseudos à demander au relais (vus sans skin connu).
-    wanted: std::cell::RefCell<Vec<String>>,
+    /// Pseudos à demander au relais (vus sans skin connu) : (v347) la distance du plus près
+    /// qu'on les a vus, et leur ordre d'arrivée. Les plus proches partent d'abord, à égalité
+    /// les premiers vus. Le modèle par défaut est dessiné en attendant.
+    wanted: std::cell::RefCell<std::collections::HashMap<String, (f32, u64)>>,
+    /// (v347) Ordre d'arrivée du prochain pseudo à demander.
+    wanted_seq: std::cell::Cell<u64>,
+    /// (v347) `wanted` plein : la plus grande distance gardée (ceux de plus loin sont
+    /// refusés d'un coup, sans parcourir la liste à chaque image).
+    farthest: std::cell::Cell<f32>,
     /// (v177) Skins des bots (nom, équipe), dessinés une fois.
     bots: std::cell::RefCell<std::collections::HashMap<(String, u8), Arc<Skin>>>,
 }
@@ -311,8 +365,17 @@ impl Skins {
         self.mine.clone()
     }
 
-    /// Skin d'un autre joueur ; inconnu : demandé au relais (une fois).
+    /// Skin d'un autre joueur ; inconnu : demandé au relais (une fois), après ceux qu'on voit
+    /// près de soi (`of_near`).
     pub fn of(&self, pseudo: &str) -> Option<Arc<Skin>> {
+        self.of_near(pseudo, f32::MAX)
+    }
+
+    /// (v347) Skin d'un autre joueur vu à `dist` blocs ; inconnu : demandé au relais, les
+    /// plus proches d'abord. Dans une foule (« si y'avait vraiment 4000 joueurs »), seuls
+    /// les `WANTED_MAX` plus proches attendent leur tour ; ceux de plus loin gardent le modèle
+    /// par défaut jusqu'à ce qu'ils s'approchent.
+    pub fn of_near(&self, pseudo: &str, dist: f32) -> Option<Arc<Skin>> {
         // Joueurs anonymes de l'échauffement (« Joueur 3 ») : modèle par défaut.
         if pseudo.is_empty() || pseudo.contains(' ') {
             return None;
@@ -333,12 +396,44 @@ impl Skins {
         match self.others.get(key) {
             Some(s) => s.clone(),
             None => {
-                let mut w = self.wanted.borrow_mut();
-                if w.len() < 64 && !w.iter().any(|k| k == key) {
-                    w.push(key.to_string());
-                }
+                self.want(key, dist);
                 None
             }
+        }
+    }
+
+    /// (v347) À demander, vu à `dist` blocs (le plus près qu'on l'ait vu compte).
+    fn want(&self, key: &str, dist: f32) {
+        let mut w = self.wanted.borrow_mut();
+        if let Some(d) = w.get_mut(key) {
+            d.0 = d.0.min(dist);
+            return;
+        }
+        if w.len() >= WANTED_MAX {
+            // Plein : seulement plus près que le plus loin gardé, qui laisse sa place.
+            if dist >= self.farthest.get() {
+                return;
+            }
+            // (`farthest` peut être trop grand : un joueur gardé s'est approché depuis.)
+            let Some((k, d)) = w
+                .iter()
+                .max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))
+                .map(|(k, d)| (k.clone(), d.0))
+            else {
+                return;
+            };
+            if dist >= d {
+                self.farthest.set(d);
+                return;
+            }
+            w.remove(&k);
+        }
+        let seq = self.wanted_seq.get();
+        self.wanted_seq.set(seq + 1);
+        w.insert(key.to_string(), (dist, seq));
+        if w.len() >= WANTED_MAX {
+            self.farthest
+                .set(w.values().fold(0.0f32, |m, d| m.max(d.0)));
         }
     }
 
@@ -389,22 +484,27 @@ impl Skins {
         if pseudo.is_empty() || pseudo.contains(' ') {
             return;
         }
-        let key = pseudo.to_lowercase();
-        let mut w = self.wanted.borrow_mut();
-        if !w.contains(&key) && w.len() < 64 {
-            w.push(key);
-        }
+        self.want(&pseudo.to_lowercase(), f32::MAX);
     }
 
     /// Pseudos à demander (et marqués comme demandés). (v344) Au plus `max` ; les autres
     /// restent à demander. Chaque
     /// demande attend sa réponse sur la connexion du joueur : par paquets, ses autres
-    /// commandes ne restent pas derrière elles.
+    /// commandes ne restent pas derrière elles. (v347) Les plus proches d'abord.
     pub fn take_wanted_max(&mut self, max: usize) -> Vec<String> {
+        if max == 0 {
+            return Vec::new();
+        }
         let w: Vec<String> = {
             let mut all = self.wanted.borrow_mut();
-            let n = max.min(all.len());
-            all.drain(..n).collect()
+            let mut order: Vec<(String, (f32, u64))> =
+                all.iter().map(|(k, d)| (k.clone(), *d)).collect();
+            order.sort_by(|a, b| a.1 .0.total_cmp(&b.1 .0).then(a.1 .1.cmp(&b.1 .1)));
+            order.truncate(max);
+            for (k, _) in &order {
+                all.remove(k);
+            }
+            order.into_iter().map(|(k, _)| k).collect()
         };
         for k in &w {
             self.others.entry(k.clone()).or_insert(None);
@@ -412,12 +512,23 @@ impl Skins {
         w
     }
 
-    /// Réponse du relais (PNG vide : pas de skin).
-    pub fn received(&mut self, pseudo: &str, png: &[u8]) {
+    /// Réponse du relais (PNG vide : pas de skin). (v347) Vrai pour « plus tard »
+    /// (`proto::SKIN_LATER`) : le relais en a déjà envoyé assez. Ce pseudo sera redemandé
+    /// quand on le reverra, avec les autres, les plus proches d'abord ; d'ici là, le modèle
+    /// par défaut (ou le skin déjà connu).
+    pub fn received(&mut self, pseudo: &str, png: &[u8]) -> bool {
+        let key = pseudo.to_lowercase();
+        if png == minelib_net::proto::SKIN_LATER {
+            if matches!(self.others.get(&key), Some(None)) {
+                self.others.remove(&key);
+            }
+            return true;
+        }
         let skin = (!png.is_empty())
             .then(|| Skin::from_png(png).ok())
             .flatten();
-        self.others.insert(pseudo.to_lowercase(), skin);
+        self.others.insert(key, skin);
+        false
     }
 
     /// Ce joueur a changé de skin : on le redemandera.

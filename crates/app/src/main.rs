@@ -420,6 +420,17 @@ struct Game {
     /// (v344) Demandes de skins au relais : jetons (`SKIN_ASKS_PER_S`, au plus
     /// `SKIN_ASKS_BURST`) et dernier remplissage.
     skin_asks: (f32, std::time::Instant),
+    /// (v347) Skins demandés sans réponse encore (pseudo en minuscules, quand) : au plus
+    /// `skin_in_flight` à la fois.
+    skin_flight: Vec<(String, std::time::Instant)>,
+    /// (v347) Le lien avec le relais du monde passe par un serveur relais d'iroh (regardé une
+    /// fois par seconde : `account::world_link_slow`).
+    skin_slow: (bool, std::time::Instant),
+    /// (v347) Dernier « plus tard » du relais (`proto::SKIN_LATER`) : plus aucune demande de
+    /// skin pendant `SKIN_LATER_WAIT`.
+    skin_later: Option<std::time::Instant>,
+    /// (v347) « Plus tard » reçus depuis la dernière ligne du journal, et quand.
+    skin_later_log: (u32, std::time::Instant),
     /// (v271) Pseudo proposé par le relais pour un ami inconnu (celui qui lui ressemble :
     /// « lside » pour « 1side ») : bouton « Ajouter » du panneau, tant que le message y est.
     friends_suggest: Option<String>,
@@ -637,6 +648,10 @@ impl Game {
             friends_note: None,
             friend_adding: None,
             skin_asks: (SKIN_ASKS_BURST, std::time::Instant::now()),
+            skin_flight: Vec::new(),
+            skin_slow: (false, std::time::Instant::now()),
+            skin_later: None,
+            skin_later_log: (0, std::time::Instant::now()),
             friends_suggest: None,
             current_room: None,
             slider_drag: None,
@@ -1842,8 +1857,13 @@ impl Game {
                     }
                 }
                 Event::Skin { pseudo, png } => {
+                    self.skin_flight
+                        .retain(|(p, _)| !p.eq_ignore_ascii_case(pseudo));
                     if let Some(s) = &mut self.session {
-                        s.skins.received(pseudo, png);
+                        if s.skins.received(pseudo, png) {
+                            self.skin_later = Some(std::time::Instant::now());
+                            self.skin_later_log.0 += 1;
+                        }
                     }
                 }
                 // (v165) Ping avec le relais du monde (construction : montré aux autres).
@@ -2961,14 +2981,53 @@ impl Game {
             s.update_head_skins(&self.accounts.pseudo());
             let dozing = self.accounts.dozing();
             // (v344) Quelques-unes par seconde : chacune attend sa réponse sur la connexion
-            // du joueur, ses autres commandes (tchat, /tp…) passent entre elles.
+            // du joueur, ses autres commandes (tchat, /tp…) passent entre elles. (v347) Pas
+            // plus vite que la connexion ne répond : `SKIN_IN_FLIGHT` demandes sans réponse au
+            // plus, et par un serveur relais d'iroh (débit limité par le serveur, 26 novembre
+            // à 02:54:56), une seule et une par seconde. Une réponse qui ne vient pas libère
+            // sa place au bout de `SKIN_REPLY_WAIT`.
+            if self.skin_slow.1.elapsed() >= std::time::Duration::from_secs(1) {
+                self.skin_slow = (account::world_link_slow(), std::time::Instant::now());
+            }
+            let slow = self.skin_slow.0;
+            let per_s = if slow {
+                SKIN_ASKS_SLOW_PER_S
+            } else {
+                SKIN_ASKS_PER_S
+            };
+            self.skin_flight
+                .retain(|(_, t)| t.elapsed() < SKIN_REPLY_WAIT);
             let (tokens, at) = &mut self.skin_asks;
-            *tokens = (*tokens + at.elapsed().as_secs_f32() * SKIN_ASKS_PER_S).min(SKIN_ASKS_BURST);
+            *tokens = (*tokens + at.elapsed().as_secs_f32() * per_s).min(SKIN_ASKS_BURST);
             *at = std::time::Instant::now();
-            let n = tokens.floor() as usize;
+            let paused = self
+                .skin_later
+                .is_some_and(|t| t.elapsed() < SKIN_LATER_WAIT);
+            // (Journal : de quoi savoir s'il faut alléger les skins.)
+            let (n_later, since) = self.skin_later_log;
+            if n_later > 0 && since.elapsed() >= std::time::Duration::from_secs(30) {
+                log::info!(
+                    "réseau (skins) : le relais a répondu « plus tard » {n_later} fois en {:.0} s \
+                     (il envoie déjà ce qu'il s'est fixé ; redemandés ensuite){}",
+                    since.elapsed().as_secs_f32(),
+                    if slow {
+                        ", lien par les serveurs relais d'iroh"
+                    } else {
+                        ""
+                    }
+                );
+                self.skin_later_log = (0, std::time::Instant::now());
+            }
+            let n = if paused {
+                0
+            } else {
+                skin_asks_now(*tokens, self.skin_flight.len(), slow)
+            };
             let wanted = s.skins.take_wanted_max(n);
             *tokens -= wanted.len() as f32;
             for p in wanted {
+                self.skin_flight
+                    .push((p.clone(), std::time::Instant::now()));
                 match s.build.as_ref().filter(|_| dozing) {
                     Some(b) => b.ask_skin(&p),
                     None => self.accounts.room(Cmd::SkinGet(p)),
@@ -2976,7 +3035,12 @@ impl Game {
             }
             if let Some(b) = s.build.as_mut() {
                 for (p, png) in b.take_skins() {
-                    s.skins.received(&p, &png);
+                    self.skin_flight
+                        .retain(|(q, _)| !q.eq_ignore_ascii_case(&p));
+                    if s.skins.received(&p, &png) {
+                        self.skin_later = Some(std::time::Instant::now());
+                        self.skin_later_log.0 += 1;
+                    }
                 }
             }
         }
@@ -6066,6 +6130,69 @@ const SHOT_COPY_S: f32 = 60.0;
 /// (v344) Skins demandés au relais : 4 par seconde, 8 d'un coup au plus.
 const SKIN_ASKS_PER_S: f32 = 4.0;
 const SKIN_ASKS_BURST: f32 = 8.0;
+/// (v347) Par un serveur relais d'iroh : un par seconde (un skin fait jusqu'à 24 Ko).
+const SKIN_ASKS_SLOW_PER_S: f32 = 1.0;
+/// (v347) Demandes de skins sans réponse, au plus (une seule par un serveur relais d'iroh).
+const SKIN_IN_FLIGHT: usize = 2;
+/// (v347) Une demande de skin sans réponse libère sa place au bout de ce temps.
+const SKIN_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// (v347) Après un « plus tard » du relais, plus aucune demande de skin pendant ce temps.
+const SKIN_LATER_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// (v347) Combien de skins demander maintenant : les jetons disponibles, et les places
+/// libres (`SKIN_IN_FLIGHT` demandes sans réponse au plus, une seule par un serveur relais
+/// d'iroh).
+fn skin_asks_now(tokens: f32, in_flight: usize, slow: bool) -> usize {
+    let flight_max = if slow { 1 } else { SKIN_IN_FLIGHT };
+    (tokens.max(0.0).floor() as usize).min(flight_max.saturating_sub(in_flight))
+}
+
+#[cfg(test)]
+mod skin_pace_tests {
+    use super::*;
+
+    /// (v347) « Si y'avait vraiment 4000 joueurs » : les skins ne partent jamais plus vite
+    /// que la connexion ne répond. Par un serveur relais d'iroh, une demande à la fois et
+    /// une par seconde : quel que soit le nombre de joueurs, au plus un skin (24 Ko au plus)
+    /// par seconde arrive par ce chemin, loin des 120 Ko/s qu'il tient.
+    #[test]
+    fn skins_are_asked_no_faster_than_the_link_answers() {
+        assert_eq!(skin_asks_now(8.0, 0, false), SKIN_IN_FLIGHT);
+        assert_eq!(skin_asks_now(8.0, 1, false), SKIN_IN_FLIGHT - 1);
+        assert_eq!(skin_asks_now(8.0, SKIN_IN_FLIGHT, false), 0);
+        assert_eq!(skin_asks_now(8.0, 0, true), 1);
+        assert_eq!(skin_asks_now(8.0, 1, true), 0);
+        assert_eq!(skin_asks_now(0.9, 0, false), 0);
+        assert_eq!(skin_asks_now(-3.0, 0, true), 0);
+        // Une minute par un serveur relais d'iroh, chaque réponse en 0,2 s, 4 000 joueurs
+        // à demander : 60 demandes au plus.
+        let (mut tokens, mut asked, mut flight): (f32, usize, Option<f32>) =
+            (SKIN_ASKS_BURST, 0, None);
+        let dt = 1.0 / 60.0;
+        let mut t = 0.0f32;
+        while t < 60.0 {
+            tokens = (tokens + dt * SKIN_ASKS_SLOW_PER_S).min(SKIN_ASKS_BURST);
+            if flight.is_some_and(|at| t - at >= 0.2) {
+                flight = None;
+            }
+            let n = skin_asks_now(tokens, flight.is_some() as usize, true).min(4000 - asked);
+            if n > 0 {
+                tokens -= n as f32;
+                asked += n;
+                flight = Some(t);
+            }
+            t += dt;
+        }
+        assert!(
+            asked <= 60 + SKIN_ASKS_BURST as usize,
+            "{asked} demandes en une minute"
+        );
+        assert!(asked >= 50, "{asked} demandes : elles avancent quand même");
+        let src = include_str!("main.rs");
+        assert!(src.contains("skin_asks_now(*tokens, self.skin_flight.len(), slow)"));
+        assert!(src.contains(".is_some_and(|t| t.elapsed() < SKIN_LATER_WAIT);"));
+    }
+}
 
 fn stamp() -> String {
     let secs = std::time::SystemTime::now()

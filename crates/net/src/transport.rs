@@ -104,6 +104,8 @@ pub struct Channel {
     group: Grouper,
     /// Message sorti de la file en ramassant les blocs, à traiter ensuite.
     held: Option<Inbound>,
+    /// (v347) Ce qui part, par genre de message (voir `traffic`).
+    meter: crate::traffic::Meter,
 }
 
 /// Où déposer un message à envoyer sur une connexion : la file d'un canal (`Channel`), ou
@@ -422,6 +424,12 @@ impl Channel {
     /// `flood` : trames en attente au-delà desquelles la connexion est coupée.
     fn finish(stream: TcpStream, noise: snow::TransportState, flood: Option<u32>) -> Result<Self> {
         stream.set_read_timeout(None)?;
+        // (v347) Côté relais (`accept`), ce sont des réponses qui partent.
+        let meter = crate::traffic::Meter::new(
+            stream.local_addr().ok(),
+            stream.peer_addr().ok(),
+            flood.is_some(),
+        );
         // (Lecture par blocs : dans une foule, des centaines de petites trames par seconde.)
         let mut reader = std::io::BufReader::with_capacity(32 * 1024, stream.try_clone()?);
         let (tx, rx) = channel();
@@ -462,6 +470,7 @@ impl Channel {
             out: Vec::new(),
             group: Grouper::new(),
             held: None,
+            meter,
         })
     }
 
@@ -489,6 +498,7 @@ impl Channel {
         let len = u16::try_from(n).map_err(|_| anyhow!("message trop long"))?;
         self.out.extend_from_slice(&len.to_be_bytes());
         self.out.extend_from_slice(&frame[..n]);
+        self.meter.sent(plain, n + 2);
         if self.out.len() >= OUT_MAX {
             self.flush()?;
         }

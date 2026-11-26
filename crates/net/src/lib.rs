@@ -25,6 +25,7 @@ pub mod poses;
 pub mod proto;
 pub mod sovereign;
 pub mod totp;
+pub mod traffic;
 pub mod transport;
 pub mod voice;
 
