@@ -4,7 +4,8 @@
 //!
 //! Un skin vient d'un fichier choisi par le joueur ; il est envoyé au relais, qui le donne
 //! aux autres joueurs. Aucun skin n'est fourni avec le jeu (le modèle par défaut est dessiné
-//! pour Minelib).
+//! pour Minelib). (v348) Il part au format compact (`Skin::to_compact`) : seulement les
+//! pixels dont le modèle se sert, par une palette, compressés. Le relais le garde tel quel.
 
 use std::sync::Arc;
 
@@ -56,15 +57,126 @@ impl Skin {
         }
         let wide = h == 64;
         if !wide {
-            // Ancien format : bras et jambe gauches = droits.
-            for (from, to) in [((40, 16), (32, 48)), ((0, 16), (16, 48))] {
-                for y in 0..16 {
-                    for x in 0..16 {
-                        px[((to.1 + y) * 64 + to.0 + x) as usize] =
-                            px[((from.1 + y) * 64 + from.0 + x) as usize];
-                    }
+            copy_left_limbs(&mut px);
+        }
+        Ok(Arc::new(Skin { px, wide }))
+    }
+
+    /// (v348) Un skin reçu du relais : au format compact, ou en PNG (envoyé par un jeu d'avant
+    /// la v348).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Arc<Skin>> {
+        if bytes.starts_with(minelib_net::proto::SKIN_COMPACT) {
+            Self::from_compact(bytes)
+        } else {
+            Self::from_png(bytes)
+        }
+    }
+
+    /// (v348) Au format compact (`proto::SKIN_COMPACT`) : les pixels dont le modèle se sert
+    /// (`used`), ligne par ligne. Une palette de 255 couleurs au plus (avec leur opacité), et
+    /// un octet par pixel (0 : transparent) ; au-delà de 255 couleurs, chaque pixel en RGBA.
+    /// Le tout compressé (deflate). Rien n'est perdu de ce que le jeu dessine : la couleur
+    /// d'un pixel tout à fait transparent, et les pixels dont le modèle ne se sert pas.
+    pub fn to_compact(&self) -> Vec<u8> {
+        use std::io::Write;
+        let mask = used(self.wide);
+        let mut palette: Vec<[u8; 4]> = Vec::new();
+        let mut index: Vec<u8> = Vec::with_capacity(mask.len());
+        let mut direct = false;
+        for &(x, y) in mask {
+            let p = self.at(x as u32, y as u32);
+            if p[3] == 0 {
+                index.push(0);
+                continue;
+            }
+            let k = match palette.iter().position(|c| *c == p) {
+                Some(k) => k,
+                None if palette.len() < 255 => {
+                    palette.push(p);
+                    palette.len() - 1
+                }
+                None => {
+                    direct = true;
+                    break;
+                }
+            };
+            index.push(k as u8 + 1);
+        }
+        let mut raw = Vec::with_capacity(mask.len() * if direct { 4 } else { 1 } + 1024);
+        if direct {
+            for &(x, y) in mask {
+                let p = self.at(x as u32, y as u32);
+                raw.extend_from_slice(if p[3] == 0 { &[0; 4] } else { &p });
+            }
+        } else {
+            raw.push(palette.len() as u8);
+            for c in &palette {
+                raw.extend_from_slice(c);
+            }
+            raw.extend_from_slice(&index);
+        }
+        let mut out = minelib_net::proto::SKIN_COMPACT.to_vec();
+        out.push(self.wide as u8 | (direct as u8) << 1);
+        let mut enc = flate2::write::DeflateEncoder::new(out, flate2::Compression::best());
+        enc.write_all(&raw).expect("en mémoire");
+        enc.finish().expect("en mémoire")
+    }
+
+    /// (v348) Lit un skin compact (voir `to_compact`), en le vérifiant : un message faux ou
+    /// trop gros ne fait rien réserver de grand.
+    fn from_compact(bytes: &[u8]) -> Result<Arc<Skin>> {
+        use std::io::Read;
+        if bytes.len() > minelib_net::proto::SKIN_COMPACT_MAX {
+            bail!("skin trop gros ({} Ko)", bytes.len() / 1024);
+        }
+        let Some(&flags) = bytes.get(4) else {
+            bail!("skin incomplet");
+        };
+        if flags & !3 != 0 {
+            bail!("skin d'un format inconnu");
+        }
+        let (wide, direct) = (flags & 1 != 0, flags & 2 != 0);
+        let mask = used(wide);
+        let max = if direct {
+            mask.len() * 4
+        } else {
+            1 + 255 * 4 + mask.len()
+        };
+        let mut raw = Vec::with_capacity(max);
+        flate2::read::DeflateDecoder::new(&bytes[5..])
+            .take(max as u64 + 1)
+            .read_to_end(&mut raw)
+            .context("skin illisible")?;
+        let mut px = vec![[0u8; 4]; 64 * 64];
+        let put = |px: &mut Vec<[u8; 4]>, (x, y): (u8, u8), p: [u8; 4]| {
+            px[y as usize * 64 + x as usize] = p;
+        };
+        if direct {
+            if raw.len() != mask.len() * 4 {
+                bail!("skin incomplet");
+            }
+            for (&at, c) in mask.iter().zip(raw.chunks_exact(4)) {
+                put(&mut px, at, [c[0], c[1], c[2], c[3]]);
+            }
+        } else {
+            let n = *raw.first().context("skin incomplet")? as usize;
+            if raw.len() != 1 + 4 * n + mask.len() {
+                bail!("skin incomplet");
+            }
+            let palette: Vec<[u8; 4]> = raw[1..1 + 4 * n]
+                .chunks_exact(4)
+                .map(|c| [c[0], c[1], c[2], c[3]])
+                .collect();
+            for (&at, &k) in mask.iter().zip(&raw[1 + 4 * n..]) {
+                match k as usize {
+                    0 => {}
+                    k if k <= n => put(&mut px, at, palette[k - 1]),
+                    _ => bail!("skin faux"),
                 }
             }
+        }
+        if !wide {
+            copy_left_limbs(&mut px);
         }
         Ok(Arc::new(Skin { px, wide }))
     }
@@ -158,6 +270,87 @@ impl Skin {
 
 fn rgb(p: [u8; 4]) -> u32 {
     (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32
+}
+
+/// (v348) Ce qui part au relais pour le skin du fichier `skin.png` (`bytes`) : au format
+/// compact. Vide (pas de skin) s'il n'y a pas de fichier ; le fichier tel quel s'il n'est pas
+/// un skin (le relais le refuse et garde l'ancien, comme avant).
+pub fn upload(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.is_empty() {
+        return bytes;
+    }
+    match Skin::from_png(&bytes) {
+        Ok(s) => s.to_compact(),
+        Err(_) => bytes,
+    }
+}
+
+/// Ancien format (64 × 32) : bras et jambe gauches = droits.
+fn copy_left_limbs(px: &mut [[u8; 4]]) {
+    for (from, to) in [((40, 16), (32, 48)), ((0, 16), (16, 48))] {
+        for y in 0..16 {
+            for x in 0..16 {
+                px[(to.1 + y) * 64 + to.0 + x] = px[(from.1 + y) * 64 + from.0 + x];
+            }
+        }
+    }
+}
+
+/// (v348) Parties du modèle dans le skin : coin du calque de base, coin du calque du dessus,
+/// taille (largeur, hauteur, profondeur), comme `Skin::layer_color`. Jambe gauche, jambe
+/// droite, corps, bras gauche, bras droit, tête.
+const PARTS: [((usize, usize), (usize, usize), [usize; 3]); 6] = [
+    ((16, 48), (0, 48), [4, 12, 4]),
+    ((0, 16), (0, 32), [4, 12, 4]),
+    ((16, 16), (16, 32), [8, 12, 4]),
+    ((32, 48), (48, 48), [4, 12, 4]),
+    ((40, 16), (40, 32), [4, 12, 4]),
+    ((0, 0), (32, 0), [8, 8, 8]),
+];
+
+/// (v348) Pixels du skin dont le modèle se sert, ligne par ligne : les six faces de chaque
+/// partie (dessus et dessous en haut, puis les côtés, le devant et le dos), au calque de base
+/// et au calque du dessus. À l'ancien format (`wide` faux), le calque du dessus de la tête
+/// seulement, et pas le bras ni la jambe gauches (copiés des droits) : 1 568 pixels, contre
+/// 3 264 au format récent, sur les 4 096 de l'image.
+fn used(wide: bool) -> &'static [(u8, u8)] {
+    static USED: std::sync::OnceLock<[Vec<(u8, u8)>; 2]> = std::sync::OnceLock::new();
+    let both = USED.get_or_init(|| {
+        [false, true].map(|wide| {
+            let mut mask = [[false; 64]; 64];
+            for (i, &(base, over, [w, h, d])) in PARTS.iter().enumerate() {
+                let left = i == 0 || i == 3;
+                let layers: &[(usize, usize)] = match (wide, i) {
+                    (true, _) => &[base, over],
+                    (false, 5) => &[base, over],
+                    (false, _) if left => &[],
+                    (false, _) => &[base],
+                };
+                for &(ox, oy) in layers {
+                    let mut fill = |x0: usize, x1: usize, y0: usize, y1: usize| {
+                        for row in mask.iter_mut().take(y1).skip(y0) {
+                            for cell in row.iter_mut().take(x1).skip(x0) {
+                                *cell = true;
+                            }
+                        }
+                    };
+                    // Dessus, dessous ; puis côté, devant, autre côté, dos.
+                    fill(ox + d, ox + d + 2 * w, oy, oy + d);
+                    fill(ox, ox + 2 * d + 2 * w, oy + d, oy + d + h);
+                }
+            }
+            let mut v = Vec::new();
+            for (y, row) in mask.iter().enumerate() {
+                for (x, &on) in row.iter().enumerate() {
+                    if on {
+                        v.push((x as u8, y as u8));
+                    }
+                }
+            }
+            v
+        })
+    });
+    &both[wide as usize]
 }
 
 /// Dessine un visage de skin (8 × 8) dans un carré de l'interface. (v209) Passé au gris
@@ -287,6 +480,131 @@ mod tests {
         assert!(Skin::from_png(&png(32, 32, |_, _| [0; 4])).is_err());
         assert!(Skin::from_png(b"pas une image").is_err());
         assert!(Skin::from_png(&vec![0u8; MAX_BYTES + 1]).is_err());
+    }
+
+    /// (v348) Ce que le modèle dessine d'un skin compact est ce qu'il dessine du PNG : toutes
+    /// les faces de toutes les parties, aux deux calques, et le visage.
+    fn draws_alike(a: &Skin, b: &Skin) {
+        for (part, &(_, _, [w, h, d])) in PARTS.iter().enumerate() {
+            let size = [w as u32, h as u32, d as u32];
+            for face in 0..6 {
+                let (nu, nv) = match face {
+                    0 | 1 => (w, h),
+                    2 | 3 => (d, h),
+                    _ => (w, d),
+                };
+                for v in 0..nv as u32 {
+                    for u in 0..nu as u32 {
+                        assert_eq!(
+                            a.color(part, face, u, v, size),
+                            b.color(part, face, u, v, size),
+                            "partie {part}, face {face}, ({u}, {v})"
+                        );
+                        assert_eq!(
+                            a.layer_color(part, face, u, v, size, true),
+                            b.layer_color(part, face, u, v, size, true),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(a.face() == b.face());
+        assert_eq!(a.wide, b.wide);
+    }
+
+    /// (v348) « Sauvegarder les skins dans un format beaucoup plus optimisé pour les passer au
+    /// réseau, ne prendre que les parties utilisées » : un skin compact se dessine exactement
+    /// comme son PNG, au format récent comme à l'ancien, même à plus de 255 couleurs, et il
+    /// est bien plus petit. Un skin compact faux, tronqué ou gonflé est refusé sans rien
+    /// réserver de grand.
+    #[test]
+    fn a_compact_skin_draws_the_same_and_weighs_less() {
+        assert_eq!(used(true).len(), 3264);
+        assert_eq!(used(false).len(), 1568);
+        // Un skin dessiné comme le font les joueurs : une vingtaine de couleurs, un chapeau,
+        // une veste qui laisse voir le dessous, quelques pixels à moitié transparents.
+        let drawn = png(64, 64, |x, y| {
+            let over =
+                (x >= 32 && y < 16) || (y >= 32 && y < 48) || (y >= 48 && (x < 16 || x >= 48));
+            let shade = ((x / 4 + y / 4) % 5) as u8 * 9;
+            if !over {
+                let base = match y {
+                    0..=15 => [200, 150, 120],
+                    16..=31 => [40, 90, 200],
+                    _ => [60, 60, 70],
+                };
+                [base[0] - shade, base[1] - shade, base[2] - shade, 255]
+            } else if (x + y) % 3 == 0 {
+                [20 + shade, 160, 40, if x % 7 == 0 { 140 } else { 255 }]
+            } else {
+                [0, 0, 0, 0]
+            }
+        });
+        let a = Skin::from_png(&drawn).unwrap();
+        let c = a.to_compact();
+        assert!(c.starts_with(minelib_net::proto::SKIN_COMPACT));
+        draws_alike(&a, &Skin::from_bytes(&c).unwrap());
+        assert!(
+            c.len() * 2 < drawn.len(),
+            "compact {} octets, PNG {}",
+            c.len(),
+            drawn.len()
+        );
+        // Les skins des bots (dessinés par le jeu).
+        for (name, team) in [
+            ("BOT Alpha", minelib_net::game::CT),
+            ("BOT Zulu", minelib_net::game::T),
+        ] {
+            let b = crate::bot_skin::bot_skin(name, team);
+            let c = b.to_compact();
+            draws_alike(&b, &Skin::from_bytes(&c).unwrap());
+            assert!(c.len() < 3 * 1024, "{name} : {} octets", c.len());
+        }
+        // Plus de 255 couleurs : chaque pixel en RGBA, toujours sous la taille permise.
+        let noise = png(64, 64, |x, y| {
+            let mut v = (y * 64 + x).wrapping_mul(2_654_435_761);
+            v ^= v >> 13;
+            let v = v.wrapping_mul(1_103_515_245).to_be_bytes();
+            [v[0], v[1], v[2], 255]
+        });
+        let n = Skin::from_png(&noise).unwrap();
+        let c = n.to_compact();
+        assert_eq!(c[4] & 2, 2, "couleurs directes");
+        assert!(
+            c.len() <= minelib_net::proto::SKIN_COMPACT_MAX,
+            "{} octets",
+            c.len()
+        );
+        draws_alike(&n, &Skin::from_bytes(&c).unwrap());
+        // L'ancien format (64 × 32).
+        let old = png(64, 32, |x, y| [x as u8 * 4, y as u8 * 8, 99, 255]);
+        let o = Skin::from_png(&old).unwrap();
+        let c = o.to_compact();
+        assert_eq!(c[4] & 1, 0);
+        draws_alike(&o, &Skin::from_bytes(&c).unwrap());
+        // Les PNG d'avant se lisent toujours.
+        draws_alike(&a, &Skin::from_bytes(&drawn).unwrap());
+        // Ce qui part au relais : compact ; pas de fichier, rien ; un fichier faux, tel quel.
+        assert!(upload(drawn.clone()).starts_with(minelib_net::proto::SKIN_COMPACT));
+        assert!(upload(Vec::new()).is_empty());
+        assert_eq!(upload(b"pas un skin".to_vec()), b"pas un skin");
+        // Faux, tronqué, gonflé : refusés.
+        let good = a.to_compact();
+        assert!(Skin::from_bytes(&good[..good.len() - 3]).is_err());
+        let mut bad = good.clone();
+        bad[4] = 9;
+        assert!(Skin::from_bytes(&bad).is_err());
+        let bomb = {
+            use std::io::Write;
+            let mut out = minelib_net::proto::SKIN_COMPACT.to_vec();
+            out.push(1);
+            let mut e = flate2::write::DeflateEncoder::new(out, flate2::Compression::best());
+            e.write_all(&vec![0u8; 8 << 20]).unwrap();
+            e.finish().unwrap()
+        };
+        assert!(bomb.len() <= minelib_net::proto::SKIN_COMPACT_MAX);
+        assert!(Skin::from_bytes(&bomb).is_err());
+        assert!(Skin::from_bytes(minelib_net::proto::SKIN_COMPACT).is_err());
     }
 
     /// (v347) « Si y'avait vraiment 4000 joueurs » : les skins des plus proches sont demandés
@@ -525,7 +843,7 @@ impl Skins {
             return true;
         }
         let skin = (!png.is_empty())
-            .then(|| Skin::from_png(png).ok())
+            .then(|| Skin::from_bytes(png).ok())
             .flatten();
         self.others.insert(key, skin);
         false

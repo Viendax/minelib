@@ -7049,9 +7049,9 @@ fn skin_path(dir: &Path, pseudo: &str) -> PathBuf {
         .join(format!("{}.png", crypto::hex(&h[..12])))
 }
 
-/// (v347) Skins qu'une connexion peut demander par seconde (le jeu en demande 4 au plus, 8
-/// d'un coup) ; au-delà : « plus tard » (`proto::SKIN_LATER`).
-const SKIN_RATE: u32 = 16;
+/// (v347) Skins qu'une connexion peut demander par seconde (v348 : le jeu en demande 16 au
+/// plus, 16 d'un coup) ; au-delà : « plus tard » (`proto::SKIN_LATER`).
+const SKIN_RATE: u32 = 64;
 /// (v347) Skins envoyés en tout aux connexions sans adresse IP (`Conn::no_ip`) : octets par
 /// seconde, et d'un coup au plus. Leur lien passe sans doute par un serveur relais d'iroh,
 /// et tous ces liens passent alors par la seule connexion du relais à ce serveur (environ
@@ -7122,8 +7122,12 @@ fn skin_get(st: &mut State, id: u64, who: String) -> Response {
 }
 
 /// Un skin acceptable : PNG de 64 × 64 ou 64 × 32, 24 Ko au plus (en-tête vérifié ; le jeu
-/// qui l'affiche le décode et le revérifie).
+/// qui l'affiche le décode et le revérifie). (v348) Ou au format compact
+/// (`proto::SKIN_COMPACT`), 16 Ko au plus : gardé et donné tel quel.
 fn valid_skin(png: &[u8]) -> bool {
+    if png.starts_with(proto::SKIN_COMPACT) {
+        return png.len() > 5 && png.len() <= proto::SKIN_COMPACT_MAX && png[4] & !3 == 0;
+    }
     const MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     if png.len() > 24 * 1024 || png.len() < 33 || png[..8] != MAGIC || &png[12..16] != b"IHDR" {
         return false;
@@ -7769,6 +7773,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             if png.is_empty() {
                 let _ = std::fs::remove_file(&path);
             } else if !valid_skin(&png) {
+                // (Un skin compact faux est refusé de même : il ne commence pas comme il faut,
+                // ou il est trop gros.)
                 return Some(err(
                     ErrorCode::Refused,
                     "Skin refusé : PNG de 64 × 64 (ou 64 × 32), 24 Ko au plus.",
@@ -11715,7 +11721,7 @@ mod tests {
 
     /// (v347) « Si y'avait vraiment 4000 joueurs » : un relais n'envoie pas plus de skins que
     /// les serveurs relais d'iroh n'en portent. Aux connexions venues sans adresse IP, 30 Ko/s
-    /// en tout (48 Ko d'un coup) ; à chaque connexion, 16 demandes par seconde. Au-delà :
+    /// en tout (48 Ko d'un coup) ; à chaque connexion, 64 demandes par seconde. Au-delà :
     /// « plus tard », et le jeu redemande ensuite. Sans skin, la réponse vide ne compte pas.
     #[test]
     fn a_relay_sends_no_more_skins_than_iroh_servers_carry() {
@@ -11752,8 +11758,8 @@ mod tests {
             // Une seconde plus tard : de nouveau un skin.
             st.skin_no_ip.1 -= Duration::from_secs(1);
             assert_eq!(ask(&crowd, st, far, "Peintre"), png);
-            // 16 demandes par seconde au plus par connexion.
-            for _ in 0..15 {
+            // 64 demandes par seconde au plus par connexion.
+            for _ in 0..63 {
                 assert!(ask(&crowd, st, near, "Personne").is_empty());
             }
             assert_eq!(ask(&crowd, st, near, "Personne"), proto::SKIN_LATER);
@@ -11779,6 +11785,16 @@ mod tests {
         let mut huge = png.clone();
         huge.resize(25 * 1024, 0);
         assert!(!valid_skin(&huge));
+        // (v348) Format compact : son début et sa taille.
+        let mut compact = proto::SKIN_COMPACT.to_vec();
+        compact.extend_from_slice(&[1, 0x63, 0x60]);
+        assert!(valid_skin(&compact));
+        compact[4] = 8;
+        assert!(!valid_skin(&compact), "format inconnu");
+        compact[4] = 1;
+        compact.resize(proto::SKIN_COMPACT_MAX + 1, 0);
+        assert!(!valid_skin(&compact), "trop gros");
+        assert!(!valid_skin(proto::SKIN_COMPACT));
         // Le nom du fichier ne dépend pas de ce que tape le joueur.
         let p = skin_path(Path::new("/r"), "../../etc/passwd");
         assert!(p.starts_with("/r/skins") && !p.to_string_lossy().contains(".."));

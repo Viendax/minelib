@@ -214,6 +214,14 @@ pub const PASSEUR_TRUSTED: &str = "confiance";
 pub const PASSEUR_INVITE_DAYS: u64 = 7;
 pub const PASSEUR_INVITE_MAX: u8 = 16;
 
+/// (v348) Début d'un skin au format compact (`Request::SkinPut`, `Response::Skin`) : seulement
+/// les pixels dont le modèle se sert, par une palette, compressés ; un octet de format (bit 0 :
+/// format 64 × 64, bit 1 : couleurs directes au lieu de la palette), puis les données
+/// (deflate). Le jeu l'écrit et le lit (`skin.rs`) ; le relais le garde et le donne tel quel.
+pub const SKIN_COMPACT: &[u8; 4] = b"MSK1";
+/// (v348) Taille maximale d'un skin compact (souvent 1 à 2 Ko ; un PNG : 24 Ko au plus).
+pub const SKIN_COMPACT_MAX: usize = 16 * 1024;
+
 /// (v347) Dans `Response::Skin`, à la place du PNG : « redemande plus tard ». Le relais a
 /// déjà envoyé ce qu'il s'est fixé de skins (par connexion, et en tout vers les joueurs venus
 /// sans adresse IP, dont le lien passe sans doute par un serveur relais d'iroh). Ce n'est pas

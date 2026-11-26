@@ -2956,7 +2956,9 @@ impl Game {
             self.skin_sent = false;
         } else if !self.skin_sent {
             self.skin_sent = true;
-            let png = std::fs::read(self.paths.root.join("skin.png")).unwrap_or_default();
+            // (v348) Au format compact.
+            let png =
+                skin::upload(std::fs::read(self.paths.root.join("skin.png")).unwrap_or_default());
             self.accounts.room(Cmd::SkinPut(png));
         }
         if let Some(rx) = &self.skin_pick {
@@ -2975,7 +2977,9 @@ impl Game {
             // (v146) Son skin, déposé chez chaque province où l'on entre ; en veille, ceux des
             // autres sont demandés aux provinces (le relais du monde n'est plus joint).
             if let Some(b) = s.build.as_mut().filter(|b| !b.has_skin()) {
-                b.set_skin(std::fs::read(self.paths.root.join("skin.png")).unwrap_or_default());
+                b.set_skin(skin::upload(
+                    std::fs::read(self.paths.root.join("skin.png")).unwrap_or_default(),
+                ));
             }
             // (v157) Têtes de joueurs : leur skin, tenu à jour.
             s.update_head_skins(&self.accounts.pseudo());
@@ -2984,8 +2988,8 @@ impl Game {
             // du joueur, ses autres commandes (tchat, /tp…) passent entre elles. (v347) Pas
             // plus vite que la connexion ne répond : `SKIN_IN_FLIGHT` demandes sans réponse au
             // plus, et par un serveur relais d'iroh (débit limité par le serveur, 26 novembre
-            // à 02:54:56), une seule et une par seconde. Une réponse qui ne vient pas libère
-            // sa place au bout de `SKIN_REPLY_WAIT`.
+            // à 02:54:56), une seule à la fois, `SKIN_ASKS_SLOW_PER_S` par seconde. Une
+            // réponse qui ne vient pas libère sa place au bout de `SKIN_REPLY_WAIT`.
             if self.skin_slow.1.elapsed() >= std::time::Duration::from_secs(1) {
                 self.skin_slow = (account::world_link_slow(), std::time::Instant::now());
             }
@@ -6127,11 +6131,12 @@ struct LastShot {
 /// s'accroupir et la radio). (v262) Dans les menus et le tchat ouvert : toujours.
 const SHOT_COPY_S: f32 = 60.0;
 
-/// (v344) Skins demandés au relais : 4 par seconde, 8 d'un coup au plus.
-const SKIN_ASKS_PER_S: f32 = 4.0;
-const SKIN_ASKS_BURST: f32 = 8.0;
-/// (v347) Par un serveur relais d'iroh : un par seconde (un skin fait jusqu'à 24 Ko).
-const SKIN_ASKS_SLOW_PER_S: f32 = 1.0;
+/// (v344) Skins demandés au relais. (v348) Au format compact (souvent 1 à 2 Ko, 16 Ko au plus,
+/// au lieu de 24 Ko au plus) : 16 par seconde, 16 d'un coup au plus (avant : 4 et 8).
+const SKIN_ASKS_PER_S: f32 = 16.0;
+const SKIN_ASKS_BURST: f32 = 16.0;
+/// (v347) Par un serveur relais d'iroh. (v348) Skins compacts : 4 par seconde (avant : 1).
+const SKIN_ASKS_SLOW_PER_S: f32 = 4.0;
 /// (v347) Demandes de skins sans réponse, au plus (une seule par un serveur relais d'iroh).
 const SKIN_IN_FLIGHT: usize = 2;
 /// (v347) Une demande de skin sans réponse libère sa place au bout de ce temps.
@@ -6153,8 +6158,9 @@ mod skin_pace_tests {
 
     /// (v347) « Si y'avait vraiment 4000 joueurs » : les skins ne partent jamais plus vite
     /// que la connexion ne répond. Par un serveur relais d'iroh, une demande à la fois et
-    /// une par seconde : quel que soit le nombre de joueurs, au plus un skin (24 Ko au plus)
-    /// par seconde arrive par ce chemin, loin des 120 Ko/s qu'il tient.
+    /// (v348) quatre par seconde : des skins compacts, souvent 1 à 2 Ko (16 Ko au plus), loin
+    /// des 120 Ko/s que tient ce chemin. (Le relais, lui, n'en envoie pas plus de 30 Ko/s en
+    /// tout à ces liens.)
     #[test]
     fn skins_are_asked_no_faster_than_the_link_answers() {
         assert_eq!(skin_asks_now(8.0, 0, false), SKIN_IN_FLIGHT);
@@ -6165,7 +6171,7 @@ mod skin_pace_tests {
         assert_eq!(skin_asks_now(0.9, 0, false), 0);
         assert_eq!(skin_asks_now(-3.0, 0, true), 0);
         // Une minute par un serveur relais d'iroh, chaque réponse en 0,2 s, 4 000 joueurs
-        // à demander : 60 demandes au plus.
+        // à demander : 240 demandes, et la réserve.
         let (mut tokens, mut asked, mut flight): (f32, usize, Option<f32>) =
             (SKIN_ASKS_BURST, 0, None);
         let dt = 1.0 / 60.0;
@@ -6184,10 +6190,10 @@ mod skin_pace_tests {
             t += dt;
         }
         assert!(
-            asked <= 60 + SKIN_ASKS_BURST as usize,
+            asked <= 240 + SKIN_ASKS_BURST as usize,
             "{asked} demandes en une minute"
         );
-        assert!(asked >= 50, "{asked} demandes : elles avancent quand même");
+        assert!(asked >= 220, "{asked} demandes : elles avancent quand même");
         let src = include_str!("main.rs");
         assert!(src.contains("skin_asks_now(*tokens, self.skin_flight.len(), slow)"));
         assert!(src.contains(".is_some_and(|t| t.elapsed() < SKIN_LATER_WAIT);"));
